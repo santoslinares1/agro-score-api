@@ -88,11 +88,11 @@ export class LotsService {
 
   async markAsProcessing(id: string, analysisId: string): Promise<Lot> {
     const lot = await this.findOne(id);
-  
+
     lot.status = 'Procesando';
     lot.lastAnalysisId = analysisId;
     lot.lastAnalysisStatus = 'Procesando';
-  
+
     return this.lotsRepository.save(lot);
   }
 
@@ -102,22 +102,22 @@ export class LotsService {
     score: number,
   ): Promise<Lot> {
     const lot = await this.findOne(id);
-  
+
     lot.status = 'Finalizado';
     lot.lastAnalysisId = analysisId;
     lot.lastAnalysisStatus = 'Finalizado';
     lot.score = score;
-  
+
     return this.lotsRepository.save(lot);
   }
-  
+
   async markAsError(id: string, analysisId: string): Promise<Lot> {
     const lot = await this.findOne(id);
-  
+
     lot.status = 'Sin análisis';
     lot.lastAnalysisId = analysisId;
     lot.lastAnalysisStatus = 'Error';
-  
+
     return this.lotsRepository.save(lot);
   }
 

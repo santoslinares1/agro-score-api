@@ -4,6 +4,7 @@ import {
   Delete,
   Get,
   Param,
+  ParseUUIDPipe,
   Patch,
   Post,
 } from '@nestjs/common';
@@ -26,22 +27,25 @@ export class LotsController {
   }
 
   @Get(':id/pipeline-input')
-  getPipelineInput(@Param('id') id: string) {
+  getPipelineInput(@Param('id', ParseUUIDPipe) id: string) {
     return this.lotsService.getPipelineInput(id);
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string) {
+  findOne(@Param('id', ParseUUIDPipe) id: string) {
     return this.lotsService.findOne(id);
   }
 
   @Patch(':id')
-  update(@Param('id') id: string, @Body() updateLotDto: UpdateLotDto) {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() updateLotDto: UpdateLotDto,
+  ) {
     return this.lotsService.update(id, updateLotDto);
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
+  remove(@Param('id', ParseUUIDPipe) id: string) {
     return this.lotsService.remove(id);
   }
 }

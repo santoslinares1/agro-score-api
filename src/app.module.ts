@@ -4,6 +4,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { LotsModule } from './lots/lots.module';
 import { AnalysisModule } from './analysis/analysis.module';
 import { PythonWorkerModule } from './python-worker/python-worker.module';
+import { FieldsModule } from './fields/fields.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { PythonWorkerModule } from './python-worker/python-worker.module';
     LotsModule,
     AnalysisModule,
     PythonWorkerModule,
+    FieldsModule,
   ],
 })
 export class AppModule {}
