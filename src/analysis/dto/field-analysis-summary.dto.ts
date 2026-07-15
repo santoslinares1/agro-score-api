@@ -1,4 +1,4 @@
-import { AnalysisStatus } from '../entities/analysis.entity';
+import { AnalysisScope, AnalysisStatus } from '../entities/analysis.entity';
 
 /**
  * Resumen liviano de un Analysis para listados por campo: evita mandar el
@@ -8,6 +8,9 @@ import { AnalysisStatus } from '../entities/analysis.entity';
 export type FieldAnalysisSummary = {
   id: string;
   status: AnalysisStatus;
+  scope: AnalysisScope | null;
+  fieldId: string | null;
+  lotId: string | null;
   createdAt: Date;
   updatedAt: Date;
   globalScore: number;

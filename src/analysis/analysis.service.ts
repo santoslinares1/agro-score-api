@@ -98,6 +98,9 @@ export class AnalysisService {
     return analyses.map((analysis) => ({
       id: analysis.id,
       status: analysis.status,
+      scope: analysis.scope,
+      fieldId: analysis.fieldId,
+      lotId: analysis.lotId,
       createdAt: analysis.createdAt,
       updatedAt: analysis.updatedAt,
       globalScore: analysis.globalScore,
