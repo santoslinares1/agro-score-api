@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import { LotsService } from '../lots/lots.service';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { Analysis } from './entities/analysis.entity';
@@ -38,7 +38,9 @@ export class AnalysisService {
     const lot = await this.lotsService.findOne(lotId);
 
     const analysis = this.analysisRepository.create({
+      scope: 'lot',
       lotId: lot.id,
+      fieldId: null,
       lotName: lot.name,
       status: 'Procesando',
       globalScore: 0,
@@ -79,13 +81,17 @@ export class AnalysisService {
 
   /**
    * Historial de análisis de un campo, en formato liviano (sin resultJson)
-   * para no traer zones/timeseries/png en un listado. El flujo de campo
-   * reutiliza la columna `lotId` de Analysis para guardar el fieldId (mismo
-   * convenio que ya usa `runFieldAnalysis`), así que filtramos por ahí.
+   * para no traer zones/timeseries/png en un listado. Los análisis nuevos
+   * usan la columna `fieldId` dedicada (scope='field'); los creados antes de
+   * esa migración reusaban `lotId` para guardar el fieldId y no tienen scope
+   * seteado, así que se mantiene ese fallback para no perder historial viejo.
    */
   async findByField(fieldId: string): Promise<FieldAnalysisSummary[]> {
     const analyses = await this.analysisRepository.find({
-      where: { lotId: fieldId },
+      where: [
+        { fieldId, scope: 'field' },
+        { lotId: fieldId, scope: IsNull() },
+      ],
       order: { createdAt: 'DESC' },
     });
 
@@ -140,10 +146,10 @@ export class AnalysisService {
     }
 
     const runningAnalysis = await this.analysisRepository.findOne({
-      where: {
-        lotId: fieldId,
-        status: 'Procesando',
-      },
+      where: [
+        { fieldId, scope: 'field', status: 'Procesando' },
+        { lotId: fieldId, scope: IsNull(), status: 'Procesando' },
+      ],
     });
 
     if (runningAnalysis) {
@@ -156,12 +162,24 @@ export class AnalysisService {
 
     const fieldInput = await this.fieldsService.getPipelineInput(fieldId);
 
+    const hasIncludedLot = fieldInput.lots.some(
+      (lot) => lot.includeInProductivityClassification,
+    );
+
+    if (!hasIncludedLot) {
+      throw new BadRequestException(
+        'El campo no tiene ningún lote incluido en la clasificación productiva. Habilitá al menos un lote antes de analizar.',
+      );
+    }
+
     this.logger.log(
       `Iniciando análisis de campo fieldId=${fieldId} (${fieldInput.lots.length} lotes en el input).`,
     );
 
     const analysis = this.analysisRepository.create({
-      lotId: fieldInput.fieldId,
+      scope: 'field',
+      fieldId: fieldInput.fieldId,
+      lotId: null,
       lotName: fieldInput.name,
       status: 'Procesando',
       maxCloudiness: input.maxCloudiness,
@@ -293,7 +311,12 @@ export class AnalysisService {
       analysis.ndviAverageMax = result.ndviAverageMax;
       analysis.ndviVariability = result.ndviVariability;
       analysis.zonesDetected = result.zonesDetected;
-      analysis.resultJson = result.resultJson;
+      analysis.resultJson = {
+        ...result.resultJson,
+        // Mismo criterio que fieldId en el flujo de campo: nada lo lee
+        // todavía, pero deja el modelo simétrico para cuando haga falta.
+        lotId,
+      };
 
       await this.analysisRepository.save(analysis);
 
@@ -320,6 +343,7 @@ export class AnalysisService {
           mode: 'error',
           message: 'Error al ejecutar el pipeline.',
           error: error instanceof Error ? error.message : String(error),
+          lotId,
         };
 
         await this.analysisRepository.save(analysis);

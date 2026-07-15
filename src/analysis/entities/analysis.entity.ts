@@ -9,14 +9,27 @@ import {
 
 export type AnalysisStatus = 'Procesando' | 'Finalizado' | 'Error';
 export type NdviVariability = 'Baja' | 'Media' | 'Alta';
+export type AnalysisScope = 'lot' | 'field';
 
 @Entity('analysis')
 export class Analysis {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column()
-  lotId: string;
+  @Column({ type: 'varchar', nullable: true })
+  lotId: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  fieldId: string | null;
+
+  /**
+   * Distingue explícitamente un análisis de lote único de uno de campo
+   * multi-lote. Nullable porque los análisis creados antes de este cambio
+   * no lo tienen (ver fallback por lotId en AnalysisService.findByField y en
+   * el guard de duplicados de runFieldAnalysis).
+   */
+  @Column({ type: 'varchar', nullable: true })
+  scope: AnalysisScope | null;
 
   @Column()
   lotName: string;
