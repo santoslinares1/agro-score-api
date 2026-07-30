@@ -6,7 +6,6 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, Repository } from 'typeorm';
-import { LotsService } from '../lots/lots.service';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { Analysis } from './entities/analysis.entity';
 import { Field } from '../fields/entities/field.entity';
@@ -19,47 +18,10 @@ export class AnalysisService {
   constructor(
     @InjectRepository(Analysis)
     private readonly analysisRepository: Repository<Analysis>,
-    private readonly lotsService: LotsService,
     private readonly pythonWorkerService: PythonWorkerService,
     private readonly fieldsService: FieldsService,
   ) {}
 
-  async createForLot(lotId: string): Promise<Analysis> {
-    const runningAnalysis = await this.analysisRepository.findOne({
-      where: {
-        lotId,
-        status: 'Procesando',
-      },
-    });
-
-    if (runningAnalysis) {
-      return runningAnalysis;
-    }
-
-    const lot = await this.lotsService.findOne(lotId);
-
-    const analysis = this.analysisRepository.create({
-      scope: 'lot',
-      lotId: lot.id,
-      fieldId: null,
-      lotName: lot.name,
-      status: 'Procesando',
-      globalScore: 0,
-      category: 'Procesando análisis',
-      maxCloudiness: lot.maxCloudiness,
-      startDate: lot.startDate,
-      endDate: lot.endDate,
-      resultJson: null,
-    });
-
-    const savedAnalysis = await this.analysisRepository.save(analysis);
-
-    await this.lotsService.markAsProcessing(lot.id, savedAnalysis.id);
-
-    this.runPipeline(savedAnalysis.id, lot.id);
-
-    return savedAnalysis;
-  }
   /**
    * Solo devuelve análisis cuyo Field es del usuario autenticado (scope
    * 'field', o legacy scope=null con el fieldId guardado en lotId — ver
@@ -388,66 +350,6 @@ export class AnalysisService {
 
         await this.analysisRepository.save(analysis);
       }
-    }
-  }
-
-  private async runPipeline(analysisId: string, lotId: string): Promise<void> {
-    try {
-      const input = await this.lotsService.getPipelineInput(lotId);
-      const result = await this.pythonWorkerService.runAnalysis(input);
-
-      const analysis = await this.findOne(analysisId);
-
-      analysis.status = 'Finalizado';
-      analysis.globalScore = result.globalScore;
-      analysis.category = result.category;
-      analysis.confidenceScore = result.confidenceScore;
-      analysis.productivityScore = result.productivityScore;
-      analysis.stabilityScore = result.stabilityScore;
-      analysis.soilScore = result.soilScore;
-      analysis.climateScore = result.climateScore;
-      analysis.ndviAverageMax = result.ndviAverageMax;
-      analysis.ndviVariability = result.ndviVariability;
-      analysis.zonesDetected = result.zonesDetected;
-      analysis.resultJson = {
-        ...result.resultJson,
-        // Mismo criterio que fieldId en el flujo de campo: nada lo lee
-        // todavía, pero deja el modelo simétrico para cuando haga falta.
-        lotId,
-      };
-
-      await this.analysisRepository.save(analysis);
-
-      await this.lotsService.markAsFinished(
-        lotId,
-        analysisId,
-        result.globalScore,
-      );
-    } catch (error) {
-      this.logger.error(
-        `Pipeline error (analysisId=${analysisId}, lotId=${lotId}): ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-
-      const analysis = await this.analysisRepository.findOne({
-        where: { id: analysisId },
-      });
-
-      if (analysis) {
-        analysis.status = 'Error';
-        analysis.category = 'Error al procesar análisis';
-        analysis.resultJson = {
-          mode: 'error',
-          message: 'Error al ejecutar el pipeline.',
-          error: error instanceof Error ? error.message : String(error),
-          lotId,
-        };
-
-        await this.analysisRepository.save(analysis);
-      }
-
-      await this.lotsService.markAsError(lotId, analysisId);
     }
   }
 }

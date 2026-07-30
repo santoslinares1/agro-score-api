@@ -1,4 +1,16 @@
-import { PipelineInput } from '../lots/lots.service';
+// Antes vivía en lots/lots.service.ts (borrado en CLEANUP-2 junto con el
+// resto del módulo legacy `lots`); PythonWorkerService.runAnalysis todavía
+// usa esta forma, así que el tipo queda acá.
+export type PipelineInput = {
+  lotId: string;
+  name: string;
+  location: string;
+  geojson: any;
+  startDate: string;
+  endDate: string;
+  maxCloudiness: number;
+  areaHa: number;
+};
 
 export type ZoneArea = {
   zone: number;

@@ -8,8 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import { AxiosError } from 'axios';
 import { firstValueFrom } from 'rxjs';
 
-import { PipelineInput } from '../lots/lots.service';
-import { WorkerAnalysisResult } from './types';
+import { PipelineInput, WorkerAnalysisResult } from './types';
 
 type NewWorkerPayload = {
   field_name: string;
