@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  GoneException,
   NotFoundException,
   Param,
   ParseUUIDPipe,
@@ -23,13 +24,16 @@ type AuthenticatedRequest = Request & { user: AuthenticatedUser };
 export class AnalysisController {
   constructor(private readonly analysisService: AnalysisService) {}
 
-  // Lote standalone legacy (módulo `lots`, sin relación a Field/User): no
-  // hay ownership que validar, pero al menos exige estar autenticado — antes
-  // este endpoint era público (AUTH-3).
+  // AUTH-5: el módulo `lots` top-level (sin relación a Field/User) queda
+  // deprecado — no hay ownership que validar y la preferencia de producto
+  // es no mantener dos modelos paralelos. Bloqueado antes de tocar
+  // lotId/worker/DB: ni siquiera consulta si el lot existe.
   @UseGuards(JwtAuthGuard)
   @Post('lots/:lotId/analysis')
-  createForLot(@Param('lotId', ParseUUIDPipe) lotId: string) {
-    return this.analysisService.createForLot(lotId);
+  createForLot(@Param('lotId', ParseUUIDPipe) _lotId: string): never {
+    throw new GoneException(
+      'El análisis legacy por lote fue reemplazado por análisis por campo (POST /analysis/field/:fieldId).',
+    );
   }
 
   @UseGuards(JwtAuthGuard)

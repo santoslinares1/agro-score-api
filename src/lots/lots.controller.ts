@@ -1,51 +1,57 @@
 import {
-  Body,
   Controller,
   Delete,
   Get,
+  GoneException,
   Param,
   ParseUUIDPipe,
   Patch,
   Post,
+  UseGuards,
 } from '@nestjs/common';
-import { CreateLotDto } from './dto/create-lot.dto';
-import { UpdateLotDto } from './dto/update-lot.dto';
-import { LotsService } from './lots.service';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
+const LEGACY_LOTS_MESSAGE =
+  'El flujo legacy de lotes individuales fue reemplazado por campos multi-lote. Usá /fields.';
+
+/**
+ * AUTH-5: el modelo `Lot` top-level no tiene relación con Field/User, así
+ * que no hay forma de validar ownership acá. En vez de mantener dos
+ * modelos de datos paralelos (uno con ownership real, otro sin él), se
+ * deprecan los seis endpoints: exigen sesión (JwtAuthGuard) y devuelven
+ * 410 Gone antes de leer o escribir nada — ni siquiera consultan si el id
+ * existe, no hay riesgo de filtrar datos de terceros.
+ */
+@UseGuards(JwtAuthGuard)
 @Controller('lots')
 export class LotsController {
-  constructor(private readonly lotsService: LotsService) {}
-
   @Post()
-  create(@Body() createLotDto: CreateLotDto) {
-    return this.lotsService.create(createLotDto);
+  create(): never {
+    throw new GoneException(LEGACY_LOTS_MESSAGE);
   }
 
   @Get()
-  findAll() {
-    return this.lotsService.findAll();
+  findAll(): never {
+    throw new GoneException(LEGACY_LOTS_MESSAGE);
   }
 
   @Get(':id/pipeline-input')
-  getPipelineInput(@Param('id', ParseUUIDPipe) id: string) {
-    return this.lotsService.getPipelineInput(id);
+  getPipelineInput(@Param('id', ParseUUIDPipe) _id: string): never {
+    throw new GoneException(LEGACY_LOTS_MESSAGE);
   }
 
   @Get(':id')
-  findOne(@Param('id', ParseUUIDPipe) id: string) {
-    return this.lotsService.findOne(id);
+  findOne(@Param('id', ParseUUIDPipe) _id: string): never {
+    throw new GoneException(LEGACY_LOTS_MESSAGE);
   }
 
   @Patch(':id')
-  update(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body() updateLotDto: UpdateLotDto,
-  ) {
-    return this.lotsService.update(id, updateLotDto);
+  update(@Param('id', ParseUUIDPipe) _id: string): never {
+    throw new GoneException(LEGACY_LOTS_MESSAGE);
   }
 
   @Delete(':id')
-  remove(@Param('id', ParseUUIDPipe) id: string) {
-    return this.lotsService.remove(id);
+  remove(@Param('id', ParseUUIDPipe) _id: string): never {
+    throw new GoneException(LEGACY_LOTS_MESSAGE);
   }
 }
