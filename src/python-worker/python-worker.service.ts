@@ -28,6 +28,11 @@ type NewWorkerPayload = {
   n_zones: number;
   zone_resolution: number;
   include_zone_png: boolean;
+  include_map_assets?: boolean;
+  map_dimensions?: number;
+  include_index_images?: boolean;
+  index_image_indices?: string[];
+  index_image_dimensions?: number;
 };
 
 type FieldWorkerInput = {
@@ -37,6 +42,12 @@ type FieldWorkerInput = {
   startDate: string;
   endDate: string;
   maxCloudiness: number;
+  indices?: string[];
+  zoneIndices?: string[];
+  indexImageIndices?: string[];
+  includeMapAssets?: boolean;
+  includeIndexImages?: boolean;
+  maxZoneCampaigns?: number;
   lots: Array<{
     id: string;
     name: string;
@@ -45,6 +56,25 @@ type FieldWorkerInput = {
     includeInProductivityClassification: boolean;
   }>;
 };
+
+/**
+ * NDVI y NDMI son los índices base del producto: siempre viajan al worker,
+ * sin importar qué mande el caller. Los avanzados (NDRE/EVI/MSAVI2/BSI) y
+ * SWIR (solo asset visual) se agregan arriba de esta base cuando el usuario
+ * los activa explícitamente desde la UI.
+ */
+const BASE_INDICES = ['NDVI', 'NDMI'];
+
+/**
+ * Fase PERF-1: por defecto la clasificación de zonas usa como mucho las
+ * últimas DEFAULT_MAX_ZONE_CAMPAIGNS campañas, sin importar cuán largo sea
+ * el rango startDate-endDate elegido. MAX_MAX_ZONE_CAMPAIGNS evita que un
+ * caller pida un número arbitrariamente alto (cada campaña de más multiplica
+ * llamadas getThumbURL en el worker: ver zones.py).
+ */
+const DEFAULT_MAX_ZONE_CAMPAIGNS = 3;
+const MIN_MAX_ZONE_CAMPAIGNS = 1;
+const MAX_MAX_ZONE_CAMPAIGNS = 6;
 
 @Injectable()
 export class PythonWorkerService {
@@ -75,6 +105,15 @@ export class PythonWorkerService {
   private async postToWorker(
     payload: NewWorkerPayload,
   ): Promise<WorkerAnalysisResult> {
+    this.logger.log(
+      `Worker payload: indices=${JSON.stringify(payload.indices)} ` +
+        `zone_indices=${JSON.stringify(payload.zone_indices)} ` +
+        `zone_campaign_years=${JSON.stringify(payload.zone_campaign_years)} ` +
+        `include_map_assets=${payload.include_map_assets ?? false} ` +
+        `include_index_images=${payload.include_index_images ?? false} ` +
+        `index_image_indices=${JSON.stringify(payload.index_image_indices)}`,
+    );
+
     try {
       const response = await firstValueFrom(
         this.httpService.post<WorkerAnalysisResult>(
@@ -109,6 +148,20 @@ export class PythonWorkerService {
     }
   }
 
+  /**
+   * Garantiza NDVI y NDMI en la lista final, sin duplicados, preservando el
+   * orden de los extras tal como los mandó el caller. El usuario puede
+   * agregar índices avanzados pero nunca sacar la base — si el DTO manda
+   * solo ['NDRE'], el resultado es ['NDVI','NDMI','NDRE'], no ['NDRE'].
+   */
+  private normalizeIndices(requested?: string[]): string[] {
+    const extras = (requested ?? [])
+      .map((idx) => idx.toUpperCase().trim())
+      .filter((idx) => idx && !BASE_INDICES.includes(idx));
+
+    return [...BASE_INDICES, ...Array.from(new Set(extras))];
+  }
+
   private mapPipelineInputToWorkerPayload(
     input: PipelineInput,
   ): NewWorkerPayload {
@@ -132,7 +185,9 @@ export class PythonWorkerService {
       campaign_start: input.startDate,
       campaign_end: input.endDate,
 
-      indices: ['NDVI', 'NDMI', 'NDRE', 'EVI', 'MSAVI2', 'BSI'],
+      // Flujo legacy de lote único: no tiene DTO propio para elegir índices
+      // todavía, así que siempre manda la base NDVI/NDMI.
+      indices: this.normalizeIndices(),
 
       max_cloud_pct: input.maxCloudiness ?? 20,
 
@@ -244,7 +299,18 @@ export class PythonWorkerService {
     return coordinates;
   }
 
-  private getCampaignYears(startDate: string, endDate: string): number[] {
+  /**
+   * Fase PERF-1: antes devolvía TODOS los años calendario entre startDate y
+   * endDate (con los defaults de fecha del frontend, eso podía ser 6-8+
+   * campañas). Ahora se queda con los `maxZoneCampaigns` años más recientes
+   * del rango — cada campaña de más multiplica llamadas getThumbURL
+   * secuenciales en zones.py, sin cambiar qué campaña representa cada año.
+   */
+  private getCampaignYears(
+    startDate: string,
+    endDate: string,
+    maxZoneCampaigns?: number,
+  ): number[] {
     const startYear = new Date(startDate).getFullYear();
     const endYear = new Date(endDate).getFullYear();
 
@@ -258,7 +324,22 @@ export class PythonWorkerService {
       years.push(year);
     }
 
-    return years.length ? years : [endYear];
+    if (!years.length) {
+      return [endYear];
+    }
+
+    return years.slice(-this.clampMaxZoneCampaigns(maxZoneCampaigns));
+  }
+
+  private clampMaxZoneCampaigns(value?: number): number {
+    if (value === undefined || value === null || Number.isNaN(value)) {
+      return DEFAULT_MAX_ZONE_CAMPAIGNS;
+    }
+
+    return Math.min(
+      MAX_MAX_ZONE_CAMPAIGNS,
+      Math.max(MIN_MAX_ZONE_CAMPAIGNS, Math.round(value)),
+    );
   }
   private mapFieldInputToWorkerPayload(
     input: FieldWorkerInput,
@@ -289,7 +370,10 @@ export class PythonWorkerService {
       campaign_start: input.startDate,
       campaign_end: input.endDate,
 
-      indices: ['NDVI', 'NDMI', 'NDRE', 'EVI', 'MSAVI2', 'BSI'],
+      // NDVI/NDMI siempre presentes (normalizeIndices los garantiza); los
+      // avanzados que haya activado el usuario en el modal viajan como
+      // extras arriba de esa base.
+      indices: this.normalizeIndices(input.indices),
 
       max_cloud_pct: input.maxCloudiness ?? 30,
 
@@ -298,15 +382,38 @@ export class PythonWorkerService {
       zone_campaign_years: this.getCampaignYears(
         input.startDate,
         input.endDate,
+        input.maxZoneCampaigns,
       ),
 
-      zone_indices: ['NDVI', 'NDMI'],
+      // zone_indices sigue NDVI+NDMI por default aunque `indices` traiga
+      // avanzados — el usuario tiene que pedirlo explícito para que la
+      // clasificación de zonas los use también.
+      zone_indices: this.normalizeIndices(input.zoneIndices),
 
       n_zones: 3,
 
       zone_resolution: 256,
 
       include_zone_png: false,
+
+      /**
+       * Fase PERF-1: antes estos dos quedaban fijos en `true` para todo
+       * análisis de campo, sin importar lo que pidiera el caller — el modo
+       * "rápido" del frontend no tenía forma de apagarlos. Ahora respetan lo
+       * que mande el caller (RunFieldAnalysisDto), con default `false` para
+       * que el análisis por defecto sea rápido. "Informe completo" los
+       * prende explícitamente desde field-detail.component.ts.
+       *
+       * index_image_indices decide cuáles assets visuales genera el worker
+       * (NDVI/NDMI por default; NDRE y SWIR quedan disponibles si el
+       * usuario los activa — SWIR nunca es un índice de `indices`,
+       * solo existe como asset visual).
+       */
+      include_map_assets: input.includeMapAssets ?? false,
+      map_dimensions: 280,
+      include_index_images: input.includeIndexImages ?? false,
+      index_image_indices: this.normalizeIndices(input.indexImageIndices),
+      index_image_dimensions: 280,
     };
   }
   async runFieldAnalysis(
