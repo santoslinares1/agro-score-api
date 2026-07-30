@@ -23,19 +23,28 @@ type AuthenticatedRequest = Request & { user: AuthenticatedUser };
 export class AnalysisController {
   constructor(private readonly analysisService: AnalysisService) {}
 
+  // Lote standalone legacy (módulo `lots`, sin relación a Field/User): no
+  // hay ownership que validar, pero al menos exige estar autenticado — antes
+  // este endpoint era público (AUTH-3).
+  @UseGuards(JwtAuthGuard)
   @Post('lots/:lotId/analysis')
   createForLot(@Param('lotId', ParseUUIDPipe) lotId: string) {
     return this.analysisService.createForLot(lotId);
   }
 
+  @UseGuards(JwtAuthGuard)
   @Get('analysis')
-  findAll() {
-    return this.analysisService.findAll();
+  findAll(@Req() req: AuthenticatedRequest) {
+    return this.analysisService.findAll(req.user.sub);
   }
 
+  @UseGuards(JwtAuthGuard)
   @Get('analysis/field/:fieldId')
-  findByField(@Param('fieldId', ParseUUIDPipe) fieldId: string) {
-    return this.analysisService.findByField(fieldId);
+  findByField(
+    @Param('fieldId', ParseUUIDPipe) fieldId: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.analysisService.findByField(fieldId, req.user.sub);
   }
 
   @Get('analysis/:id/report')

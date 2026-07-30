@@ -9,6 +9,7 @@ import { IsNull, Repository } from 'typeorm';
 import { LotsService } from '../lots/lots.service';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { Analysis } from './entities/analysis.entity';
+import { Field } from '../fields/entities/field.entity';
 import { FieldsService } from '../fields/fields.service';
 import { FieldAnalysisSummary } from './dto/field-analysis-summary.dto';
 @Injectable()
@@ -59,12 +60,26 @@ export class AnalysisService {
 
     return savedAnalysis;
   }
-  async findAll(): Promise<Analysis[]> {
-    return this.analysisRepository.find({
-      order: {
-        createdAt: 'DESC',
-      },
-    });
+  /**
+   * Solo devuelve análisis cuyo Field es del usuario autenticado (scope
+   * 'field', o legacy scope=null con el fieldId guardado en lotId — ver
+   * resolveOwnedFieldId). Los análisis de lote legacy (scope='lot', sin
+   * relación a Field/User) quedan afuera de la lista: no hay owner
+   * verificable, así que no se listan para nadie (AUTH-3).
+   */
+  async findAll(userId: string): Promise<Analysis[]> {
+    return this.analysisRepository
+      .createQueryBuilder('analysis')
+      .innerJoin(
+        Field,
+        'field',
+        `(analysis.scope = :fieldScope AND field.id::text = analysis."fieldId") OR ` +
+          `(analysis.scope IS NULL AND field.id::text = analysis."lotId")`,
+        { fieldScope: 'field' },
+      )
+      .where('field."userId" = :userId', { userId })
+      .orderBy('analysis.createdAt', 'DESC')
+      .getMany();
   }
 
   async findOne(id: string): Promise<Analysis> {
@@ -80,30 +95,49 @@ export class AnalysisService {
   }
 
   /**
-   * Igual que `findOne`, pero valida que el análisis pertenezca al usuario
-   * autenticado. Los análisis de campo (scope='field', o legacy con
-   * scope=null que reusa `lotId` como fieldId) se validan contra el
-   * ownership del Field. Los análisis de lote legacy (Lot standalone, sin
-   * relación a User) no tienen dueño modelado todavía: se permiten para
-   * cualquier usuario autenticado hasta que esa entidad tenga ownership
-   * propio (ver riesgos/deuda de AUTH-1).
+   * Resuelve a qué Field pertenece (verificablemente) un análisis, o null
+   * si no hay ninguno. Reglas (AUTH-3):
+   * - scope='field': el dueño es fieldId.
+   * - scope=null (legacy, de antes de que existiera la columna scope): el
+   *   fieldId histórico se guardaba en lotId — solo cuenta si scope es
+   *   explícitamente null, nunca para scope='lot'.
+   * - scope='lot' (análisis de lote standalone, módulo `lots` top-level sin
+   *   relación a Field/User) u otro cualquier caso: no hay Field que
+   *   resolver → null. Bloqueado por default, ver findOneOwned.
+   */
+  private resolveOwnedFieldId(analysis: Analysis): string | null {
+    if (analysis.scope === 'field') {
+      return analysis.fieldId;
+    }
+
+    if (analysis.scope === null && analysis.lotId) {
+      return analysis.lotId;
+    }
+
+    return null;
+  }
+
+  /**
+   * Igual que `findOne`, pero valida ownership antes de devolver el
+   * análisis. Default-deny (AUTH-3): si no se puede resolver un Field real
+   * y verificable para este análisis (ver resolveOwnedFieldId), se bloquea
+   * con 404 genérico sin importar quién pregunte — nunca "autenticado
+   * entonces puede verlo". Esto cierra el hueco de los análisis de lote
+   * legacy (scope='lot') que antes se devolvían sin ningún chequeo.
    */
   async findOneOwned(id: string, userId: string): Promise<Analysis> {
     const analysis = await this.findOne(id);
 
-    const ownerFieldId =
-      analysis.scope === 'field'
-        ? analysis.fieldId
-        : analysis.scope === null && analysis.lotId
-          ? analysis.lotId
-          : null;
+    const fieldId = this.resolveOwnedFieldId(analysis);
 
-    if (ownerFieldId) {
-      const field = await this.fieldsService.findOne(ownerFieldId, userId).catch(() => null);
+    if (!fieldId) {
+      throw new NotFoundException('Análisis no encontrado.');
+    }
 
-      if (!field) {
-        throw new NotFoundException('Análisis no encontrado.');
-      }
+    const field = await this.fieldsService.findOne(fieldId, userId).catch(() => null);
+
+    if (!field) {
+      throw new NotFoundException('Análisis no encontrado.');
     }
 
     return analysis;
@@ -115,8 +149,15 @@ export class AnalysisService {
    * usan la columna `fieldId` dedicada (scope='field'); los creados antes de
    * esa migración reusaban `lotId` para guardar el fieldId y no tienen scope
    * seteado, así que se mantiene ese fallback para no perder historial viejo.
+   *
+   * AUTH-3: este endpoint no tenía ningún chequeo de ownership (bug
+   * encontrado en la auditoría, no estaba en el alcance original de
+   * AUTH-1). Ahora exige que el Field sea del usuario autenticado, mismo
+   * patrón que runFieldAnalysis.
    */
-  async findByField(fieldId: string): Promise<FieldAnalysisSummary[]> {
+  async findByField(fieldId: string, userId: string): Promise<FieldAnalysisSummary[]> {
+    await this.fieldsService.findOne(fieldId, userId);
+
     const analyses = await this.analysisRepository.find({
       where: [
         { fieldId, scope: 'field' },
