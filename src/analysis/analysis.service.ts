@@ -183,9 +183,12 @@ export class AnalysisService {
     }));
   }
 
-  async getReportPath(id: string): Promise<string> {
-    const analysis = await this.findOne(id);
-
+  /**
+   * AUTH-4: recibe el analysis ya validado por ownership (findOneOwned) en
+   * vez de un id — así ninguna ruta de reporte puede terminar leyendo un
+   * analysis sin pasar por el chequeo de dueño.
+   */
+  getReportPath(analysis: Analysis): string {
     const reportPath = analysis.resultJson?.report?.htmlPath;
 
     if (!reportPath) {
@@ -194,9 +197,8 @@ export class AnalysisService {
 
     return reportPath;
   }
-  async getReportPdfPath(id: string): Promise<string> {
-    const analysis = await this.findOne(id);
 
+  getReportPdfPath(analysis: Analysis): string {
     const pdfPath = analysis.resultJson?.report?.pdfPath;
 
     if (!pdfPath) {

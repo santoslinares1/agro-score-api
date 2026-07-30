@@ -47,12 +47,19 @@ export class AnalysisController {
     return this.analysisService.findByField(fieldId, req.user.sub);
   }
 
+  // AUTH-4: las tres rutas de reporte pasan por findOneOwned antes de tocar
+  // el filesystem — mismo gate de ownership que GET /analysis/:id, nunca un
+  // findOne "pelado". Si el análisis no tiene Field verificable del usuario,
+  // findOneOwned tira 404 antes de llegar a leer ningún archivo.
+  @UseGuards(JwtAuthGuard)
   @Get('analysis/:id/report')
   async getReport(
     @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
     @Res() res: Response,
   ) {
-    const reportPath = await this.analysisService.getReportPath(id);
+    const analysis = await this.analysisService.findOneOwned(id, req.user.sub);
+    const reportPath = this.analysisService.getReportPath(analysis);
 
     if (!existsSync(reportPath)) {
       throw new NotFoundException('El archivo de reporte no existe.');
@@ -66,12 +73,16 @@ export class AnalysisController {
 
     return createReadStream(reportPath).pipe(res);
   }
+
+  @UseGuards(JwtAuthGuard)
   @Get('analysis/:id/report/download')
   async downloadReport(
     @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
     @Res() res: Response,
   ) {
-    const reportPath = await this.analysisService.getReportPath(id);
+    const analysis = await this.analysisService.findOneOwned(id, req.user.sub);
+    const reportPath = this.analysisService.getReportPath(analysis);
 
     if (!existsSync(reportPath)) {
       throw new NotFoundException('El archivo de reporte no existe.');
@@ -85,12 +96,16 @@ export class AnalysisController {
 
     return createReadStream(reportPath).pipe(res);
   }
+
+  @UseGuards(JwtAuthGuard)
   @Get('analysis/:id/report/pdf')
   async downloadPdfReport(
     @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
     @Res() res: Response,
   ) {
-    const pdfPath = await this.analysisService.getReportPdfPath(id);
+    const analysis = await this.analysisService.findOneOwned(id, req.user.sub);
+    const pdfPath = this.analysisService.getReportPdfPath(analysis);
 
     if (!existsSync(pdfPath)) {
       throw new NotFoundException('El archivo PDF no existe.');
