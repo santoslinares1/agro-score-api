@@ -80,6 +80,36 @@ export class AnalysisService {
   }
 
   /**
+   * Igual que `findOne`, pero valida que el análisis pertenezca al usuario
+   * autenticado. Los análisis de campo (scope='field', o legacy con
+   * scope=null que reusa `lotId` como fieldId) se validan contra el
+   * ownership del Field. Los análisis de lote legacy (Lot standalone, sin
+   * relación a User) no tienen dueño modelado todavía: se permiten para
+   * cualquier usuario autenticado hasta que esa entidad tenga ownership
+   * propio (ver riesgos/deuda de AUTH-1).
+   */
+  async findOneOwned(id: string, userId: string): Promise<Analysis> {
+    const analysis = await this.findOne(id);
+
+    const ownerFieldId =
+      analysis.scope === 'field'
+        ? analysis.fieldId
+        : analysis.scope === null && analysis.lotId
+          ? analysis.lotId
+          : null;
+
+    if (ownerFieldId) {
+      const field = await this.fieldsService.findOne(ownerFieldId, userId).catch(() => null);
+
+      if (!field) {
+        throw new NotFoundException('Análisis no encontrado.');
+      }
+    }
+
+    return analysis;
+  }
+
+  /**
    * Historial de análisis de un campo, en formato liviano (sin resultJson)
    * para no traer zones/timeseries/png en un listado. Los análisis nuevos
    * usan la columna `fieldId` dedicada (scope='field'); los creados antes de
@@ -140,8 +170,18 @@ export class AnalysisService {
       startDate: string;
       endDate: string;
       maxCloudiness: number;
+      indices?: string[];
+      zoneIndices?: string[];
+      indexImageIndices?: string[];
+      includeMapAssets?: boolean;
+      includeIndexImages?: boolean;
+      maxZoneCampaigns?: number;
     },
+    userId: string,
   ): Promise<Analysis> {
+    // Lanza NotFoundException si el campo no existe o no es del usuario.
+    await this.fieldsService.findOne(fieldId, userId);
+
     if (new Date(input.startDate) > new Date(input.endDate)) {
       throw new BadRequestException(
         'La fecha de inicio debe ser anterior o igual a la fecha de fin.',
@@ -209,6 +249,12 @@ export class AnalysisService {
       startDate: input.startDate,
       endDate: input.endDate,
       maxCloudiness: input.maxCloudiness,
+      indices: input.indices,
+      zoneIndices: input.zoneIndices,
+      indexImageIndices: input.indexImageIndices,
+      includeMapAssets: input.includeMapAssets,
+      includeIndexImages: input.includeIndexImages,
+      maxZoneCampaigns: input.maxZoneCampaigns,
     });
 
     return savedAnalysis;
@@ -223,6 +269,12 @@ export class AnalysisService {
       startDate: string;
       endDate: string;
       maxCloudiness: number;
+      indices?: string[];
+      zoneIndices?: string[];
+      indexImageIndices?: string[];
+      includeMapAssets?: boolean;
+      includeIndexImages?: boolean;
+      maxZoneCampaigns?: number;
       lots: Array<{
         id: string;
         name: string;

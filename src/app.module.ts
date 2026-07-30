@@ -5,6 +5,8 @@ import { LotsModule } from './lots/lots.module';
 import { AnalysisModule } from './analysis/analysis.module';
 import { PythonWorkerModule } from './python-worker/python-worker.module';
 import { FieldsModule } from './fields/fields.module';
+import { UsersModule } from './users/users.module';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
@@ -22,7 +24,11 @@ import { FieldsModule } from './fields/fields.module';
         password: config.get<string>('DB_PASSWORD'),
         database: config.get<string>('DB_NAME'),
         autoLoadEntities: true,
-        synchronize: true,
+        // AUTH-2: el esquema ahora se versiona con migrations (ver
+        // src/data-source.ts y src/migrations/). synchronize solo se
+        // habilita si TYPEORM_SYNCHRONIZE=true está seteado explícito;
+        // por default (incluido local) queda en false.
+        synchronize: config.get<string>('TYPEORM_SYNCHRONIZE') === 'true',
       }),
     }),
 
@@ -30,6 +36,8 @@ import { FieldsModule } from './fields/fields.module';
     AnalysisModule,
     PythonWorkerModule,
     FieldsModule,
+    UsersModule,
+    AuthModule,
   ],
 })
 export class AppModule {}

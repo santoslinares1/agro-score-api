@@ -32,7 +32,7 @@ export class FieldsService {
     private readonly fieldLotRepository: Repository<FieldLot>,
   ) {}
 
-  async create(dto: CreateFieldDto): Promise<Field> {
+  async create(dto: CreateFieldDto, userId: string): Promise<Field> {
     const lots = dto.lots.map((lot, index) =>
       this.fieldLotRepository.create({
         name: lot.name,
@@ -51,6 +51,7 @@ export class FieldsService {
     );
 
     const field = this.fieldRepository.create({
+      userId,
       name: dto.name,
       ownerName: dto.ownerName,
       location: dto.location,
@@ -67,8 +68,9 @@ export class FieldsService {
     return this.fieldRepository.save(field);
   }
 
-  async findAll(): Promise<Field[]> {
+  async findAll(userId: string): Promise<Field[]> {
     return this.fieldRepository.find({
+      where: { userId },
       relations: {
         lots: true,
       },
@@ -78,12 +80,33 @@ export class FieldsService {
     });
   }
 
-  async findOne(id: string): Promise<Field> {
+  async findOne(id: string, userId: string): Promise<Field> {
     const field = await this.fieldRepository.findOne({
       where: { id },
       relations: {
         lots: true,
       },
+    });
+
+    if (!field || field.userId !== userId) {
+      throw new NotFoundException('Campo no encontrado.');
+    }
+
+    field.lots = [...field.lots].sort(
+      (a, b) => a.displayOrder - b.displayOrder,
+    );
+
+    return field;
+  }
+
+  /**
+   * Variante interna sin chequeo de ownership, para uso de otros servicios
+   * (p.ej. AnalysisService) que ya validaron el ownership por su cuenta.
+   */
+  async findByIdOrFail(id: string): Promise<Field> {
+    const field = await this.fieldRepository.findOne({
+      where: { id },
+      relations: { lots: true },
     });
 
     if (!field) {
@@ -96,17 +119,18 @@ export class FieldsService {
 
     return field;
   }
+
   /**
    * Edita solo metadata general del campo. A propósito no toca `lots`: ese
    * array se gestiona con `updateLot` lote por lote, nunca reemplazando todo
    * desde acá.
    */
-  async update(id: string, dto: UpdateFieldDto): Promise<Field> {
-    await this.findOne(id);
+  async update(id: string, dto: UpdateFieldDto, userId: string): Promise<Field> {
+    await this.findOne(id, userId);
 
     await this.fieldRepository.update(id, dto);
 
-    return this.findOne(id);
+    return this.findOne(id, userId);
   }
 
   /**
@@ -118,7 +142,10 @@ export class FieldsService {
     fieldId: string,
     lotId: string,
     dto: UpdateFieldLotDto,
+    userId: string,
   ): Promise<FieldLot> {
+    await this.findOne(fieldId, userId);
+
     const lot = await this.fieldLotRepository.findOne({
       where: { id: lotId },
     });
@@ -162,7 +189,7 @@ export class FieldsService {
   }
 
   async getPipelineInput(id: string): Promise<FieldPipelineInput> {
-    const field = await this.findOne(id);
+    const field = await this.findByIdOrFail(id);
 
     if (!field.lots?.length) {
       throw new NotFoundException('El campo no tiene lotes internos cargados.');

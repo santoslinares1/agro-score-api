@@ -6,12 +6,18 @@ import {
   Param,
   ParseUUIDPipe,
   Post,
+  Req,
   Res,
+  UseGuards,
 } from '@nestjs/common';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import { createReadStream, existsSync } from 'fs';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { AuthenticatedUser } from '../auth/jwt.strategy';
 import { AnalysisService } from './analysis.service';
 import { RunFieldAnalysisDto } from './dto/run-field-analysis.dto';
+
+type AuthenticatedRequest = Request & { user: AuthenticatedUser };
 
 @Controller()
 export class AnalysisController {
@@ -90,18 +96,24 @@ export class AnalysisController {
     return createReadStream(pdfPath).pipe(res);
   }
 
+  @UseGuards(JwtAuthGuard)
   @Get('analysis/:id')
-  findOne(@Param('id', ParseUUIDPipe) id: string) {
-    return this.analysisService.findOne(id);
+  findOne(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.analysisService.findOneOwned(id, req.user.sub);
   }
 
   // Ruta histórica. El alias 'analysis/field/:fieldId' es el nombre preferido
   // hacia adelante; se mantienen ambas para no romper clientes existentes.
+  @UseGuards(JwtAuthGuard)
   @Post(['field/:fieldId', 'analysis/field/:fieldId'])
   runFieldAnalysis(
     @Param('fieldId', ParseUUIDPipe) fieldId: string,
     @Body() body: RunFieldAnalysisDto,
+    @Req() req: AuthenticatedRequest,
   ) {
-    return this.analysisService.runFieldAnalysis(fieldId, body);
+    return this.analysisService.runFieldAnalysis(fieldId, body, req.user.sub);
   }
 }

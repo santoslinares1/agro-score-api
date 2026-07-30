@@ -2,16 +2,30 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  ManyToOne,
   OneToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { FieldLot } from './field-lot.entity';
+import { User } from '../../users/user.entity';
 
 @Entity('fields')
 export class Field {
   @PrimaryGeneratedColumn('uuid')
   id: string;
+
+  /**
+   * NOT NULL desde AUTH-2: todo campo legacy sin dueño ya pasó por el
+   * backfill (ver scripts/backfill-fields-user.ts) antes de aplicar la
+   * migración que agrega esta constraint. Un field sin userId ya no es un
+   * estado válido.
+   */
+  @Column()
+  userId: string;
+
+  @ManyToOne(() => User, { onDelete: 'CASCADE', nullable: false })
+  user?: User;
 
   @Column()
   name: string;
