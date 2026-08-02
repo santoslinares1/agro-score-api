@@ -11,6 +11,7 @@ import { Analysis } from './entities/analysis.entity';
 import { Field } from '../fields/entities/field.entity';
 import { FieldsService } from '../fields/fields.service';
 import { FieldAnalysisSummary } from './dto/field-analysis-summary.dto';
+import { ReportPdfService } from './report-pdf/report-pdf.service';
 @Injectable()
 export class AnalysisService {
   private readonly logger = new Logger(AnalysisService.name);
@@ -20,6 +21,7 @@ export class AnalysisService {
     private readonly analysisRepository: Repository<Analysis>,
     private readonly pythonWorkerService: PythonWorkerService,
     private readonly fieldsService: FieldsService,
+    private readonly reportPdfService: ReportPdfService,
   ) {}
 
   /**
@@ -160,15 +162,27 @@ export class AnalysisService {
     return reportPath;
   }
 
-  getReportPdfPath(analysis: Analysis): string {
-    const pdfPath = analysis.resultJson?.report?.pdfPath;
+  /**
+   * PDF-1: reemplaza el viejo getReportPdfPath (leía report.pdfPath, un archivo en disco que
+   * ningún proceso llegó a generar nunca). Recibe el analysis ya validado por ownership
+   * (findOneOwned) y vuelve a resolver+validar el Field dueño acá — mismo gate AUTH-4 que el
+   * resto de las rutas de reporte, nunca genera el PDF antes de confirmar ownership.
+   */
+  async buildReportPdf(
+    analysis: Analysis,
+    userId: string,
+  ): Promise<{ stream: NodeJS.ReadableStream & { end(): void }; filename: string }> {
+    const fieldId = this.resolveOwnedFieldId(analysis);
 
-    if (!pdfPath) {
-      throw new NotFoundException('El análisis no tiene PDF generado.');
+    if (!fieldId) {
+      throw new NotFoundException('El análisis no tiene reporte generado.');
     }
 
-    return pdfPath;
+    const field = await this.fieldsService.findOne(fieldId, userId);
+
+    return this.reportPdfService.build(analysis, field);
   }
+
   async runFieldAnalysis(
     fieldId: string,
     input: {

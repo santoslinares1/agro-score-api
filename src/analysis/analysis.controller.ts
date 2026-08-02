@@ -101,6 +101,9 @@ export class AnalysisController {
     return createReadStream(reportPath).pipe(res);
   }
 
+  // PDF-1: genera el PDF real desde los datos del análisis ya validado por ownership — no
+  // depende de resultJson.report.pdfPath ni de ningún archivo report.pdf en disco generado
+  // por otro proceso (ver ReportPdfService).
   @UseGuards(JwtAuthGuard)
   @Get('analysis/:id/report/pdf')
   async downloadPdfReport(
@@ -109,19 +112,16 @@ export class AnalysisController {
     @Res() res: Response,
   ) {
     const analysis = await this.analysisService.findOneOwned(id, req.user.sub);
-    const pdfPath = this.analysisService.getReportPdfPath(analysis);
-
-    if (!existsSync(pdfPath)) {
-      throw new NotFoundException('El archivo PDF no existe.');
-    }
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="agro-score-report-${id}.pdf"`,
+    const { stream, filename } = await this.analysisService.buildReportPdf(
+      analysis,
+      req.user.sub,
     );
 
-    return createReadStream(pdfPath).pipe(res);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    stream.pipe(res);
+    stream.end();
   }
 
   @UseGuards(JwtAuthGuard)

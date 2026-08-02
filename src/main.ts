@@ -13,6 +13,10 @@ async function bootstrap() {
   app.enableCors({
     origin: frontendUrl,
     credentials: true,
+    // PDF-1: sin esto el frontend no puede leer el nombre de archivo real que manda
+    // Content-Disposition en /analysis/:id/report/pdf (fetch/XHR ocultan este header en
+    // requests cross-origin salvo que el servidor lo exponga explícitamente).
+    exposedHeaders: ['Content-Disposition'],
   });
 
   app.useGlobalPipes(

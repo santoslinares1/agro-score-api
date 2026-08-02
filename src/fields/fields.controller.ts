@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   ParseUUIDPipe,
@@ -13,7 +14,7 @@ import type { Request } from 'express';
 
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AuthenticatedUser } from '../auth/jwt.strategy';
-import { CreateFieldDto } from './dto/create-field.dto';
+import { CreateFieldDto, CreateFieldLotDto } from './dto/create-field.dto';
 import { UpdateFieldDto } from './dto/update-field.dto';
 import { UpdateFieldLotDto } from './dto/update-field-lot.dto';
 import { FieldsService } from './fields.service';
@@ -60,5 +61,23 @@ export class FieldsController {
     @Req() req: AuthenticatedRequest,
   ) {
     return this.fieldsService.updateLot(fieldId, lotId, dto, req.user.sub);
+  }
+
+  @Post(':fieldId/lots')
+  createLot(
+    @Param('fieldId', ParseUUIDPipe) fieldId: string,
+    @Body() dto: CreateFieldLotDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.fieldsService.createLot(fieldId, dto, req.user.sub);
+  }
+
+  @Delete(':fieldId/lots/:lotId')
+  removeLot(
+    @Param('fieldId', ParseUUIDPipe) fieldId: string,
+    @Param('lotId', ParseUUIDPipe) lotId: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.fieldsService.removeLot(fieldId, lotId, req.user.sub);
   }
 }

@@ -5,6 +5,7 @@ import { AnalysisController } from './analysis.controller';
 import { AnalysisService } from './analysis.service';
 import { Analysis } from './entities/analysis.entity';
 import { FieldsModule } from 'src/fields/fields.module';
+import { ReportPdfService } from './report-pdf/report-pdf.service';
 
 @Module({
   imports: [
@@ -13,6 +14,6 @@ import { FieldsModule } from 'src/fields/fields.module';
     FieldsModule,
   ],
   controllers: [AnalysisController],
-  providers: [AnalysisService],
+  providers: [AnalysisService, ReportPdfService],
 })
 export class AnalysisModule {}

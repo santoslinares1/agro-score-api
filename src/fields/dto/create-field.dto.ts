@@ -6,6 +6,7 @@ import {
   IsInt,
   IsNumber,
   IsOptional,
+  IsPositive,
   IsString,
   Max,
   Min,
@@ -23,6 +24,7 @@ export class CreateFieldLotDto {
 
   @IsOptional()
   @IsNumber()
+  @IsPositive()
   areaHa?: number;
 
   @IsOptional()

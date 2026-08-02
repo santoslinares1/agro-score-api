@@ -1,8 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 
-import { CreateFieldDto } from './dto/create-field.dto';
+import { CreateFieldDto, CreateFieldLotDto } from './dto/create-field.dto';
 import { UpdateFieldDto } from './dto/update-field.dto';
 import { UpdateFieldLotDto } from './dto/update-field-lot.dto';
 import { Field } from './entities/field.entity';
@@ -135,8 +135,9 @@ export class FieldsService {
 
   /**
    * Edita metadata de un FieldLot puntual (nombre, superficie de referencia,
-   * inclusión en clasificación productiva, notas, orden). No toca geojson:
-   * la geometría no se redibuja desde este endpoint todavía.
+   * inclusión en clasificación productiva, notas, orden). Desde GEOMETRY-1
+   * también acepta `geojson`, para reemplazar la geometría completa del lote
+   * (redibujo, no edición fina de vértices).
    */
   async updateLot(
     fieldId: string,
@@ -156,7 +157,14 @@ export class FieldsService {
       );
     }
 
-    await this.fieldLotRepository.update(lotId, dto);
+    if (dto.geojson !== undefined) {
+      this.validateLotGeojson(dto.geojson);
+    }
+
+    // `geojson` es `unknown` en la entidad (jsonb sin tipar) — TypeORM no
+    // logra inferir el QueryDeepPartialEntity para ese campo desde el DTO.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await this.fieldLotRepository.update(lotId, dto as any);
 
     if (dto.areaHa !== undefined) {
       await this.recalculateTotalAreaHa(fieldId);
@@ -171,6 +179,151 @@ export class FieldsService {
     }
 
     return updatedLot;
+  }
+
+  /**
+   * Agrega un lote interno nuevo a un campo existente (GEOMETRY-1). No
+   * reemplaza `create()`: ese sigue siendo el alta de campo+lotes iniciales.
+   */
+  async createLot(
+    fieldId: string,
+    dto: CreateFieldLotDto,
+    userId: string,
+  ): Promise<FieldLot> {
+    await this.findOne(fieldId, userId);
+
+    this.validateLotGeojson(dto.geojson);
+
+    const existingLots = await this.fieldLotRepository.find({
+      where: { fieldId },
+    });
+
+    const nextDisplayOrder =
+      existingLots.reduce((max, lot) => Math.max(max, lot.displayOrder ?? 0), 0) + 1;
+
+    const lot = this.fieldLotRepository.create({
+      fieldId,
+      name: dto.name,
+      geojson: dto.geojson,
+      areaHa: dto.areaHa ?? 0,
+      displayOrder: dto.displayOrder ?? nextDisplayOrder,
+      includeInProductivityClassification:
+        dto.includeInProductivityClassification ?? true,
+      notes: dto.notes,
+    });
+
+    const savedLot = await this.fieldLotRepository.save(lot);
+
+    await this.recalculateTotalAreaHa(fieldId);
+
+    return savedLot;
+  }
+
+  /**
+   * Elimina físicamente un lote interno (GEOMETRY-1). Es seguro: los
+   * análisis ya generados guardan su propia copia de `fieldLots`/`zones` en
+   * `resultJson` y no tienen una relación de base de datos hacia
+   * `field_lots` (Analysis.lotId es un campo histórico de texto libre, sin
+   * FK), así que borrar un lote no afecta diagnósticos ya calculados.
+   */
+  async removeLot(
+    fieldId: string,
+    lotId: string,
+    userId: string,
+  ): Promise<{ success: true }> {
+    await this.findOne(fieldId, userId);
+
+    const lot = await this.fieldLotRepository.findOne({
+      where: { id: lotId },
+    });
+
+    if (!lot || lot.fieldId !== fieldId) {
+      throw new NotFoundException(
+        'El lote no existe o no pertenece a este campo.',
+      );
+    }
+
+    await this.fieldLotRepository.delete(lotId);
+    await this.recalculateTotalAreaHa(fieldId);
+
+    return { success: true };
+  }
+
+  /**
+   * Valida mínimamente la forma del polígono: Polygon/MultiPolygon (bare o
+   * envueltos en Feature/FeatureCollection), con al menos un anillo de 3
+   * vértices distintos (4 posiciones contando el cierre). `@Allow()` en el
+   * DTO no valida estructura, así que este chequeo corre en el service antes
+   * de persistir.
+   */
+  private validateLotGeojson(geojson: unknown): void {
+    if (!this.isValidGeojsonGeometry(geojson)) {
+      throw new BadRequestException('El polígono del lote no es válido.');
+    }
+  }
+
+  private isValidRing(ring: unknown): boolean {
+    return (
+      Array.isArray(ring) &&
+      ring.length >= 4 &&
+      ring.every(
+        (point) =>
+          Array.isArray(point) &&
+          point.length >= 2 &&
+          typeof point[0] === 'number' &&
+          typeof point[1] === 'number',
+      )
+    );
+  }
+
+  private isValidPolygonGeometry(geometry: unknown): boolean {
+    const value = geometry as { type?: string; coordinates?: unknown } | null;
+
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+
+    if (value.type === 'Polygon') {
+      const coordinates = value.coordinates as unknown[];
+      return Array.isArray(coordinates) && coordinates.length > 0 && this.isValidRing(coordinates[0]);
+    }
+
+    if (value.type === 'MultiPolygon') {
+      const coordinates = value.coordinates as unknown[];
+      return (
+        Array.isArray(coordinates) &&
+        coordinates.length > 0 &&
+        coordinates.every(
+          (polygon) => Array.isArray(polygon) && polygon.length > 0 && this.isValidRing(polygon[0]),
+        )
+      );
+    }
+
+    return false;
+  }
+
+  private isValidGeojsonGeometry(geojson: unknown): boolean {
+    const value = geojson as { type?: string; geometry?: unknown; features?: unknown[] } | null;
+
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+
+    if (value.type === 'Feature') {
+      return this.isValidPolygonGeometry(value.geometry);
+    }
+
+    if (value.type === 'FeatureCollection') {
+      return (
+        Array.isArray(value.features) &&
+        value.features.length > 0 &&
+        value.features.every((feature) =>
+          this.isValidPolygonGeometry((feature as { geometry?: unknown })?.geometry),
+        )
+      );
+    }
+
+    return this.isValidPolygonGeometry(value);
   }
 
   /**

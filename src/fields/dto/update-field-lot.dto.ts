@@ -1,10 +1,10 @@
-import { OmitType, PartialType } from '@nestjs/mapped-types';
+import { PartialType } from '@nestjs/mapped-types';
 import { CreateFieldLotDto } from './create-field.dto';
 
 /**
- * Excluye `geojson` a propósito: en esta fase no se permite redibujar/editar
- * la geometría de un lote desde este endpoint, solo su metadata.
+ * Incluye `geojson` (GEOMETRY-1): permite tanto editar metadata como
+ * reemplazar la geometría completa de un lote existente desde el mismo
+ * endpoint. La forma del polígono se valida en FieldsService, no acá, porque
+ * `@Allow()` no impone ninguna estructura.
  */
-export class UpdateFieldLotDto extends PartialType(
-  OmitType(CreateFieldLotDto, ['geojson'] as const),
-) {}
+export class UpdateFieldLotDto extends PartialType(CreateFieldLotDto) {}

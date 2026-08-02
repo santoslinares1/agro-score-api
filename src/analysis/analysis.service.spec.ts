@@ -7,6 +7,7 @@ import { Field } from '../fields/entities/field.entity';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { AnalysisService } from './analysis.service';
 import { Analysis } from './entities/analysis.entity';
+import { ReportPdfService } from './report-pdf/report-pdf.service';
 
 type MockRepo = {
   findOne: jest.Mock;
@@ -20,6 +21,7 @@ describe('AnalysisService', () => {
   let fieldsService: jest.Mocked<
     Pick<FieldsService, 'findOne' | 'findByIdOrFail' | 'getPipelineInput'>
   >;
+  let reportPdfService: jest.Mocked<Pick<ReportPdfService, 'build'>>;
 
   const buildAnalysis = (overrides: Partial<Analysis> = {}): Analysis =>
     ({
@@ -91,12 +93,14 @@ describe('AnalysisService', () => {
             getPipelineInput: jest.fn(),
           },
         },
+        { provide: ReportPdfService, useValue: { build: jest.fn() } },
       ],
     }).compile();
 
     service = module.get(AnalysisService);
     analysisRepository = module.get(getRepositoryToken(Analysis));
     fieldsService = module.get(FieldsService);
+    reportPdfService = module.get(ReportPdfService);
   });
 
   describe('findOneOwned', () => {
@@ -253,19 +257,68 @@ describe('AnalysisService', () => {
       );
     });
 
-    it('getReportPdfPath devuelve el path si el análisis tiene PDF generado', () => {
-      const analysis = buildAnalysis({
-        resultJson: { mode: 'python-worker-v2', message: '', report: { pdfPath: '/tmp/report.pdf' } },
-      });
+  });
 
-      expect(service.getReportPdfPath(analysis)).toBe('/tmp/report.pdf');
+  describe('buildReportPdf (PDF-1)', () => {
+    // AUTH-4: mismo gate de ownership que getReportPath/getReportPdfPath — vuelve a
+    // resolver el Field dueño (resolveOwnedFieldId) antes de delegar en ReportPdfService, así
+    // nunca genera el PDF antes de confirmar quién es el dueño.
+    it('resuelve el Field por scope=field y delega en ReportPdfService.build', async () => {
+      const analysis = buildAnalysis({ scope: 'field', fieldId: 'field-1' });
+      const field = buildField();
+      const built = { stream: {} as any, filename: 'agroscore-reporte-campo-a-2026-01-01.pdf' };
+
+      fieldsService.findOne.mockResolvedValue(field);
+      reportPdfService.build.mockResolvedValue(built);
+
+      const result = await service.buildReportPdf(analysis, 'user-A');
+
+      expect(fieldsService.findOne).toHaveBeenCalledWith('field-1', 'user-A');
+      expect(reportPdfService.build).toHaveBeenCalledWith(analysis, field);
+      expect(result).toBe(built);
     });
 
-    it('getReportPdfPath lanza NotFoundException si no hay PDF generado', () => {
-      const analysis = buildAnalysis({ resultJson: null });
+    it('resuelve el Field por scope=null legacy (fieldId guardado en lotId)', async () => {
+      const analysis = buildAnalysis({ scope: null, lotId: 'field-1', fieldId: null });
+      const field = buildField();
 
-      expect(() => service.getReportPdfPath(analysis)).toThrow(
-        'El análisis no tiene PDF generado.',
+      fieldsService.findOne.mockResolvedValue(field);
+      reportPdfService.build.mockResolvedValue({ stream: {} as any, filename: 'x.pdf' });
+
+      await service.buildReportPdf(analysis, 'user-A');
+
+      expect(fieldsService.findOne).toHaveBeenCalledWith('field-1', 'user-A');
+    });
+
+    it('lanza NotFoundException para scope=lot sin llamar a FieldsService ni a ReportPdfService', async () => {
+      const analysis = buildAnalysis({ scope: 'lot', lotId: 'lot-1', fieldId: null });
+
+      await expect(service.buildReportPdf(analysis, 'user-A')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(fieldsService.findOne).not.toHaveBeenCalled();
+      expect(reportPdfService.build).not.toHaveBeenCalled();
+    });
+
+    it('propaga NotFoundException si el Field resuelto es de otro usuario, sin generar el PDF', async () => {
+      const analysis = buildAnalysis({ scope: 'field', fieldId: 'field-1' });
+      fieldsService.findOne.mockRejectedValue(new NotFoundException('Campo no encontrado.'));
+
+      await expect(service.buildReportPdf(analysis, 'user-B')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(reportPdfService.build).not.toHaveBeenCalled();
+    });
+
+    it('propaga el error de ReportPdfService.build (p.ej. análisis sin datos suficientes)', async () => {
+      const analysis = buildAnalysis({ scope: 'field', fieldId: 'field-1' });
+      fieldsService.findOne.mockResolvedValue(buildField());
+      reportPdfService.build.mockRejectedValue(
+        new NotFoundException('El análisis no tiene datos suficientes para generar el reporte.'),
+      );
+
+      await expect(service.buildReportPdf(analysis, 'user-A')).rejects.toThrow(
+        'El análisis no tiene datos suficientes para generar el reporte.',
       );
     });
   });

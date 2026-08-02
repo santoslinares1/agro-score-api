@@ -15,7 +15,7 @@ describe('AnalysisController', () => {
       AnalysisService,
       | 'findOneOwned'
       | 'getReportPath'
-      | 'getReportPdfPath'
+      | 'buildReportPdf'
       | 'findAll'
       | 'findByField'
       | 'runFieldAnalysis'
@@ -39,7 +39,7 @@ describe('AnalysisController', () => {
           useValue: {
             findOneOwned: jest.fn(),
             getReportPath: jest.fn(),
-            getReportPdfPath: jest.fn(),
+            buildReportPdf: jest.fn(),
             findAll: jest.fn(),
             findByField: jest.fn(),
             runFieldAnalysis: jest.fn(),
@@ -83,11 +83,11 @@ describe('AnalysisController', () => {
     });
   });
 
-  describe('reportes: gate de ownership antes de tocar el filesystem (AUTH-4)', () => {
+  describe('reportes HTML: gate de ownership antes de tocar el filesystem (AUTH-4)', () => {
     const cases: Array<{
       name: string;
       call: (id: string, req: any, res: any) => Promise<unknown>;
-      pathMethod: 'getReportPath' | 'getReportPdfPath';
+      pathMethod: 'getReportPath';
       contentType: string;
       disposition: string;
     }> = [
@@ -104,13 +104,6 @@ describe('AnalysisController', () => {
         pathMethod: 'getReportPath',
         contentType: 'text/html; charset=utf-8',
         disposition: 'attachment; filename="agro-score-report-analysis-1.html"',
-      },
-      {
-        name: 'downloadPdfReport',
-        call: (id, r, res) => controller.downloadPdfReport(id, r, res),
-        pathMethod: 'getReportPdfPath',
-        contentType: 'application/pdf',
-        disposition: 'attachment; filename="agro-score-report-analysis-1.pdf"',
       },
     ];
 
@@ -175,5 +168,54 @@ describe('AnalysisController', () => {
         });
       });
     }
+  });
+
+  describe('downloadPdfReport (PDF-1): gate de ownership antes de generar el PDF (AUTH-4)', () => {
+    it('si findOneOwned rechaza (ajeno/legacy), nunca llega a generar el PDF', async () => {
+      analysisService.findOneOwned.mockRejectedValue(
+        new NotFoundException('Análisis no encontrado.'),
+      );
+
+      await expect(
+        controller.downloadPdfReport('analysis-1', req, buildRes()),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(analysisService.buildReportPdf).not.toHaveBeenCalled();
+    });
+
+    it('si el análisis es propio pero no tiene datos suficientes, propaga el error del service', async () => {
+      analysisService.findOneOwned.mockResolvedValue({ id: 'analysis-1' } as any);
+      analysisService.buildReportPdf.mockRejectedValue(
+        new NotFoundException('El análisis no tiene datos suficientes para generar el reporte.'),
+      );
+
+      await expect(
+        controller.downloadPdfReport('analysis-1', req, buildRes()),
+      ).rejects.toThrow('El análisis no tiene datos suficientes para generar el reporte.');
+    });
+
+    it('camino feliz: ownership + PDF generado -> streamea la respuesta con los headers correctos', async () => {
+      const analysis = { id: 'analysis-1' } as any;
+      analysisService.findOneOwned.mockResolvedValue(analysis);
+
+      const pipeMock = jest.fn();
+      const endMock = jest.fn();
+      analysisService.buildReportPdf.mockResolvedValue({
+        stream: { pipe: pipeMock, end: endMock } as any,
+        filename: 'agroscore-reporte-campo-a-2026-01-01.pdf',
+      });
+
+      const res = buildRes();
+      await controller.downloadPdfReport('analysis-1', req, res);
+
+      expect(analysisService.buildReportPdf).toHaveBeenCalledWith(analysis, 'user-A');
+      expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'application/pdf');
+      expect(res.setHeader).toHaveBeenCalledWith(
+        'Content-Disposition',
+        'attachment; filename="agroscore-reporte-campo-a-2026-01-01.pdf"',
+      );
+      expect(pipeMock).toHaveBeenCalledWith(res);
+      expect(endMock).toHaveBeenCalled();
+    });
   });
 });
