@@ -7,6 +7,7 @@ import { PythonWorkerModule } from './python-worker/python-worker.module';
 import { FieldsModule } from './fields/fields.module';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
+import { ContactModule } from './contact/contact.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { AuthModule } from './auth/auth.module';
     FieldsModule,
     UsersModule,
     AuthModule,
+    ContactModule,
   ],
 })
 export class AppModule {}
