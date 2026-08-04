@@ -1,10 +1,18 @@
 import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+
+  // SEC-FIX-1: cabeceras de seguridad HTTP estándar. No interfiere con CORS
+  // (son middlewares independientes) ni con el CORS_ORIGIN + credentials ni
+  // con el preflight OPTIONS; crossOriginResourcePolicy default ('same-origin')
+  // solo bloquea requests no-cors (ej. <img>/<script> cross-origin), no fetch/XHR
+  // en modo cors como el que usa el frontend (incluida la descarga del PDF vía blob).
+  app.use(helmet());
 
   const config = app.get(ConfigService);
   const frontendUrl =
@@ -31,4 +39,7 @@ async function bootstrap() {
   await app.listen(port, '0.0.0.0');
 }
 
-bootstrap();
+bootstrap().catch((error: Error) => {
+  console.error(`[bootstrap] No se pudo iniciar el backend: ${error.message}`);
+  process.exit(1);
+});

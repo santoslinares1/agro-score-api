@@ -6,6 +6,7 @@ import { PassportModule } from '@nestjs/passport';
 import { UsersModule } from '../users/users.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
+import { getRequiredJwtSecret } from './jwt-secret.util';
 import { JwtStrategy } from './jwt.strategy';
 
 @Module({
@@ -16,9 +17,8 @@ import { JwtStrategy } from './jwt.strategy';
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_SECRET') || 'dev-secret-change-me',
+        secret: getRequiredJwtSecret(config),
         signOptions: {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           expiresIn: (config.get<string>('JWT_EXPIRES_IN') || '7d') as any,
         },
       }),

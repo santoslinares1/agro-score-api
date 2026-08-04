@@ -1,4 +1,6 @@
+import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test, TestingModule } from '@nestjs/testing';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 
 import { ContactProfile } from './contact-profile.enum';
 import { ContactController } from './contact.controller';
@@ -21,6 +23,9 @@ describe('ContactController', () => {
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
+      imports: [
+        ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 20 }]),
+      ],
       controllers: [ContactController],
       providers: [
         {
@@ -61,5 +66,20 @@ describe('ContactController', () => {
       ok: false,
       message: 'No pudimos enviar la consulta en este momento',
     });
+  });
+
+  // SEC-003: POST /contact es público — debe quedar atado a ThrottlerGuard
+  // con un límite explícito para mitigar spam/flood básico.
+  it('POST /contact tiene ThrottlerGuard con límite de 3 req/min', () => {
+    const create = (controller as unknown as Record<string, () => unknown>)
+      .create;
+
+    const guards = Reflect.getMetadata(GUARDS_METADATA, create) as
+      | unknown[]
+      | undefined;
+    expect(guards).toContain(ThrottlerGuard);
+
+    expect(Reflect.getMetadata('THROTTLER:LIMITdefault', create)).toBe(3);
+    expect(Reflect.getMetadata('THROTTLER:TTLdefault', create)).toBe(60_000);
   });
 });

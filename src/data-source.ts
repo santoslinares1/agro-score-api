@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { DataSource } from 'typeorm';
 
 import { Analysis } from './analysis/entities/analysis.entity';
+import { resolveDatabaseSsl } from './config/database-ssl.util';
 import { Field } from './fields/entities/field.entity';
 import { FieldLot } from './fields/entities/field-lot.entity';
 import { User } from './users/user.entity';
@@ -31,4 +32,9 @@ export const AppDataSource = new DataSource({
   migrations: ['src/migrations/*.ts'],
   migrationsTableName: 'migrations',
   synchronize: false,
+  // SEC-004: mismo criterio que app.module.ts — ver config/database-ssl.util.ts.
+  ssl: resolveDatabaseSsl(
+    process.env.DATABASE_SSL,
+    process.env.DATABASE_SSL_REJECT_UNAUTHORIZED,
+  ),
 });
