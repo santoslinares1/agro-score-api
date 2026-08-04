@@ -24,7 +24,8 @@
     "migration:revert": "npm run typeorm -- migration:revert",
     "migration:show": "npm run typeorm -- migration:show",
     "migration:baseline": "ts-node -r tsconfig-paths/register scripts/baseline-migration.ts",
-    "backfill:fields-user": "ts-node -r tsconfig-paths/register scripts/backfill-fields-user.ts"
+    "backfill:fields-user": "ts-node -r tsconfig-paths/register scripts/backfill-fields-user.ts",
+    "promote:user-role": "ts-node -r tsconfig-paths/register scripts/promote-user-role.ts"
   },
   "dependencies": {
     "@nestjs/axios": "^4.0.1",

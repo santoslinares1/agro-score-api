@@ -79,6 +79,33 @@ export class Analysis {
   @Column({ type: 'jsonb', nullable: true })
   resultJson: WorkerResultJson | null;
 
+  /**
+   * ADMIN-1: timing/error para el panel admin. Nullable: los análisis
+   * creados antes de esta migración no los tienen y eso es válido — no hay
+   * backfill posible (no se guardaba el dato antes), así que se muestran
+   * como null en vez de inventar un valor. `status` sigue siendo la fuente
+   * de verdad ('Procesando'/'Finalizado'/'Error'); estas columnas son
+   * metadata adicional, no un estado paralelo.
+   */
+  @Column({ type: 'timestamp', nullable: true })
+  startedAt: Date | null;
+
+  @Column({ type: 'timestamp', nullable: true })
+  completedAt: Date | null;
+
+  @Column({ type: 'timestamp', nullable: true })
+  failedAt: Date | null;
+
+  @Column({ type: 'int', nullable: true })
+  durationMs: number | null;
+
+  /**
+   * Mensaje resumido y truncado (ver ANALYSIS_ERROR_MESSAGE_MAX_LENGTH en
+   * analysis.service.ts) — nunca el stack trace completo ni datos sensibles.
+   */
+  @Column({ type: 'varchar', nullable: true })
+  errorMessage: string | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

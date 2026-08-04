@@ -1,9 +1,11 @@
 import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
+import { getRepositoryToken } from '@nestjs/typeorm';
 
 import { AccessRequestProfile } from './access-request-profile.enum';
 import { AccessRequestService } from './access-request.service';
 import { CreateAccessRequestDto } from './dto/create-access-request.dto';
+import { AccessRequest } from './entities/access-request.entity';
 
 interface SentEmailCall {
   to: string;
@@ -30,6 +32,13 @@ jest.mock('resend', () => ({
 function lastSentEmail(): SentEmailCall {
   return sendMock.mock.calls[0][0];
 }
+
+const accessRequestRepositoryMock = {
+  create: jest.fn((data: Partial<AccessRequest>) => data),
+  save: jest.fn((data: Partial<AccessRequest>) =>
+    Promise.resolve({ id: 'access-request-1', ...data }),
+  ),
+};
 
 describe('AccessRequestService', () => {
   let service: AccessRequestService;
@@ -61,6 +70,10 @@ describe('AccessRequestService', () => {
           provide: ConfigService,
           useValue: { get: (key: string) => env[key] },
         },
+        {
+          provide: getRepositoryToken(AccessRequest),
+          useValue: accessRequestRepositoryMock,
+        },
       ],
     }).compile();
 
@@ -69,6 +82,23 @@ describe('AccessRequestService', () => {
 
   beforeEach(() => {
     sendMock.mockReset();
+    accessRequestRepositoryMock.create.mockClear();
+    accessRequestRepositoryMock.save.mockClear();
+  });
+
+  it('persiste la solicitud en DB antes de intentar el envío de mail (ADMIN-1)', async () => {
+    service = await buildService({ CONTACT_EMAIL_DRY_RUN: 'true' });
+
+    await service.sendAccessRequest(dto);
+
+    expect(accessRequestRepositoryMock.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'Santos Linares',
+        email: 'santos9linares@gmail.com',
+        organization: 'Campo La Esperanza',
+        profile: AccessRequestProfile.PRODUCER,
+      }),
+    );
   });
 
   describe('dry-run', () => {

@@ -1,9 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { InjectRepository } from '@nestjs/typeorm';
 import { Resend } from 'resend';
+import { Repository } from 'typeorm';
 
 import { ACCESS_REQUEST_PROFILE_LABELS } from './access-request-profile.enum';
 import { CreateAccessRequestDto } from './dto/create-access-request.dto';
+import { AccessRequest } from './entities/access-request.entity';
 
 export interface AccessRequestResult {
   ok: boolean;
@@ -44,11 +47,31 @@ export class AccessRequestService {
   private readonly logger = new Logger(AccessRequestService.name);
   private resendClient: Resend | null = null;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    @InjectRepository(AccessRequest)
+    private readonly accessRequestRepository: Repository<AccessRequest>,
+  ) {}
 
   async sendAccessRequest(
     dto: CreateAccessRequestDto,
   ): Promise<AccessRequestResult> {
+    // ADMIN-1: persiste primero — así la solicitud queda visible en
+    // /admin/access-requests aunque el envío de mail (Resend) falle después.
+    // No se persiste dentro del try/catch de envío: si guardar en DB falla,
+    // preferimos que el request entero falle con 500 antes que devolver un
+    // falso "enviado" que después no aparece en ningún lado.
+    await this.accessRequestRepository.save(
+      this.accessRequestRepository.create({
+        name: dto.name.trim(),
+        email: dto.email.trim(),
+        organization: dto.organization.trim(),
+        profile: dto.profile,
+        estimatedSurface: dto.estimatedSurface?.trim() || undefined,
+        message: dto.message?.trim() || undefined,
+      }),
+    );
+
     const mail = this.buildMail(dto);
 
     if (this.isDryRun()) {

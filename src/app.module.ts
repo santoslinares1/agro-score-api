@@ -11,6 +11,7 @@ import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { ContactModule } from './contact/contact.module';
 import { AccessRequestModule } from './access-request/access-request.module';
+import { AdminModule } from './admin/admin.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
@@ -68,6 +69,7 @@ import { AppService } from './app.service';
     AuthModule,
     ContactModule,
     AccessRequestModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [AppService],

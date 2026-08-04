@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { DataSource } from 'typeorm';
 
+import { AccessRequest } from './access-request/entities/access-request.entity';
 import { Analysis } from './analysis/entities/analysis.entity';
 import { resolveDatabaseSsl } from './config/database-ssl.util';
 import { Field } from './fields/entities/field.entity';
@@ -28,7 +29,7 @@ export const AppDataSource = new DataSource({
   username: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  entities: [User, Field, FieldLot, Analysis],
+  entities: [User, Field, FieldLot, Analysis, AccessRequest],
   migrations: ['src/migrations/*.ts'],
   migrationsTableName: 'migrations',
   synchronize: false,

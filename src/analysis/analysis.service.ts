@@ -12,6 +12,11 @@ import { Field } from '../fields/entities/field.entity';
 import { FieldsService } from '../fields/fields.service';
 import { FieldAnalysisSummary } from './dto/field-analysis-summary.dto';
 import { ReportPdfService } from './report-pdf/report-pdf.service';
+
+// ADMIN-1: cota para errorMessage — nunca stack traces completos ni datos
+// sensibles, solo lo suficiente para que el panel admin muestre qué pasó.
+const ANALYSIS_ERROR_MESSAGE_MAX_LENGTH = 500;
+
 @Injectable()
 export class AnalysisService {
   private readonly logger = new Logger(AnalysisService.name);
@@ -244,6 +249,7 @@ export class AnalysisService {
       lotId: null,
       lotName: fieldInput.name,
       status: 'Procesando',
+      startedAt: new Date(),
       maxCloudiness: input.maxCloudiness,
       startDate: input.startDate,
       endDate: input.endDate,
@@ -309,7 +315,15 @@ export class AnalysisService {
 
       const analysis = await this.findOne(analysisId);
 
+      const completedAt = new Date();
+
       analysis.status = 'Finalizado';
+      analysis.completedAt = completedAt;
+      analysis.durationMs = this.computeDurationMs(
+        analysis.startedAt,
+        completedAt,
+      );
+      analysis.errorMessage = null;
       analysis.globalScore = result.globalScore;
       analysis.category = result.category;
       analysis.confidenceScore = result.confidenceScore;
@@ -350,7 +364,15 @@ export class AnalysisService {
       });
 
       if (analysis) {
+        const failedAt = new Date();
+
         analysis.status = 'Error';
+        analysis.failedAt = failedAt;
+        analysis.durationMs = this.computeDurationMs(
+          analysis.startedAt,
+          failedAt,
+        );
+        analysis.errorMessage = this.summarizeError(error);
         analysis.category = 'Error al procesar análisis de campo';
         analysis.resultJson = {
           mode: 'error',
@@ -365,5 +387,26 @@ export class AnalysisService {
         await this.analysisRepository.save(analysis);
       }
     }
+  }
+
+  /**
+   * ADMIN-1: análisis viejos sin startedAt (creados antes de esta migración)
+   * no tienen forma real de calcular duración — se deja null en vez de
+   * inventar un número con createdAt como sustituto.
+   */
+  private computeDurationMs(startedAt: Date | null, endedAt: Date): number | null {
+    if (!startedAt) {
+      return null;
+    }
+
+    return endedAt.getTime() - new Date(startedAt).getTime();
+  }
+
+  private summarizeError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+
+    return message.length > ANALYSIS_ERROR_MESSAGE_MAX_LENGTH
+      ? `${message.slice(0, ANALYSIS_ERROR_MESSAGE_MAX_LENGTH)}…`
+      : message;
   }
 }
