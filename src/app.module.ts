@@ -11,6 +11,8 @@ import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { ContactModule } from './contact/contact.module';
 import { AccessRequestModule } from './access-request/access-request.module';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
 
 @Module({
   imports: [
@@ -67,5 +69,7 @@ import { AccessRequestModule } from './access-request/access-request.module';
     ContactModule,
     AccessRequestModule,
   ],
+  controllers: [AppController],
+  providers: [AppService],
 })
 export class AppModule {}
