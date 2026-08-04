@@ -10,6 +10,7 @@ import { FieldsModule } from './fields/fields.module';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { ContactModule } from './contact/contact.module';
+import { AccessRequestModule } from './access-request/access-request.module';
 
 @Module({
   imports: [
@@ -64,6 +65,7 @@ import { ContactModule } from './contact/contact.module';
     UsersModule,
     AuthModule,
     ContactModule,
+    AccessRequestModule,
   ],
 })
 export class AppModule {}
