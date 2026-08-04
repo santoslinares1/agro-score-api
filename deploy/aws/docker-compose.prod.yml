@@ -1,0 +1,70 @@
+# DEPLOY-AWS-1: compose productivo para EC2. Pensado para correr desde
+# /opt/agroscore/agro-score-api (ver README.md de esta carpeta) con
+# agro-score-worker clonado como repo hermano en /opt/agroscore/agro-score-worker.
+#
+# Postgres — dos opciones, ver README.md sección "Base de datos":
+#   Opción A (recomendada): RDS externo. Borrar/comentar el servicio
+#     `postgres` de abajo y su entrada en `depends_on` de agro-score-api;
+#     apuntar DB_HOST/DB_PORT en .env.backend al endpoint de RDS.
+#   Opción B (temporal): Postgres en este mismo compose, sin exponer puerto
+#     al host (solo `expose`, nunca `ports`), con volumen persistente.
+#
+# Ningún servicio publica un puerto público salvo agro-score-api, y ese
+# puerto se publica SOLO en 127.0.0.1 (Nginx en el host hace el proxy desde
+# ahí hacia afuera). agro-score-worker y postgres solo son alcanzables desde
+# la red interna `agroscore_internal` — no exponen ningún puerto al host.
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: agro_score_postgres
+    restart: unless-stopped
+    env_file:
+      - .env.postgres
+    expose:
+      - "5432"
+    volumes:
+      - agro_score_postgres_data:/var/lib/postgresql/data
+    networks:
+      - agroscore_internal
+
+  agro-score-worker:
+    build:
+      context: ../../../agro-score-worker
+      dockerfile: Dockerfile
+    container_name: agro_score_worker
+    restart: unless-stopped
+    env_file:
+      - .env.worker
+    volumes:
+      # Solo lectura — el JSON del service account nunca se copia dentro de
+      # la imagen, se monta desde el host en runtime.
+      - /opt/agroscore/secrets/gee-service-account.json:/run/secrets/gee-service-account.json:ro
+    expose:
+      - "8000"
+    networks:
+      - agroscore_internal
+
+  agro-score-api:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    container_name: agro_score_api
+    restart: unless-stopped
+    env_file:
+      - .env.backend
+    depends_on:
+      - postgres
+      - agro-score-worker
+    ports:
+      # Solo localhost — Nginx en el host es el único punto público (80/443).
+      - "127.0.0.1:3001:3001"
+    networks:
+      - agroscore_internal
+
+networks:
+  agroscore_internal:
+    driver: bridge
+
+volumes:
+  agro_score_postgres_data:

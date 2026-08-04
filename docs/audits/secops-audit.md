@@ -19,7 +19,9 @@ Ninguno de estos hallazgos requiere reescribir el producto. Son correcciones pun
 
 **Veredicto original: NO LISTO para deploy.** Ver sección 11 para la lista acotada de acciones obligatorias antes de desplegar.
 
-> **Actualización SEC-FIX-1 (2026-08-03):** se corrigieron los bloqueantes de código/config más graves — SEC-001, SEC-002, SEC-003, SEC-004, SEC-017 quedan **resueltos**; SEC-005/SEC-007 quedan **parcialmente mitigados** (límites de input agregados, auth interna del worker sigue pendiente como deuda de `SEC-FIX-2`); SEC-009 (leak de excepciones del worker) quedó resuelto como efecto colateral de la Parte 7. **El veredicto sigue siendo NO LISTO para deploy** — el bloqueante restante es exclusivamente de infraestructura: SEC-006/SEC-008 (Dockerfiles, compose de producción, Nginx, SSL) no existen todavía y quedan para `DEPLOY-AWS-1`. Detalle completo de qué se cambió, cómo se validó y qué queda abierto en [`sec-fix-1.md`](./sec-fix-1.md).
+> **Actualización SEC-FIX-1 (2026-08-03):** se corrigieron los bloqueantes de código/config más graves — SEC-001, SEC-002, SEC-003, SEC-004, SEC-017 quedan **resueltos**; SEC-005/SEC-007 quedan **parcialmente mitigados** (límites de input agregados, auth interna del worker sigue pendiente como deuda de `SEC-FIX-2`); SEC-009 (leak de excepciones del worker) quedó resuelto como efecto colateral de la Parte 7. Detalle completo en [`sec-fix-1.md`](./sec-fix-1.md).
+>
+> **Actualización DEPLOY-AWS-1 (2026-08-03):** se construyó la infraestructura de deploy que faltaba — Dockerfiles de backend y worker (validados con `docker build` real), `docker-compose.prod.yml` (worker y Postgres sin publicar puerto al host), Nginx + guía de Certbot, y documentación completa de deploy a EC2 + actualización de la landing en S3. **SEC-008 y SEC-006 quedan resueltos.** SEC-005 queda mejor mitigado (aislamiento de red real) pero sigue sin auth interna (`SEC-FIX-2`). **Con esto, ya no queda ningún bloqueante de infraestructura pendiente de construir** — lo que resta es ejecutar el deploy real (fuera de alcance de esta ficha, que fue solo de preparación) y la deuda ya documentada. Detalle completo en [`deploy-aws-1.md`](./deploy-aws-1.md).
 
 ---
 
@@ -63,10 +65,10 @@ Formato: `ID | Severidad | Componente | Resumen | Prioridad`. Detalle completo (
 | SEC-002 | Backend | `JWT_SECRET` tiene fallback inseguro hardcodeado (`'dev-secret-change-me'`) en 2 archivos | Antes de deploy | ✅ **Resuelto (SEC-FIX-1)** — fail-fast |
 | SEC-003 | Backend | Sin rate limiting en `/auth/login` ni `/contact` (sin `@nestjs/throttler`) | Antes de deploy | ✅ **Resuelto (SEC-FIX-1)** |
 | SEC-004 | Backend/DB | Sin SSL/TLS configurado en la conexión TypeORM → Postgres | Antes de deploy | ✅ **Resuelto (SEC-FIX-1)** — configurable, ver deuda abajo |
-| SEC-005 | Worker | Sin ninguna autenticación — `/analyze` es invocable por cualquiera con acceso de red | Antes de deploy | ⚠️ **Abierto** — deuda documentada como `SEC-FIX-2` |
-| SEC-006 | Docker/Deploy | `docker-compose.yml` expone Postgres en `0.0.0.0:5434` con password de desarrollo hardcodeada | Antes de deploy | ⚠️ Abierto — `DEPLOY-AWS-1` |
+| SEC-005 | Worker | Sin ninguna autenticación — `/analyze` es invocable por cualquiera con acceso de red | Antes de deploy | 🟡 **Mejor mitigado (DEPLOY-AWS-1)** — aislamiento de red real; auth interna sigue como deuda `SEC-FIX-2` |
+| SEC-006 | Docker/Deploy | `docker-compose.yml` (dev) expone Postgres en `0.0.0.0:5434` con password de desarrollo hardcodeada | Antes de deploy | ✅ **Resuelto en el compose productivo (DEPLOY-AWS-1)** — el compose de dev no se tocó (sigue siendo solo para desarrollo local) |
 | SEC-007 | Worker | Sin límites de input (`lots`, `zone_campaign_years`, `n_zones`, `zone_resolution`, dimensiones de imágenes) — riesgo de DoS y abuso de cuota de Earth Engine | Antes de deploy | 🟡 **Parcialmente mitigado (SEC-FIX-1)** — ver detalle |
-| SEC-008 | Docker/Deploy | No existe ningún Dockerfile (backend ni worker), ni Nginx, ni SSL, ni compose de producción en ningún repo | Antes de deploy | ⚠️ Abierto — `DEPLOY-AWS-1` (bloqueante restante principal) |
+| SEC-008 | Docker/Deploy | No existe ningún Dockerfile (backend ni worker), ni Nginx, ni SSL, ni compose de producción en ningún repo | Antes de deploy | ✅ **Resuelto (DEPLOY-AWS-1)** — ver `deploy-aws-1.md` |
 
 ### Medio
 
@@ -241,7 +243,7 @@ Recomendación (Bajo/Informativo, no bloqueante): agregar un `ExceptionFilter` g
 - Riesgo: cualquiera con acceso de red al puerto 8000 puede invocar `/analyze` directamente, saltándose el backend (y por lo tanto el rate limiting, la autenticación de usuario y el control de ownership que sí existen del lado de NestJS), disparando cómputo de Earth Engine potencialmente costoso.
 - Mitigación disponible: si en producción el worker queda 100% en la red interna de Docker Compose sin ningún puerto publicado al host ni a internet, este riesgo queda contenido por aislamiento de red. **Pero hoy no hay ninguna capa de defensa en profundidad adicional si ese aislamiento fallara** (un error de configuración en el compose de producción, por ejemplo).
 - Recomendación: (a) garantizar que el worker no publique puerto al host en el compose de producción (`expose` en vez de `ports`), y (b) considerar una capa mínima de autenticación interna (API key compartida entre backend y worker vía env) como defensa en profundidad, ya que es barata de implementar.
-- **Estado: ⚠️ abierto, deliberadamente no resuelto en SEC-FIX-1.** La ficha SEC-FIX-1 solo documentó la variable `WORKER_INTERNAL_TOKEN=` en `agro-score-worker/.env.example` como deuda explícita para no mezclar auth interna con los cambios de límites de input. Queda como `SEC-FIX-2`: backend manda header `X-Worker-Token`, worker lo valida y rechaza si falta. El aislamiento de red (a) sigue dependiendo de `DEPLOY-AWS-1`.
+- **Estado: 🟡 mejor mitigado (DEPLOY-AWS-1), auth interna sigue sin implementar.** `SEC-FIX-1` solo había documentado la variable `WORKER_INTERNAL_TOKEN=` como deuda. `DEPLOY-AWS-1` implementó la mitigación (a) real: en `deploy/aws/docker-compose.prod.yml` el worker usa `expose: ["8000"]` (nunca `ports:`), así que no hay forma de alcanzarlo desde fuera de la red interna de Docker, ni siquiera con el Security Group mal configurado (el puerto ni siquiera está publicado al host). Sigue sin existir la mitigación (b) — auth interna en sí — documentada como `SEC-FIX-2` en ambos `env.worker.example`.
 
 `/health` sin auth — correcto, es lo esperado para un healthcheck interno de Docker/orquestador.
 
@@ -344,13 +346,13 @@ Este es el hallazgo estructural más importante de la auditoría: **la infraestr
 - Evidencia: `find` recursivo (excluyendo `node_modules`/`.git`/`venv`) no encontró ningún `Dockerfile` en `agro-score-api`, `agro-score-worker` ni `agro-score-web`. El único artefacto de infraestructura en los 3 repos es `agro-score-api/docker-compose.yml`, y solo define el servicio `postgres` (para desarrollo local) — no define backend, no define worker, no define Nginx. No hay `.dockerignore` en ningún repo. No hay `nginx.conf`, ni configuración de Certbot/SSL en ningún lugar. Los README de los 3 repos no contienen un plan de deploy real (el de `agro-score-api` es el boilerplate default de NestJS, mencionando la plataforma comercial "Mau" de NestJS, no AWS EC2; `agro-score-worker` no tiene README).
 - Implicación directa: el plan de deploy (EC2 + Docker Compose + Nginx + SSL) descrito en la ficha **no tiene ningún artefacto construido todavía**. Es el prerequisito bloqueante número uno antes de cualquier otro paso de deploy.
 - Recomendación: ficha dedicada (`DEPLOY-AWS-1`, propuesta en sección 14) para construir Dockerfile de backend (multi-stage, `npm ci --omit=dev`, usuario no-root, sin copiar `.env`), Dockerfile de worker (idealmente basado en una imagen con dependencias geoespaciales ya optimizadas, usuario no-root, sin `report.py`/Playwright si se limpia primero — ver SEC-021), `docker-compose.prod.yml` con los 4 servicios (postgres, backend, worker, nginx) y networking interno, y configuración de Nginx + Certbot.
-- Estado: abierto.
+- **Estado: ✅ resuelto (DEPLOY-AWS-1).** `Dockerfile` multi-stage en backend (Node 24, `npm ci --omit=dev` en runtime, usuario no-root `agroscore`, sin copiar `.env`) y en worker (Python 3.12-slim, usuario no-root, sin copiar `.env` ni credenciales JSON) — ambos con `.dockerignore`, ambos validados con `docker build` real y smoke test de arranque. `deploy/aws/docker-compose.prod.yml` con backend + worker + Postgres (Opción B) y red interna Docker; Nginx solo proxyea al backend (`deploy/aws/nginx/agroscore-api.conf`), nunca al worker ni a Postgres. Guía de Certbot en `deploy/aws/README.md`. Detalle completo, incluidos varios hallazgos nuevos encontrados al construir esto (ruta real del build compilado, nombres reales de env vars, gap de `.gitignore`), en [`deploy-aws-1.md`](./deploy-aws-1.md).
 
 **SEC-006 [Alto] — Patrón de exposición de Postgres en el compose existente**
 - Evidencia: `docker-compose.yml:6-12` — `POSTGRES_PASSWORD: agro_password` hardcodeada, puerto publicado como `"5434:5432"`. Confirmado en el entorno de desarrollo actual: `ss -ltn` muestra el puerto escuchando en `0.0.0.0:5434` y `[::]:5434` (todas las interfaces), no solo `127.0.0.1`, que es el comportamiento default de Docker Compose para `ports:` a menos que se especifique el bind explícitamente (`"127.0.0.1:5434:5432"`).
 - Riesgo: es el único compose existente en el repo, y el más probable candidato a copiarse/extenderse para producción. Si se reutiliza tal cual en el EC2 de producción sin ajustar el bind y sin que el Security Group bloquee el puerto 5432/5434 desde internet, Postgres quedaría expuesto públicamente con una contraseña de desarrollo conocida.
 - Recomendación: en el compose de producción, Postgres no debe publicar puerto al host en absoluto (los otros servicios lo alcanzan por la red interna de Docker); si se necesita acceso puntual para debug, bindear explícitamente a `127.0.0.1` y nunca reusar la password de dev. Evaluar RDS en vez de Postgres en contenedor para producción (ver checklist DB abajo).
-- Estado: abierto.
+- **Estado: ✅ resuelto en el compose productivo (DEPLOY-AWS-1).** `deploy/aws/docker-compose.prod.yml` define Postgres (Opción B, temporal) con `expose: ["5432"]` únicamente — sin `ports:`, sin exposición a `0.0.0.0` ni a `127.0.0.1`. La Opción A (recomendada) es RDS externo, documentada en `deploy/aws/README.md`. El `docker-compose.yml` de desarrollo local (raíz del repo, no `deploy/aws/`) sigue igual — sigue siendo explícitamente solo para dev, nunca pensado para reutilizarse en prod.
 
 ### Checklist de producción EC2 (a implementar, no existe todavía — ninguno de estos puntos tiene código/config hoy)
 
@@ -440,9 +442,9 @@ Lista acotada — resolver estas antes de desplegar a AWS. Estado actualizado tr
 ## 14. Próximas fichas propuestas
 
 - ~~**SEC-FIX-1**~~ — ✅ Implementado 2026-08-03 (JWT fail-fast, throttler, SSL DB configurable, límites del worker, helmet, manejo de excepciones del worker). Ver [`sec-fix-1.md`](./sec-fix-1.md).
-- **SEC-FIX-2** — Autenticación interna backend↔worker (`WORKER_INTERNAL_TOKEN` / header `X-Worker-Token`, documentado pero no implementado en SEC-FIX-1) + resto de hallazgos Medio no bloqueantes (SEC-010, SEC-011, SEC-012, SEC-014, SEC-015).
-- **DEPLOY-AWS-1** — Construir Dockerfiles, `docker-compose.prod.yml`, Nginx + Certbot, Security Groups, y ejecutar el primer deploy a EC2. Único bloqueante real restante tras SEC-FIX-1.
-- **OBSERVABILITY-1** — Healthchecks del backend, logs gestionables, alertas básicas, CloudWatch.
+- ~~**DEPLOY-AWS-1**~~ — ✅ Preparación completa 2026-08-03 (Dockerfiles, `docker-compose.prod.yml`, Nginx + guía Certbot, doc de deploy a EC2 y de actualización de landing S3). **No incluyó el deploy real** — eso es el próximo paso operativo, no una ficha de código. Ver [`deploy-aws-1.md`](./deploy-aws-1.md).
+- **SEC-FIX-2** — Autenticación interna backend↔worker (`WORKER_INTERNAL_TOKEN` / header `X-Worker-Token`, documentado pero no implementado) + resto de hallazgos Medio no bloqueantes (SEC-010, SEC-011, SEC-012, SEC-014, SEC-015).
+- **OBSERVABILITY-1** — Healthchecks del backend (ya existe `/health` desde `DEPLOY-AWS-1`), logs gestionables, alertas básicas, CloudWatch.
 - **BACKUP-1** — Estrategia de backup de Postgres (dump periódico, retención, prueba de restore) y evaluación de migración a RDS.
 
 ---

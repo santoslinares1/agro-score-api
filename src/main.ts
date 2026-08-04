@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { resolveCorsOrigins } from './config/cors-origins.util';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -15,11 +16,18 @@ async function bootstrap() {
   app.use(helmet());
 
   const config = app.get(ConfigService);
-  const frontendUrl =
-    config.get<string>('FRONTEND_URL') || 'http://localhost:4200';
+
+  // DEPLOY-AWS-1: CORS_ORIGIN admite lista separada por comas (landing en
+  // S3/CloudFront puede responder desde apex + www, o desde el dominio de
+  // CloudFront mientras no haya dominio propio). Sin CORS_ORIGIN, se
+  // mantiene el comportamiento previo de un solo origin vía FRONTEND_URL.
+  const corsOrigins = resolveCorsOrigins(
+    config.get<string>('CORS_ORIGIN'),
+    config.get<string>('FRONTEND_URL'),
+  );
 
   app.enableCors({
-    origin: frontendUrl,
+    origin: corsOrigins,
     credentials: true,
     // PDF-1: sin esto el frontend no puede leer el nombre de archivo real que manda
     // Content-Disposition en /analysis/:id/report/pdf (fetch/XHR ocultan este header en

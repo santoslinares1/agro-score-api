@@ -41,6 +41,12 @@ lerna-debug.log*
 .env.test.local
 .env.production.local
 .env.local
+# DEPLOY-AWS-1: cubre también deploy/aws/.env.backend, .env.worker,
+# .env.postgres y cualquier otro .env.* futuro en cualquier carpeta — los
+# literales de arriba no alcanzaban a estos (hallazgo real encontrado
+# validando el compose de esta ficha, ver deploy-aws-1.md).
+.env.*
+!.env.example
 
 # temp directory
 .temp
