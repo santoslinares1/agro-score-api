@@ -127,6 +127,19 @@ export class UsersService {
     return this.usersRepository.count({ where: { isActive: true } });
   }
 
+  async countCreatedSince(since: Date): Promise<number> {
+    // OJO: 'user' es palabra reservada en Postgres (equivalente a
+    // CURRENT_USER) — un alias `user` sin comillas seguido de una columna
+    // ya entrecomillada (`user."createdAt"`) rompe el parser ("syntax error
+    // at or near \".\""). El resto de los query builders del admin usan
+    // alias como 'field'/'analysis'/'entity' que no chocan con esto; acá
+    // hay que citar el alias a mano.
+    return this.usersRepository
+      .createQueryBuilder('user')
+      .where('"user"."createdAt" >= :since', { since })
+      .getCount();
+  }
+
   toPublicUser(user: User): PublicUser {
     const { passwordHash: _passwordHash, ...publicUser } = user;
 

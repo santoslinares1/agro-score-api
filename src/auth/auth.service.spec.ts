@@ -1,16 +1,36 @@
-import { ConflictException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 import * as bcrypt from 'bcryptjs';
 
+import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
+import { UserRole } from '../users/user-role.enum';
 import { UsersService } from '../users/users.service';
 import { AuthService } from './auth.service';
+import { hashToken } from './token.util';
+
+function buildInvitation(overrides: Partial<UserInvitation> = {}): UserInvitation {
+  return {
+    id: 'invitation-1',
+    email: 'invitado@example.com',
+    role: UserRole.USER,
+    invitedByUserId: 'admin-1',
+    tokenHash: hashToken('raw-token'),
+    expiresAt: new Date(Date.now() + 60_000),
+    acceptedAt: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    ...overrides,
+  } as UserInvitation;
+}
 
 describe('AuthService', () => {
   let service: AuthService;
   let usersService: jest.Mocked<UsersService>;
   let jwtService: jest.Mocked<JwtService>;
+  let invitationRepo: { findOne: jest.Mock; save: jest.Mock };
 
   const buildUser = (overrides: Partial<User> = {}): User => ({
     id: 'user-1',
@@ -25,6 +45,8 @@ describe('AuthService', () => {
   });
 
   beforeEach(async () => {
+    invitationRepo = { findOne: jest.fn(), save: jest.fn() };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AuthService,
@@ -46,6 +68,7 @@ describe('AuthService', () => {
             sign: jest.fn(() => 'signed.jwt.token'),
           },
         },
+        { provide: getRepositoryToken(UserInvitation), useValue: invitationRepo },
       ],
     }).compile();
 
@@ -179,6 +202,60 @@ describe('AuthService', () => {
       usersService.findById.mockResolvedValue(null);
 
       await expect(service.me('user-1')).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+  });
+
+  describe('acceptInvitation', () => {
+    it('crea el usuario con el rol de la invitación, la marca aceptada y nunca devuelve passwordHash', async () => {
+      const invitation = buildInvitation();
+      invitationRepo.findOne.mockResolvedValue(invitation);
+      invitationRepo.save.mockImplementation((v: unknown) => Promise.resolve(v));
+      usersService.findByEmail.mockResolvedValue(null);
+      usersService.create.mockResolvedValue(
+        buildUser({ email: invitation.email, role: UserRole.USER }),
+      );
+
+      const result = await service.acceptInvitation({
+        token: 'raw-token',
+        password: 'password123',
+        fullName: 'Invitado Test',
+      });
+
+      expect(result.user).not.toHaveProperty('passwordHash');
+      expect(usersService.create).toHaveBeenCalledWith(
+        expect.objectContaining({ email: invitation.email, role: UserRole.USER, isActive: true }),
+      );
+      expect(invitationRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ acceptedAt: expect.any(Date) }),
+      );
+    });
+
+    it('rechaza un token que no matchea ninguna invitación', async () => {
+      invitationRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.acceptInvitation({
+          token: 'token-invalido',
+          password: 'password123',
+          fullName: 'X',
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('rechaza si ya existe una cuenta con el email de la invitación', async () => {
+      const invitation = buildInvitation();
+      invitationRepo.findOne.mockResolvedValue(invitation);
+      usersService.findByEmail.mockResolvedValue(buildUser({ email: invitation.email }));
+
+      await expect(
+        service.acceptInvitation({
+          token: 'raw-token',
+          password: 'password123',
+          fullName: 'X',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(usersService.create).not.toHaveBeenCalled();
     });
   });
 });

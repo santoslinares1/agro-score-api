@@ -41,6 +41,8 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
           provide: AdminService,
           useValue: {
             getMetrics: jest.fn().mockResolvedValue({ totalUsers: 0 }),
+            getSystemHealth: jest.fn().mockResolvedValue({ api: { status: 'ok' } }),
+            listAuditLogs: jest.fn().mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
           },
         },
       ],
@@ -79,6 +81,33 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
     await request(app.getHttpServer())
       .get('/admin/metrics')
       .set('x-test-role', UserRole.OWNER)
+      .expect(200);
+  });
+
+  // ADMIN-2: mismos endpoints nuevos, misma composición de guards a nivel
+  // controller — confirma que no quedaron desprotegidos "por error de
+  // copiar/pegar" al agregarlos.
+  it('GET /admin/system/health — role "user" no entra, "owner" sí', async () => {
+    await request(app.getHttpServer())
+      .get('/admin/system/health')
+      .set('x-test-role', UserRole.USER)
+      .expect(403);
+
+    await request(app.getHttpServer())
+      .get('/admin/system/health')
+      .set('x-test-role', UserRole.OWNER)
+      .expect(200);
+  });
+
+  it('GET /admin/audit-logs — role "user" no entra, "admin" sí', async () => {
+    await request(app.getHttpServer())
+      .get('/admin/audit-logs')
+      .set('x-test-role', UserRole.USER)
+      .expect(403);
+
+    await request(app.getHttpServer())
+      .get('/admin/audit-logs')
+      .set('x-test-role', UserRole.ADMIN)
       .expect(200);
   });
 });

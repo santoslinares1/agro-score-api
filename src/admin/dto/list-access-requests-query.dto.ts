@@ -6,7 +6,9 @@ import { PaginationQueryDto } from './pagination-query.dto';
 const ACCESS_REQUEST_STATUSES: AccessRequestStatus[] = [
   'new',
   'contacted',
+  'interested',
   'discarded',
+  'converted',
 ];
 
 export class ListAccessRequestsQueryDto extends PaginationQueryDto {

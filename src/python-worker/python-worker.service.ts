@@ -89,6 +89,25 @@ export class PythonWorkerService {
       'http://localhost:8000';
   }
 
+  /**
+   * ADMIN-2: chequeo liviano para GET /admin/system/health — timeout corto
+   * (3s) porque este endpoint es de un panel admin, no puede colgarse
+   * esperando al worker. No dispara ningún llamado a Earth Engine (el
+   * worker's /health no lo hace tampoco, ver agro-score-worker/app/main.py).
+   */
+  async checkHealth(): Promise<{ status: 'ok' | 'unreachable'; error?: string }> {
+    try {
+      await firstValueFrom(
+        this.httpService.get(`${this.workerUrl}/health`, { timeout: 3000 }),
+      );
+      return { status: 'ok' };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Worker health check failed: ${message}`);
+      return { status: 'unreachable', error: message };
+    }
+  }
+
   async runAnalysis(input: PipelineInput): Promise<WorkerAnalysisResult> {
     const workerPayload = this.mapPipelineInputToWorkerPayload(input);
     return this.postToWorker(workerPayload);

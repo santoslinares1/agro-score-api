@@ -2,7 +2,9 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
+import { TypeOrmModule } from '@nestjs/typeorm';
 
+import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { UsersModule } from '../users/users.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
@@ -13,6 +15,11 @@ import { JwtStrategy } from './jwt.strategy';
   imports: [
     UsersModule,
     PassportModule,
+    // ADMIN-2: POST /auth/accept-invitation necesita leer/marcar
+    // UserInvitation. No se creó un InvitationsModule aparte para esto solo
+    // — es la única consumidora pública de la entidad, AdminModule es dueño
+    // de crearlas.
+    TypeOrmModule.forFeature([UserInvitation]),
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

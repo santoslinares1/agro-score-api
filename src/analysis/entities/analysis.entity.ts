@@ -3,9 +3,13 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  JoinColumn,
+  ManyToOne,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
+
+import { User } from '../../users/user.entity';
 
 export type AnalysisStatus = 'Procesando' | 'Finalizado' | 'Error';
 export type NdviVariability = 'Baja' | 'Media' | 'Alta';
@@ -105,6 +109,28 @@ export class Analysis {
    */
   @Column({ type: 'varchar', nullable: true })
   errorMessage: string | null;
+
+  /**
+   * ADMIN-2: operación sobre diagnósticos fallidos desde el panel admin.
+   * `retryCount`/`lastRetriedAt` reflejan pedidos de reintento ("retry
+   * requested") — ver comentario en AdminService.retryAnalysis: no
+   * re-ejecutan el pipeline todavía, solo llevan la cuenta.
+   */
+  @Column({ type: 'timestamp', nullable: true })
+  reviewedAt: Date | null;
+
+  @Column({ type: 'uuid', nullable: true })
+  reviewedByUserId: string | null;
+
+  @ManyToOne(() => User, { onDelete: 'SET NULL', nullable: true })
+  @JoinColumn({ name: 'reviewedByUserId' })
+  reviewedByUser?: User;
+
+  @Column({ type: 'int', default: 0 })
+  retryCount: number;
+
+  @Column({ type: 'timestamp', nullable: true })
+  lastRetriedAt: Date | null;
 
   @CreateDateColumn()
   createdAt: Date;

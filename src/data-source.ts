@@ -2,10 +2,13 @@ import 'dotenv/config';
 import { DataSource } from 'typeorm';
 
 import { AccessRequest } from './access-request/entities/access-request.entity';
+import { AdminAuditLog } from './admin/entities/admin-audit-log.entity';
 import { Analysis } from './analysis/entities/analysis.entity';
 import { resolveDatabaseSsl } from './config/database-ssl.util';
 import { Field } from './fields/entities/field.entity';
 import { FieldLot } from './fields/entities/field-lot.entity';
+import { PasswordResetToken } from './users/entities/password-reset-token.entity';
+import { UserInvitation } from './users/entities/user-invitation.entity';
 import { User } from './users/user.entity';
 
 /**
@@ -29,7 +32,16 @@ export const AppDataSource = new DataSource({
   username: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  entities: [User, Field, FieldLot, Analysis, AccessRequest],
+  entities: [
+    User,
+    Field,
+    FieldLot,
+    Analysis,
+    AccessRequest,
+    AdminAuditLog,
+    UserInvitation,
+    PasswordResetToken,
+  ],
   migrations: ['src/migrations/*.ts'],
   migrationsTableName: 'migrations',
   synchronize: false,

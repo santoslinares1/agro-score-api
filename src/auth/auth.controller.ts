@@ -3,6 +3,7 @@ import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { Request } from 'express';
 
 import { AuthService } from './auth.service';
+import { AcceptInvitationDto } from './dto/accept-invitation.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { JwtAuthGuard } from './jwt-auth.guard';
@@ -32,6 +33,16 @@ export class AuthController {
   @Get('me')
   me(@Req() req: Request & { user: AuthenticatedUser }) {
     return this.authService.me(req.user.sub);
+  }
+
+  // ADMIN-2: mismo rate limit que register/login (SEC-003) — endpoint
+  // público, el token de invitación es de un solo uso pero igual conviene
+  // no dejarlo abierto a fuerza bruta.
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('accept-invitation')
+  acceptInvitation(@Body() dto: AcceptInvitationDto) {
+    return this.authService.acceptInvitation(dto);
   }
 
   @Post('logout')
