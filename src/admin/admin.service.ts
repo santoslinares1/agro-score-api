@@ -12,7 +12,10 @@ import { LessThan, Repository } from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
+import { AuditActorContext, AuditLogService } from '../audit-log/audit-log.service';
+import { AdminAuditLog } from '../audit-log/entities/admin-audit-log.entity';
 import { generateToken, hashToken } from '../auth/token.util';
+import { EmailSendResult, EmailService } from '../email/email.service';
 import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
@@ -21,7 +24,6 @@ import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
 import { UserRole } from '../users/user-role.enum';
 import { PublicUser, UsersService } from '../users/users.service';
-import { AuditActorContext, AuditLogService } from './audit-log.service';
 import { CreateAdminUserDto } from './dto/create-admin-user.dto';
 import { CreateInvitationDto } from './dto/create-invitation.dto';
 import { CreateUserFromAccessRequestDto } from './dto/create-user-from-access-request.dto';
@@ -31,7 +33,6 @@ import { ListAuditLogsQueryDto } from './dto/list-audit-logs-query.dto';
 import { PaginationQueryDto } from './dto/pagination-query.dto';
 import { UpdateAccessRequestDto } from './dto/update-access-request.dto';
 import { UpdateAdminUserDto } from './dto/update-admin-user.dto';
-import { AdminAuditLog } from './entities/admin-audit-log.entity';
 
 // Mismo costo que AuthService — ver src/auth/auth.service.ts. No se
 // comparte la constante entre módulos para no acoplar AdminModule a
@@ -67,6 +68,7 @@ export class AdminService {
   constructor(
     private readonly usersService: UsersService,
     private readonly auditLogService: AuditLogService,
+    private readonly emailService: EmailService,
     private readonly pythonWorkerService: PythonWorkerService,
     private readonly config: ConfigService,
     @InjectRepository(Field)
@@ -484,25 +486,77 @@ export class AdminService {
   }
 
   /**
-   * ADMIN-2: en producción (NODE_ENV=production) el token crudo NUNCA viaja
-   * en la respuesta HTTP — es un secreto de un solo uso equivalente a una
-   * password. Ahí solo se confirma que se creó; el envío real (email) queda
-   * documentado como deuda (no hay servicio de mail para este flujo
-   * todavía). Fuera de producción, se devuelve el token y, si está
-   * configurado ADMIN_APP_URL, la URL completa lista para pegar en el
-   * navegador — pensado para desarrollo/QA manual, no para uso productivo.
+   * ADMIN-3: base para armar los links que van tanto en el email real como
+   * en la respuesta HTTP de dev/QA. `APP_PUBLIC_URL` es la variable nueva
+   * (pensada para agro-score-web, donde viven las páginas públicas de
+   * accept-invitation/reset-password — ver docs/admin-backend.md); si no
+   * está seteada cae a `FRONTEND_URL` (que en producción ya vale
+   * `https://agroscorelatam.com`). `ADMIN_APP_URL` (ADMIN-2) queda
+   * deprecada para este propósito — las páginas ya no viven en
+   * agro-score-admin.
+   */
+  private buildAppUrl(path: string, rawToken: string): string {
+    const base = (
+      this.config.get<string>('APP_PUBLIC_URL') ||
+      this.config.get<string>('FRONTEND_URL') ||
+      ''
+    ).replace(/\/$/, '');
+
+    return `${base}${path}?token=${rawToken}`;
+  }
+
+  /**
+   * ADMIN-2/ADMIN-3: en producción (NODE_ENV=production) el token crudo
+   * NUNCA viaja en la respuesta HTTP — es un secreto de un solo uso
+   * equivalente a una password; ahora que el envío de email es real, el
+   * único canal de entrega en producción es el email mismo. Fuera de
+   * producción, se sigue devolviendo el token + URL completa — pensado para
+   * desarrollo/QA manual, no para uso productivo.
    */
   private buildIssuedTokenResponse(rawToken: string, path: string): IssuedToken | null {
     if (this.config.get<string>('NODE_ENV') === 'production') {
       return null;
     }
 
-    const appUrl = this.config.get<string>('ADMIN_APP_URL');
-
     return {
       token: rawToken,
-      url: appUrl ? `${appUrl.replace(/\/$/, '')}${path}?token=${rawToken}` : undefined,
+      url: this.buildAppUrl(path, rawToken),
     };
+  }
+
+  /**
+   * ADMIN-3: envío best-effort del email de invitación + auditoría del
+   * resultado. Best-effort porque la invitación ya se persistió antes de
+   * llegar acá (ver issueInvitation) — un fallo de Resend nunca revierte la
+   * creación, solo se refleja en `emailSent: false` en la respuesta y queda
+   * registrado en el audit log (éxito o fallo, ambos se auditan).
+   */
+  private async sendInvitationEmailAndAudit(
+    invitation: UserInvitation,
+    rawToken: string,
+    actor: AuditActorContext,
+  ): Promise<EmailSendResult> {
+    const invitationUrl = this.buildAppUrl('/accept-invitation', rawToken);
+
+    const result = await this.emailService.sendInvitationEmail(invitation.email, {
+      invitationUrl,
+      expiresAt: invitation.expiresAt,
+    });
+
+    await this.auditLogService.record({
+      actor,
+      action: 'admin.invitation.email_sent',
+      targetType: 'invitation',
+      targetId: invitation.id,
+      after: {
+        email: invitation.email,
+        emailSent: result.sent,
+        dryRun: result.dryRun,
+        provider: result.provider,
+      },
+    });
+
+    return result;
   }
 
   async createInvitation(dto: CreateInvitationDto, actor: AuditActorContext) {
@@ -520,6 +574,7 @@ export class AdminService {
       after: { email: invitation.email, role: invitation.role, expiresAt: invitation.expiresAt },
     });
 
+    const emailResult = await this.sendInvitationEmailAndAudit(invitation, rawToken, actor);
     const issued = this.buildIssuedTokenResponse(rawToken, '/accept-invitation');
 
     return {
@@ -527,12 +582,10 @@ export class AdminService {
       email: invitation.email,
       role: invitation.role,
       expiresAt: invitation.expiresAt,
-      ...(issued
-        ? { invitationToken: issued.token, invitationUrl: issued.url }
-        : {
-            message:
-              'Invitación creada. El envío de email todavía no está integrado para este flujo — deuda documentada en docs/admin-backend.md.',
-          }),
+      emailSent: emailResult.sent,
+      dryRun: emailResult.dryRun,
+      provider: emailResult.provider,
+      ...(issued ? { invitationToken: issued.token, invitationUrl: issued.url } : {}),
     };
   }
 
@@ -563,18 +616,35 @@ export class AdminService {
       targetId: user.id,
     });
 
+    const resetUrl = this.buildAppUrl('/reset-password', rawToken);
+    const emailResult = await this.emailService.sendPasswordResetEmail(user.email, {
+      resetUrl,
+      expiresAt,
+    });
+
+    await this.auditLogService.record({
+      actor,
+      action: 'admin.password_reset.email_sent',
+      targetType: 'user',
+      targetId: user.id,
+      after: {
+        email: user.email,
+        emailSent: emailResult.sent,
+        dryRun: emailResult.dryRun,
+        provider: emailResult.provider,
+      },
+    });
+
     const issued = this.buildIssuedTokenResponse(rawToken, '/reset-password');
 
     return {
       userId: user.id,
       email: user.email,
       expiresAt,
-      ...(issued
-        ? { resetToken: issued.token, resetUrl: issued.url }
-        : {
-            message:
-              'Token de reset generado. El envío de email y el endpoint público para consumirlo todavía no están implementados — deuda documentada en docs/admin-backend.md.',
-          }),
+      emailSent: emailResult.sent,
+      dryRun: emailResult.dryRun,
+      provider: emailResult.provider,
+      ...(issued ? { resetToken: issued.token, resetUrl: issued.url } : {}),
     };
   }
 
@@ -674,6 +744,7 @@ export class AdminService {
       after: savedAccessRequest,
     });
 
+    const emailResult = await this.sendInvitationEmailAndAudit(invitation, rawToken, actor);
     const issued = this.buildIssuedTokenResponse(rawToken, '/accept-invitation');
 
     return {
@@ -683,12 +754,10 @@ export class AdminService {
         email: invitation.email,
         role: invitation.role,
         expiresAt: invitation.expiresAt,
-        ...(issued
-          ? { invitationToken: issued.token, invitationUrl: issued.url }
-          : {
-              message:
-                'Invitación creada. El envío de email todavía no está integrado — deuda documentada.',
-            }),
+        emailSent: emailResult.sent,
+        dryRun: emailResult.dryRun,
+        provider: emailResult.provider,
+        ...(issued ? { invitationToken: issued.token, invitationUrl: issued.url } : {}),
       },
     };
   }

@@ -4,6 +4,8 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 import * as bcrypt from 'bcryptjs';
 
+import { AuditLogService } from '../audit-log/audit-log.service';
+import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
 import { UserRole } from '../users/user-role.enum';
@@ -26,11 +28,25 @@ function buildInvitation(overrides: Partial<UserInvitation> = {}): UserInvitatio
   } as UserInvitation;
 }
 
+function buildResetToken(overrides: Partial<PasswordResetToken> = {}): PasswordResetToken {
+  return {
+    id: 'reset-1',
+    userId: 'user-1',
+    tokenHash: hashToken('raw-reset-token'),
+    expiresAt: new Date(Date.now() + 60_000),
+    usedAt: null,
+    createdAt: new Date(),
+    ...overrides,
+  } as PasswordResetToken;
+}
+
 describe('AuthService', () => {
   let service: AuthService;
   let usersService: jest.Mocked<UsersService>;
   let jwtService: jest.Mocked<JwtService>;
+  let auditLogService: jest.Mocked<AuditLogService>;
   let invitationRepo: { findOne: jest.Mock; save: jest.Mock };
+  let passwordResetRepo: { findOne: jest.Mock; save: jest.Mock };
 
   const buildUser = (overrides: Partial<User> = {}): User => ({
     id: 'user-1',
@@ -46,6 +62,7 @@ describe('AuthService', () => {
 
   beforeEach(async () => {
     invitationRepo = { findOne: jest.fn(), save: jest.fn() };
+    passwordResetRepo = { findOne: jest.fn(), save: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -56,6 +73,7 @@ describe('AuthService', () => {
             findByEmail: jest.fn(),
             findById: jest.fn(),
             create: jest.fn(),
+            updatePassword: jest.fn().mockResolvedValue(undefined),
             toPublicUser: jest.fn((user: User) => {
               const { passwordHash: _passwordHash, ...rest } = user;
               return rest;
@@ -68,13 +86,19 @@ describe('AuthService', () => {
             sign: jest.fn(() => 'signed.jwt.token'),
           },
         },
+        {
+          provide: AuditLogService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
         { provide: getRepositoryToken(UserInvitation), useValue: invitationRepo },
+        { provide: getRepositoryToken(PasswordResetToken), useValue: passwordResetRepo },
       ],
     }).compile();
 
     service = module.get(AuthService);
     usersService = module.get(UsersService);
     jwtService = module.get(JwtService);
+    auditLogService = module.get(AuditLogService);
   });
 
   describe('register', () => {
@@ -228,6 +252,14 @@ describe('AuthService', () => {
       expect(invitationRepo.save).toHaveBeenCalledWith(
         expect.objectContaining({ acceptedAt: expect.any(Date) }),
       );
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.invitation.accepted',
+          targetType: 'invitation',
+          targetId: invitation.id,
+          actor: expect.objectContaining({ actorUserId: result.user.id }),
+        }),
+      );
     });
 
     it('rechaza un token que no matchea ninguna invitación', async () => {
@@ -256,6 +288,74 @@ describe('AuthService', () => {
       ).rejects.toBeInstanceOf(ConflictException);
 
       expect(usersService.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('resetPassword', () => {
+    it('actualiza la password, marca usedAt, audita y nunca devuelve hash/token', async () => {
+      const resetToken = buildResetToken();
+      passwordResetRepo.findOne.mockResolvedValue(resetToken);
+      passwordResetRepo.save.mockImplementation((v: unknown) => Promise.resolve(v));
+
+      const result = await service.resetPassword({
+        token: 'raw-reset-token',
+        password: 'newpassword123',
+      });
+
+      expect(result).toEqual({ message: expect.any(String) });
+      expect(result).not.toHaveProperty('passwordHash');
+      expect(result).not.toHaveProperty('tokenHash');
+
+      expect(usersService.updatePassword).toHaveBeenCalledWith(
+        resetToken.userId,
+        expect.any(String),
+      );
+      const passwordHashArg = usersService.updatePassword.mock.calls[0][1];
+      expect(passwordHashArg).not.toBe('newpassword123');
+      expect(bcrypt.compareSync('newpassword123', passwordHashArg)).toBe(true);
+
+      expect(passwordResetRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ usedAt: expect.any(Date) }),
+      );
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.password_reset.completed',
+          targetType: 'user',
+          targetId: resetToken.userId,
+          actor: expect.objectContaining({ actorUserId: resetToken.userId }),
+        }),
+      );
+    });
+
+    it('rechaza un token que no matchea ningún reset pendiente', async () => {
+      passwordResetRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.resetPassword({ token: 'token-invalido', password: 'newpassword123' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
+    });
+
+    it('busca el token con el mismo criterio que acceptInvitation (hash, usedAt IS NULL, expiresAt > now)', async () => {
+      // El WHERE real (usedAt: IsNull(), expiresAt: MoreThan(new Date())) es
+      // responsabilidad de TypeORM/la DB, no unit-testeable con un repo
+      // mockeado — un token ya usado o vencido simplemente no matchea el
+      // findOne y cae en el mismo BadRequestException genérico que un token
+      // inexistente (mismo criterio que acceptInvitation: no revelar el
+      // motivo exacto a un atacante).
+      passwordResetRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.resetPassword({ token: 'usado-o-vencido', password: 'newpassword123' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(passwordResetRepo.findOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ tokenHash: hashToken('usado-o-vencido') }),
+        }),
+      );
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
     });
   });
 });

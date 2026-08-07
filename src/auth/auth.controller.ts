@@ -6,6 +6,7 @@ import { AuthService } from './auth.service';
 import { AcceptInvitationDto } from './dto/accept-invitation.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { AuthenticatedUser } from './jwt.strategy';
 
@@ -41,8 +42,23 @@ export class AuthController {
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Post('accept-invitation')
-  acceptInvitation(@Body() dto: AcceptInvitationDto) {
-    return this.authService.acceptInvitation(dto);
+  acceptInvitation(@Body() dto: AcceptInvitationDto, @Req() req: Request) {
+    return this.authService.acceptInvitation(dto, {
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
+  }
+
+  // ADMIN-3: mismo rate limit/criterio que accept-invitation — token de un
+  // solo uso, pero endpoint público igual.
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('reset-password')
+  resetPassword(@Body() dto: ResetPasswordDto, @Req() req: Request) {
+    return this.authService.resetPassword(dto, {
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
   }
 
   @Post('logout')

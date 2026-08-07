@@ -3,6 +3,8 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
+import { AuditLogModule } from '../audit-log/audit-log.module';
+import { EmailModule } from '../email/email.module';
 import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerModule } from '../python-worker/python-worker.module';
@@ -11,8 +13,6 @@ import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { UsersModule } from '../users/users.module';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
-import { AuditLogService } from './audit-log.service';
-import { AdminAuditLog } from './entities/admin-audit-log.entity';
 
 /**
  * ADMIN-1: para usuarios, siempre pasa por UsersService (UsersModule) — no
@@ -27,25 +27,31 @@ import { AdminAuditLog } from './entities/admin-audit-log.entity';
  *
  * ADMIN-2: suma PythonWorkerModule (para GET /admin/system/health, reusa
  * PythonWorkerService.checkHealth) y las entidades de invitaciones/
- * password-reset/audit log. AuditLogService es su propio provider — lo usan
- * AdminController/Service, no AuthModule (accept-invitation no genera
- * entradas de auditoría, ver docs/admin-backend.md).
+ * password-reset.
+ *
+ * ADMIN-3: AuditLogService se extrajo a su propio AuditLogModule (ver
+ * src/audit-log/audit-log.module.ts) porque AuthModule también lo necesita
+ * ahora (accept-invitation/reset-password sí generan auditoría — a
+ * diferencia de lo que decía el comentario viejo acá). AdminModule ya no lo
+ * provee directo, solo lo importa. Suma también EmailModule para el envío
+ * real de invitaciones/reset (ver src/email/email.module.ts).
  */
 @Module({
   imports: [
     UsersModule,
     PythonWorkerModule,
+    AuditLogModule,
+    EmailModule,
     TypeOrmModule.forFeature([
       Field,
       FieldLot,
       Analysis,
       AccessRequest,
-      AdminAuditLog,
       UserInvitation,
       PasswordResetToken,
     ]),
   ],
   controllers: [AdminController],
-  providers: [AdminService, AuditLogService],
+  providers: [AdminService],
 })
 export class AdminModule {}

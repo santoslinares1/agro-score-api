@@ -21,7 +21,13 @@ describe('AuthController — rate limiting (SEC-003)', () => {
       providers: [
         {
           provide: AuthService,
-          useValue: { register: jest.fn(), login: jest.fn(), me: jest.fn() },
+          useValue: {
+            register: jest.fn(),
+            login: jest.fn(),
+            me: jest.fn(),
+            acceptInvitation: jest.fn(),
+            resetPassword: jest.fn(),
+          },
         },
       ],
     }).compile();
@@ -32,6 +38,8 @@ describe('AuthController — rate limiting (SEC-003)', () => {
   it.each([
     ['login', 5],
     ['register', 5],
+    ['acceptInvitation', 5],
+    ['resetPassword', 5],
   ])('%s tiene ThrottlerGuard con límite de %i req/min', (method, limit) => {
     const handler = (controller as unknown as Record<string, () => unknown>)[
       method

@@ -15,9 +15,18 @@ export type AdminAuditAction =
   | 'admin.access_request.updated'
   | 'admin.access_request.converted'
   | 'admin.invitation.created'
+  | 'admin.invitation.email_sent'
   | 'admin.password_reset.created'
+  | 'admin.password_reset.email_sent'
   | 'admin.analysis.retry_requested'
-  | 'admin.analysis.marked_reviewed';
+  | 'admin.analysis.marked_reviewed'
+  // ADMIN-3: acciones disparadas por el propio usuario final (no un admin)
+  // desde endpoints públicos de /auth — mismo ledger, mismo AuditLogService
+  // (ver src/audit-log/audit-log.module.ts sobre por qué se extrajo de
+  // AdminModule). El "actor" en estos dos casos es el propio usuario que
+  // acaba de crear su cuenta o resetear su password.
+  | 'auth.invitation.accepted'
+  | 'auth.password_reset.completed';
 
 export type AuditActorContext = {
   actorUserId: string;

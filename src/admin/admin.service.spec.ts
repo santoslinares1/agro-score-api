@@ -5,6 +5,9 @@ import { ConfigService } from '@nestjs/config';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
+import { AuditActorContext, AuditLogService } from '../audit-log/audit-log.service';
+import { AdminAuditLog } from '../audit-log/entities/admin-audit-log.entity';
+import { EmailService } from '../email/email.service';
 import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
@@ -14,8 +17,6 @@ import { User } from '../users/user.entity';
 import { UserRole } from '../users/user-role.enum';
 import { UsersService } from '../users/users.service';
 import { AdminService } from './admin.service';
-import { AuditActorContext, AuditLogService } from './audit-log.service';
-import { AdminAuditLog } from './entities/admin-audit-log.entity';
 
 function buildUser(overrides: Partial<User> = {}): User {
   return {
@@ -70,6 +71,7 @@ describe('AdminService', () => {
   let service: AdminService;
   let usersService: jest.Mocked<UsersService>;
   let auditLogService: jest.Mocked<AuditLogService>;
+  let emailService: jest.Mocked<EmailService>;
   let pythonWorkerService: jest.Mocked<PythonWorkerService>;
   let configService: jest.Mocked<ConfigService>;
   let accessRequestRepo: ReturnType<typeof noopRepo>;
@@ -111,6 +113,17 @@ describe('AdminService', () => {
           useValue: { record: jest.fn().mockResolvedValue(undefined) },
         },
         {
+          provide: EmailService,
+          useValue: {
+            sendInvitationEmail: jest
+              .fn()
+              .mockResolvedValue({ sent: true, provider: 'resend', dryRun: true }),
+            sendPasswordResetEmail: jest
+              .fn()
+              .mockResolvedValue({ sent: true, provider: 'resend', dryRun: true }),
+          },
+        },
+        {
           provide: PythonWorkerService,
           useValue: { checkHealth: jest.fn().mockResolvedValue({ status: 'ok' }) },
         },
@@ -131,6 +144,7 @@ describe('AdminService', () => {
     service = module.get(AdminService);
     usersService = module.get(UsersService);
     auditLogService = module.get(AuditLogService);
+    emailService = module.get(EmailService);
     pythonWorkerService = module.get(PythonWorkerService);
     configService = module.get(ConfigService);
   });
@@ -355,9 +369,15 @@ describe('AdminService', () => {
       expect(result.accessRequest.status).toBe('converted');
       expect(result.invitation.email).toBe(accessRequest.email);
       expect(result.invitation.role).toBe(UserRole.USER);
+      expect(result.invitation.emailSent).toBe(true);
+      expect(emailService.sendInvitationEmail).toHaveBeenCalledWith(
+        accessRequest.email,
+        expect.objectContaining({ invitationUrl: expect.any(String) }),
+      );
 
       const actions = auditLogService.record.mock.calls.map((call) => call[0].action);
       expect(actions).toContain('admin.invitation.created');
+      expect(actions).toContain('admin.invitation.email_sent');
       expect(actions).toContain('admin.access_request.converted');
     });
 
@@ -395,9 +415,12 @@ describe('AdminService', () => {
 
       expect(result).toHaveProperty('invitationToken');
       expect(result).not.toHaveProperty('tokenHash');
+      expect(result.emailSent).toBe(true);
+      expect(result.dryRun).toBe(true);
+      expect(result.provider).toBe('resend');
     });
 
-    it('en producción NO devuelve ningún token', async () => {
+    it('en producción NO devuelve ningún token pero sí emailSent/dryRun/provider', async () => {
       configService.get.mockImplementation((key: string) =>
         key === 'NODE_ENV' ? 'production' : undefined,
       );
@@ -414,6 +437,50 @@ describe('AdminService', () => {
       expect(result).not.toHaveProperty('invitationToken');
       expect(result).not.toHaveProperty('invitationUrl');
       expect(result).not.toHaveProperty('tokenHash');
+      expect(result.emailSent).toBe(true);
+      expect(result.dryRun).toBe(true);
+    });
+
+    it('envía el email de invitación y audita admin.invitation.email_sent', async () => {
+      configService.get.mockReturnValue(undefined);
+      usersService.findByEmail.mockResolvedValue(null);
+      invitationRepo.save.mockImplementation((v: unknown) =>
+        Promise.resolve({ id: 'invitation-1', ...(v as object) }),
+      );
+
+      await service.createInvitation({ email: 'nuevo@example.com', role: UserRole.USER }, actor);
+
+      expect(emailService.sendInvitationEmail).toHaveBeenCalledWith(
+        'nuevo@example.com',
+        expect.objectContaining({ invitationUrl: expect.any(String), expiresAt: expect.any(Date) }),
+      );
+
+      const emailSentCall = auditLogService.record.mock.calls.find(
+        (call) => call[0].action === 'admin.invitation.email_sent',
+      );
+      expect(emailSentCall).toBeDefined();
+      expect(emailSentCall?.[0].targetType).toBe('invitation');
+    });
+
+    it('si el envío de email falla, la invitación igual se crea (emailSent: false)', async () => {
+      configService.get.mockReturnValue(undefined);
+      usersService.findByEmail.mockResolvedValue(null);
+      invitationRepo.save.mockImplementation((v: unknown) =>
+        Promise.resolve({ id: 'invitation-1', ...(v as object) }),
+      );
+      emailService.sendInvitationEmail.mockResolvedValueOnce({
+        sent: false,
+        provider: 'resend',
+        dryRun: false,
+      });
+
+      const result = await service.createInvitation(
+        { email: 'nuevo@example.com', role: UserRole.USER },
+        actor,
+      );
+
+      expect(result.id).toBe('invitation-1');
+      expect(result.emailSent).toBe(false);
     });
 
     it('rechaza invitar a un email que ya tiene cuenta', async () => {
@@ -426,7 +493,7 @@ describe('AdminService', () => {
   });
 
   describe('createPasswordResetToken', () => {
-    it('en producción no devuelve el token y audita admin.password_reset.created', async () => {
+    it('en producción no devuelve el token pero sí emailSent/dryRun y audita ambas acciones', async () => {
       configService.get.mockImplementation((key: string) =>
         key === 'NODE_ENV' ? 'production' : undefined,
       );
@@ -437,9 +504,44 @@ describe('AdminService', () => {
 
       expect(result).not.toHaveProperty('resetToken');
       expect(result).not.toHaveProperty('resetUrl');
-      expect(auditLogService.record).toHaveBeenCalledWith(
-        expect.objectContaining({ action: 'admin.password_reset.created' }),
+      expect(result.emailSent).toBe(true);
+      expect(result.dryRun).toBe(true);
+
+      const actions = auditLogService.record.mock.calls.map((call) => call[0].action);
+      expect(actions).toContain('admin.password_reset.created');
+      expect(actions).toContain('admin.password_reset.email_sent');
+    });
+
+    it('en dev devuelve resetToken/resetUrl y envía el email al usuario', async () => {
+      configService.get.mockReturnValue(undefined);
+      const user = buildUser();
+      usersService.findById.mockResolvedValue(user);
+      passwordResetRepo.save.mockResolvedValue(undefined);
+
+      const result = await service.createPasswordResetToken('user-1', actor);
+
+      expect(result).toHaveProperty('resetToken');
+      expect(result).toHaveProperty('resetUrl');
+      expect(emailService.sendPasswordResetEmail).toHaveBeenCalledWith(
+        user.email,
+        expect.objectContaining({ resetUrl: expect.any(String), expiresAt: expect.any(Date) }),
       );
+    });
+
+    it('si el envío de email falla, el token igual se genera (emailSent: false)', async () => {
+      configService.get.mockReturnValue(undefined);
+      usersService.findById.mockResolvedValue(buildUser());
+      passwordResetRepo.save.mockResolvedValue(undefined);
+      emailService.sendPasswordResetEmail.mockResolvedValueOnce({
+        sent: false,
+        provider: 'resend',
+        dryRun: false,
+      });
+
+      const result = await service.createPasswordResetToken('user-1', actor);
+
+      expect(result.emailSent).toBe(false);
+      expect(result).toHaveProperty('resetToken');
     });
 
     it('404 si el usuario no existe', async () => {

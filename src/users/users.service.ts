@@ -119,6 +119,17 @@ export class UsersService {
     });
   }
 
+  /**
+   * ADMIN-3: dedicado y separado de `update()`/`UpdateUserFields` a
+   * propósito — ese tipo nunca debe aceptar `passwordHash` (así el
+   * ValidationPipe global de un DTO admin no puede colarlo por error). Solo
+   * lo llama AuthService.resetPassword, después de validar el token de
+   * reset contra la DB.
+   */
+  async updatePassword(id: string, passwordHash: string): Promise<void> {
+    await this.usersRepository.update(id, { passwordHash });
+  }
+
   async count(): Promise<number> {
     return this.usersRepository.count();
   }

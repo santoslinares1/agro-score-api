@@ -1,8 +1,10 @@
-# ADMIN-1 / ADMIN-2 — Backend admin (`/admin/*`)
+# ADMIN-1 / ADMIN-2 / ADMIN-3 — Backend admin (`/admin/*`)
 
 **ADMIN-1 (2026-08-04):** soporte backend para un futuro panel de administración interno (frontend separado, `agro-score-admin`, FASE 2). Roles, guards, endpoints de lectura/gestión bajo `/admin/*`, timing de diagnósticos y persistencia de solicitudes de acceso.
 
 **ADMIN-2 (2026-08-06):** segunda iteración — convierte el panel en herramienta operativa real. Agrega: flujo completo de solicitudes de acceso (status ampliado, notas, asignación, conversión a usuario), invitaciones + reset de contraseña (tokens hasheados, nunca passwords en claro), auditoría de acciones admin, operación sobre diagnósticos fallidos (marcar revisado / pedir reintento), `GET /admin/system/health`, y métricas extendidas (altas 7/30 días, tasa de fallo, etc.). `agro-score-admin` (frontend) **ya existe** desde la FASE 2 anterior — esta ficha es de nuevo solo backend; el frontend se actualiza en una ficha separada.
+
+**ADMIN-3 (2026-08-07):** cierra las dos deudas explícitas que dejó ADMIN-2 — envío real de email para invitaciones/password-reset (`EmailService`, Resend, ver `docs/invitation-password-reset-email.md`) y el endpoint público `POST /auth/reset-password` para canjear el token. Suma auditoría del lado de `/auth` (`auth.invitation.accepted`, `auth.password_reset.completed` — antes `AuthModule` no auditaba nada, ver más abajo) y las páginas públicas de accept-invitation/reset-password, que viven en **agro-score-web** (no en agro-score-admin — ver sección "Dónde viven las páginas públicas").
 
 ---
 
@@ -81,6 +83,7 @@ Público (fuera de `/admin`, sin auth):
 | Método | Ruta | Descripción |
 |---|---|---|
 | POST | `/auth/accept-invitation` | *(ADMIN-2)* `{token, password, fullName}` → crea la cuenta y hace login |
+| POST | `/auth/reset-password` | *(ADMIN-3)* `{token, password}` → cambia la password, marca el token usado, **no** hace login |
 
 Paginación: `page`/`limit` (default 1/20, `limit` máx 100) en todos los listados; `search` donde aplica (email/nombre, nombre de campo/lote, nombre/email/organización); `status` en `analysis` (`Procesando`/`Finalizado`/`Error` — **se mantienen los valores en español ya existentes**, no se migró a `running`/`completed`/`failed` para no romper compatibilidad) y en `access-requests` (`new`/`contacted`/`interested`/`discarded`/`converted`, ampliado en ADMIN-2).
 
@@ -153,26 +156,52 @@ Dos entidades nuevas, ambas con `tokenHash` indexado único:
 
 ### `POST /admin/invitations` y `POST /admin/access-requests/:id/create-user`
 
-Ambos crean una `UserInvitation` (comparten `AdminService.issueInvitation` internamente). Respuesta:
+Ambos crean una `UserInvitation` (comparten `AdminService.issueInvitation` internamente) **y ahora envían el email de verdad** (ADMIN-3 — `EmailService`, ver `docs/invitation-password-reset-email.md`). Respuesta:
 
-- **Fuera de producción** (`NODE_ENV != 'production'`): incluye `invitationToken` (el token crudo) y, si está seteado `ADMIN_APP_URL`, `invitationUrl` ya armada.
-- **En producción** (`NODE_ENV=production`): **no devuelve ningún token**, solo `{ id, email, role, expiresAt, message }`. El envío real del link (email) todavía no está integrado para este flujo — deuda documentada abajo.
+```json
+{
+  "id": "...", "email": "...", "role": "user", "expiresAt": "...",
+  "emailSent": true, "dryRun": false, "provider": "resend"
+}
+```
+
+- `emailSent` / `dryRun` / `provider` viajan **siempre**, en cualquier entorno — reemplazan el viejo campo `message` de ADMIN-2 ("el envío de email no está integrado"), que ya no aplica.
+- **Fuera de producción** (`NODE_ENV != 'production'`): suma `invitationToken` (el token crudo) e `invitationUrl` ya armada con `APP_PUBLIC_URL`/`FRONTEND_URL`.
+- **En producción** (`NODE_ENV=production'`): **no devuelve ningún token** — el email es el único canal de entrega del link.
+- Un fallo de envío (`emailSent: false`) **no revierte la creación** de la invitación — ya se persistió antes de intentar el email.
 
 ### `POST /admin/users/:id/password-reset`
 
-Mismo criterio: genera y persiste (solo el hash) un `PasswordResetToken` de 2 horas. Fuera de producción devuelve `resetToken`/`resetUrl`; en producción, ningún token. **No existe todavía el endpoint público para consumirlo** (`POST /auth/reset-password` o similar) — a propósito, ver deuda. El admin puede usar el flujo de invitación (`POST /admin/invitations` con el mismo email) como alternativa funcional hoy: como el usuario ya existe, `issueInvitation` rechazaría con 409 — o sea que **hoy en día la única forma de que un usuario recupere acceso es que un owner/admin lo reactive/edite manualmente**, el token de `password-reset` queda generado pero sin consumidor. Documentado como deuda explícita, no un bug.
+Mismo criterio: genera y persiste (solo el hash) un `PasswordResetToken` de 2 horas, envía el email, y responde `{ userId, email, expiresAt, emailSent, dryRun, provider, resetToken?, resetUrl? }` (token/url solo fuera de producción). **Ya existe el endpoint público para consumirlo** — `POST /auth/reset-password` (ver abajo), cerrado en ADMIN-3. Antes de esto, era deuda explícita: el token se generaba pero no había forma de canjearlo.
 
 ### `POST /auth/accept-invitation` (público)
 
-`{ token, password, fullName }` → busca la invitación por `hashToken(token)` (no vencida, no aceptada), verifica que no exista ya un usuario con ese email, crea el `User` con el `role` de la invitación (`isActive: true`) y marca `acceptedAt`. Devuelve `{ user, accessToken }` igual que `/auth/login` (login automático). Mismo rate limit que `/auth/register`/`/auth/login` (5 req/min, SEC-003). Mensajes de error genéricos (token inválido/vencido/usado dan el mismo mensaje) para no filtrar información a un atacante.
+`{ token, password, fullName }` → busca la invitación por `hashToken(token)` (no vencida, no aceptada), verifica que no exista ya un usuario con ese email, crea el `User` con el `role` de la invitación (`isActive: true`) y marca `acceptedAt`. Devuelve `{ user, accessToken }` igual que `/auth/login` (login automático). Mismo rate limit que `/auth/register`/`/auth/login` (5 req/min, SEC-003). Mensajes de error genéricos (token inválido/vencido/usado dan el mismo mensaje) para no filtrar información a un atacante. *(ADMIN-3)* audita `auth.invitation.accepted` — el actor es el propio usuario recién creado.
 
 `UserInvitation` **no guarda `fullName`** a propósito — la persona invitada lo completa al aceptar, como un signup normal. Esto evita necesitar ese dato en `POST /admin/invitations` y mantiene la entidad exactamente con la forma sugerida en la consigna.
 
-## Auditoría de acciones admin
+### `POST /auth/reset-password` (público, ADMIN-3)
 
-`AdminAuditLog` (`src/admin/entities/admin-audit-log.entity.ts`) + `AuditLogService` (`src/admin/audit-log.service.ts`). Ledger append-only — ningún endpoint lo edita ni lo borra.
+`{ token, password }` → busca el `PasswordResetToken` por `hashToken(token)` (no vencido, no usado — mismo criterio que accept-invitation), actualiza `User.passwordHash` (`UsersService.updatePassword`, dedicado y separado de `update()` para que ningún DTO admin pueda colarlo) y marca `usedAt`. Devuelve `{ message }` — **a diferencia de accept-invitation, no hace login automático** (el frontend redirige a `/login`). Mismo rate limit (5 req/min, SEC-003), mismo mensaje de error genérico. Audita `auth.password_reset.completed`.
 
-Acciones auditadas (`AdminAuditAction`): `admin.user.created`, `admin.user.updated`, `admin.user.role_changed`, `admin.user.deactivated`, `admin.access_request.updated`, `admin.access_request.converted`, `admin.invitation.created`, `admin.password_reset.created`, `admin.analysis.marked_reviewed`, `admin.analysis.retry_requested`. Las 4 acciones de usuario (`created`/`updated`/`role_changed`/`deactivated`) ya existían desde ADMIN-1 pero **no dejaban rastro** — ahora sí.
+## Dónde viven las páginas públicas (ADMIN-3)
+
+`/accept-invitation` y `/reset-password` son pantallas de **agro-score-web**
+(`features/public/accept-invitation`, `features/public/reset-password`), no
+de agro-score-admin — viven junto al login real de usuarios `user`
+(`features/public/login`). agro-score-admin es el panel interno para
+`owner`/`admin`; los usuarios invitados (mayormente `role=user`, vía
+solicitudes de acceso convertidas) inician sesión en agro-score-web, así que
+ahí es donde tiene que completarse el flujo. Si se invita a alguien con rol
+`admin`/`owner`, igual acepta la invitación en agro-score-web (login
+automático ahí) y por separado puede iniciar sesión en agro-score-admin con
+el mismo email/password una vez que los tiene.
+
+## Auditoría de acciones
+
+`AdminAuditLog` + `AuditLogService` — extraídos en ADMIN-3 a su propio módulo, `src/audit-log/` (antes vivían en `src/admin/`, provider directo de `AdminModule`). El motivo: `AuthModule` también necesita auditar ahora (`accept-invitation`/`reset-password` sí generan auditoría — el comentario de ADMIN-2 que decía lo contrario quedó desactualizado). Importar `AdminModule` completo en `AuthModule` hubiera traído de arrastre `Field`/`Analysis`/`AccessRequest`; `AuditLogModule` es liviano y lo importan ambos. Ledger append-only — ningún endpoint lo edita ni lo borra.
+
+Acciones auditadas (`AdminAuditAction`, `src/audit-log/audit-log.service.ts`): `admin.user.created`, `admin.user.updated`, `admin.user.role_changed`, `admin.user.deactivated`, `admin.access_request.updated`, `admin.access_request.converted`, `admin.invitation.created`, `admin.invitation.email_sent` *(ADMIN-3)*, `admin.password_reset.created`, `admin.password_reset.email_sent` *(ADMIN-3)*, `admin.analysis.marked_reviewed`, `admin.analysis.retry_requested`, `auth.invitation.accepted` *(ADMIN-3)*, `auth.password_reset.completed` *(ADMIN-3)*. Las últimas dos son las únicas dos acciones cuyo actor es el propio usuario final, no un admin — disparadas desde endpoints públicos de `/auth`.
 
 `GET /admin/audit-logs?actorUserId=&action=&targetType=&targetId=&page=&limit=` — filtros exactos, no hay `search` de texto libre (a propósito: son campos estructurados, no texto).
 
@@ -250,6 +279,8 @@ Todas nullable/con default seguro donde correspondía — ninguna requirió back
 
 **Nunca se corrieron contra producción.** Para aplicarlas en producción: mismo `npm run migration:run` con las variables de entorno (`DB_*`, `DATABASE_SSL=true`) apuntando a la DB productiva, como parte del proceso de deploy documentado en `agro-score-api/deploy/aws/README.md` — coordinar el timing con el equipo antes de correrlo ahí.
 
+**ADMIN-3 no agregó migraciones.** `UserInvitation`/`PasswordResetToken` ya existían completas desde ADMIN-2 — todo lo nuevo (`EmailService`, `POST /auth/reset-password`, extracción de `AuditLogService`, `UsersService.updatePassword`) es capa de servicio/routing, no schema. `npm run migration:generate` post-cambios no encuentra diff pendiente.
+
 ## CORS para el futuro frontend admin (FASE 2)
 
 No se tocó `.env` real. Cuando `agro-score-admin` tenga dominio (`https://admin.agroscorelatam.com`), sumarlo a `CORS_ORIGIN` en el `.env` de producción **sin sacar los orígenes existentes**:
@@ -276,16 +307,24 @@ Ver comentario agregado en `.env.example`.
 - `src/auth/auth.service.spec.ts` (extendido): `acceptInvitation` — crea el usuario con el rol de la invitación, nunca devuelve `passwordHash`, rechaza token inválido/vencido y email ya registrado.
 - `src/auth/dto/accept-invitation.dto.spec.ts`.
 
-Suite completa: **255/255** (`npm test`).
+**ADMIN-3 (nuevos):**
+- `src/email/email.service.spec.ts` — dry-run (no llama a Resend, nunca loguea el link/token completo), envío real con provider mockeado (éxito/error), precedencia `EMAIL_FROM`→`CONTACT_FROM_EMAIL` y `EMAIL_DRY_RUN`→`CONTACT_EMAIL_DRY_RUN` (default `true` sin ninguna seteada).
+- `src/admin/admin.service.spec.ts` (extendido): `createInvitation`/`createPasswordResetToken`/`createUserFromAccessRequest` llaman a `EmailService`, auditan `*_created` + `*_email_sent`, `emailSent`/`dryRun`/`provider` viajan en cualquier entorno, un fallo de envío no revierte la creación del token.
+- `src/auth/auth.service.spec.ts` (extendido): `acceptInvitation` audita `auth.invitation.accepted`; `resetPassword` — actualiza `passwordHash`, marca `usedAt`, rechaza token inválido/vencido/usado con el mismo mensaje genérico, nunca devuelve `passwordHash`/`tokenHash`, audita `auth.password_reset.completed`.
+- `src/auth/dto/reset-password.dto.spec.ts`.
+- `src/audit-log/audit-log.service.spec.ts` (movido de `src/admin/`, sin cambios de contenido).
+
+Suite completa: **277/277** (`npm test`).
 
 ## Qué no se tocó / deuda conocida
 
 **Resuelto en ADMIN-2** (ya no es deuda): endpoint para cambiar `access_requests.status`, reseteo de contraseña desde el admin (generación del token — ver siguiente punto), auditoría de acciones admin.
 
+**Resuelto en ADMIN-3** (ya no es deuda): envío real de email para invitaciones/password-reset (`EmailService`, Resend — ver `docs/invitation-password-reset-email.md`), endpoint público `POST /auth/reset-password` para canjear el token, auditoría del lado de `/auth` (`auth.invitation.accepted`, `auth.password_reset.completed`), `agro-score-admin` ya consume los campos nuevos (`emailSent`/`dryRun`/`provider`), páginas públicas de accept-invitation/reset-password (en agro-score-web).
+
 **Deuda nueva/actualizada:**
 - **`POST /admin/analysis/:id/retry` no re-ejecuta el pipeline** — solo deja constancia ("retry requested"). Automatizar el reintento real requiere reconstruir con confianza el input original y agregar guardas de idempotencia/costo — ver sección "Diagnósticos" arriba.
-- **No existe el endpoint público para consumir un password-reset token** (`POST /auth/reset-password` o similar). `POST /admin/users/:id/password-reset` genera y persiste el token, pero hoy no hay forma de canjearlo. El flujo de invitación (`POST /admin/invitations`) sí es end-to-end funcional.
-- **Envío de email no integrado** para invitaciones ni password-reset — en producción esos endpoints confirman que el token se creó pero no lo entregan por ningún canal todavía (ni siquiera queda registrado en un log accesible, más allá del audit log que no incluye el token). Server-side únicamente por ahora: un owner/admin con acceso a la DB/logs de dev puede sacar el token de la respuesta HTTP fuera de producción.
+- **No hay "olvidé mi contraseña" autoservicio.** El reset lo sigue disparando un admin (`POST /admin/users/:id/password-reset`) — no existe un endpoint público donde un usuario pida su propio reset por email. Ver `docs/invitation-password-reset-email.md`.
+- **No hay endpoint de reenvío** de invitación/reset. Si `emailSent: false` o el email se pierde, la única opción hoy es generar una invitación/token nuevo desde cero.
 - `earthEngine` en `/admin/system/health` siempre `not_checked` (documentado, no un bug — ver sección Sistema/health).
 - `POST /auth/register` sigue público, sin cambios (deuda ya documentada en `docs/audits/access-request-flow.md`, `AUTH-POLICY-1`). Con el default `role='user'`, no es vector para crear admins.
-- `agro-score-admin` (frontend) ya existe (FASE 2 anterior) pero **no se actualizó en esta ficha** — no consume todavía ninguno de los endpoints/campos nuevos de ADMIN-2. Es la siguiente ficha.

@@ -2,8 +2,8 @@ import 'dotenv/config';
 import { DataSource } from 'typeorm';
 
 import { AccessRequest } from './access-request/entities/access-request.entity';
-import { AdminAuditLog } from './admin/entities/admin-audit-log.entity';
 import { Analysis } from './analysis/entities/analysis.entity';
+import { AdminAuditLog } from './audit-log/entities/admin-audit-log.entity';
 import { resolveDatabaseSsl } from './config/database-ssl.util';
 import { Field } from './fields/entities/field.entity';
 import { FieldLot } from './fields/entities/field-lot.entity';
