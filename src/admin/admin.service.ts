@@ -79,8 +79,6 @@ export class AdminService {
     private readonly analysisRepository: Repository<Analysis>,
     @InjectRepository(AccessRequest)
     private readonly accessRequestRepository: Repository<AccessRequest>,
-    @InjectRepository(AdminAuditLog)
-    private readonly auditLogRepository: Repository<AdminAuditLog>,
     @InjectRepository(UserInvitation)
     private readonly invitationRepository: Repository<UserInvitation>,
     @InjectRepository(PasswordResetToken)
@@ -1048,35 +1046,11 @@ export class AdminService {
 
   // ── Auditoría ───────────────────────────────────────────────────────
 
+  // Fix post-ADMIN-3: la lectura de audit logs vive en AuditLogService
+  // (dueño del repositorio); AdminService solo pasa los filtros del query
+  // DTO — ver AuditLogService.list().
   async listAuditLogs(query: ListAuditLogsQueryDto): Promise<Paginated<AdminAuditLog>> {
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
-
-    const qb = this.auditLogRepository
-      .createQueryBuilder('log')
-      .orderBy('log.createdAt', 'DESC')
-      .skip((page - 1) * limit)
-      .take(limit);
-
-    if (query.actorUserId) {
-      qb.andWhere('log."actorUserId" = :actorUserId', { actorUserId: query.actorUserId });
-    }
-
-    if (query.action) {
-      qb.andWhere('log.action = :action', { action: query.action });
-    }
-
-    if (query.targetType) {
-      qb.andWhere('log."targetType" = :targetType', { targetType: query.targetType });
-    }
-
-    if (query.targetId) {
-      qb.andWhere('log."targetId" = :targetId', { targetId: query.targetId });
-    }
-
-    const [items, total] = await qb.getManyAndCount();
-
-    return { items, total, page, limit };
+    return this.auditLogService.list(query);
   }
 
   // ── Sistema / health ────────────────────────────────────────────────

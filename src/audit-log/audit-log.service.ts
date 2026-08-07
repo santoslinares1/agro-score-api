@@ -43,6 +43,26 @@ export type RecordAuditParams = {
   after?: unknown;
 };
 
+// ADMIN-3 (fix): shape estructuralmente compatible con
+// ListAuditLogsQueryDto (src/admin/dto/list-audit-logs-query.dto.ts) sin
+// importarlo — AuditLogModule no depende de AdminModule (ver comentario en
+// audit-log.module.ts sobre por qué se extrajo).
+export type ListAuditLogsParams = {
+  page?: number;
+  limit?: number;
+  actorUserId?: string;
+  action?: string;
+  targetType?: string;
+  targetId?: string;
+};
+
+export type PaginatedAuditLogs = {
+  items: AdminAuditLog[];
+  total: number;
+  page: number;
+  limit: number;
+};
+
 // Nunca debe llegar a `before`/`after` en el audit log, sin importar qué
 // pase el caller — es una red de seguridad además de la disciplina de cada
 // caller de armar objetos "limpios" a mano.
@@ -78,6 +98,44 @@ export class AuditLogService {
     });
 
     await this.auditLogRepository.save(entry);
+  }
+
+  /**
+   * Movido desde AdminService.listAuditLogs (ADMIN-3 lo dejó inyectando
+   * AdminAuditLogRepository directo, lo cual dejó de resolver una vez que
+   * AdminModule dejó de registrar la entidad en su TypeOrmModule.forFeature
+   * — el repositorio ahora vive únicamente acá). AdminService debe consumir
+   * este método en vez de tener su propio acceso al repositorio.
+   */
+  async list(params: ListAuditLogsParams): Promise<PaginatedAuditLogs> {
+    const page = params.page ?? 1;
+    const limit = params.limit ?? 20;
+
+    const qb = this.auditLogRepository
+      .createQueryBuilder('log')
+      .orderBy('log.createdAt', 'DESC')
+      .skip((page - 1) * limit)
+      .take(limit);
+
+    if (params.actorUserId) {
+      qb.andWhere('log."actorUserId" = :actorUserId', { actorUserId: params.actorUserId });
+    }
+
+    if (params.action) {
+      qb.andWhere('log.action = :action', { action: params.action });
+    }
+
+    if (params.targetType) {
+      qb.andWhere('log."targetType" = :targetType', { targetType: params.targetType });
+    }
+
+    if (params.targetId) {
+      qb.andWhere('log."targetId" = :targetId', { targetId: params.targetId });
+    }
+
+    const [items, total] = await qb.getManyAndCount();
+
+    return { items, total, page, limit };
   }
 
   /**
