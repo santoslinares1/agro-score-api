@@ -34,6 +34,20 @@ export type IndexImage = {
   image_base64?: string;
   dateRangeStart?: string;
   dateRangeEnd?: string;
+  vmin?: number;
+  vmax?: number;
+  palette?: string[];
+};
+
+export type IndexScale = {
+  vmin: number;
+  vmax: number;
+  palette: string[];
+};
+
+export type LotAreaRow = {
+  name: string;
+  areaHa: number;
 };
 
 /**
@@ -284,6 +298,38 @@ export function indexImageDateRangeLabel(item: IndexImage): string {
     : 'No disponible';
 }
 
+/**
+ * REPORT-IMG-1: escala de color real (vmin/vmax/paleta) con la que el worker generó la imagen —
+ * ver `INDEX_IMAGE_CONFIG` en agro-score-worker/app/pipeline/map_assets.py. `null` si el análisis
+ * no trae esos datos (análisis viejos); nunca inventa un rango.
+ */
+export function getIndexScale(item: IndexImage | null | undefined): IndexScale | null {
+  if (
+    typeof item?.vmin !== 'number' ||
+    typeof item?.vmax !== 'number' ||
+    !Array.isArray(item?.palette) ||
+    !item.palette.length
+  ) {
+    return null;
+  }
+
+  return { vmin: item.vmin, vmax: item.vmax, palette: item.palette };
+}
+
+/**
+ * REPORT-IMG-1: superficie de referencia por lote (la cargada en el campo, no la de píxeles
+ * válidos del worker — mismo criterio que getLotsOverview), para la tabla junto al RGB.
+ */
+export function getLotAreaRows(resultJson: any): LotAreaRow[] {
+  return getFieldLots(resultJson)
+    .filter((lot) => typeof lot.areaHa === 'number')
+    .map((lot) => ({ name: lot.name || 'Lote sin nombre', areaHa: lot.areaHa as number }));
+}
+
+export function getLotAreaTotalHa(rows: LotAreaRow[]): number {
+  return rows.reduce((acc, row) => acc + row.areaHa, 0);
+}
+
 function yearFromDate(date: string | undefined): string | null {
   if (!date) {
     return null;
@@ -305,16 +351,7 @@ function avgMetric(rows: any[], key: string): number {
   return values.reduce((acc, value) => acc + value, 0) / values.length;
 }
 
-/**
- * Evolución temporal resumida por campaña (mismo agrupamiento que campaignRows en
- * analysis-result.component.ts): se promedia NDVI/NDMI por año en vez de graficar cada fecha
- * de imagen individual, para mantener el PDF en una tabla acotada en vez de un gráfico.
- */
-export function getCampaignRows(resultJson: any): CampaignRow[] {
-  const timeseries = Array.isArray(resultJson?.timeseries)
-    ? resultJson.timeseries
-    : [];
-  const rows: any[] = timeseries.flatMap((serie: any) => serie?.rows || []);
+function buildCampaignRowsFromRows(rows: any[]): CampaignRow[] {
   const grouped = new Map<string, any[]>();
 
   for (const row of rows) {
@@ -345,6 +382,49 @@ export function getCampaignRows(resultJson: any): CampaignRow[] {
       ndviMean: avgMetric(yearRows, 'NDVI_mean'),
       ndmiMean: avgMetric(yearRows, 'NDMI_mean'),
     }));
+}
+
+/**
+ * Evolución temporal resumida por campaña (mismo agrupamiento que campaignRows en
+ * analysis-result.component.ts): se promedia NDVI/NDMI por año en vez de graficar cada fecha
+ * de imagen individual, para mantener el PDF en una tabla acotada en vez de un gráfico.
+ */
+export function getCampaignRows(resultJson: any): CampaignRow[] {
+  const timeseries = Array.isArray(resultJson?.timeseries)
+    ? resultJson.timeseries
+    : [];
+  const rows: any[] = timeseries.flatMap((serie: any) => serie?.rows || []);
+  return buildCampaignRowsFromRows(rows);
+}
+
+export type LotCampaignRows = {
+  lot: string;
+  lotId: string | null;
+  rows: CampaignRow[];
+};
+
+/**
+ * REPORT-IMG-1: evolución temporal agrupada por lote (lot/lot_id — ver LotTimeSeriesResult en
+ * agro-score-worker/app/pipeline/timeseries.py), cada elemento de resultJson.timeseries ya es la
+ * serie de un lote. Con 0 o 1 lote no aporta nada sobre el gráfico combinado, así que queda vacío
+ * y el caller decide no mostrar la sección.
+ */
+export function getCampaignRowsByLot(resultJson: any): LotCampaignRows[] {
+  const timeseries = Array.isArray(resultJson?.timeseries)
+    ? resultJson.timeseries
+    : [];
+
+  if (timeseries.length < 2) {
+    return [];
+  }
+
+  return timeseries
+    .map((serie: any) => ({
+      lot: resolveLotLabel(resultJson, serie?.lot_id, serie?.lot),
+      lotId: serie?.lot_id ?? null,
+      rows: buildCampaignRowsFromRows(serie?.rows || []),
+    }))
+    .filter((group: LotCampaignRows) => group.rows.length > 0);
 }
 
 export function getBestLotByNdvi(

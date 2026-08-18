@@ -13,14 +13,19 @@ import {
   getAnalyzedAreaHa,
   getBestLotByNdvi,
   getCampaignRows,
+  getCampaignRowsByLot,
   getClassificationScopeNote,
   getFieldZoneTotals,
+  getIndexImages,
+  getIndexScale,
+  getLotAreaRows,
+  getLotAreaTotalHa,
   getLotZoneDetails,
   getLotsCount,
   getLotsOverview,
-  getPrimaryIndexImages,
   getRgbImage,
   getTopZoneByHectares,
+  IndexScale,
   indexImageDateRangeLabel,
   isSoilClimateAvailable,
   safeText,
@@ -617,18 +622,48 @@ export class ReportPdfService {
     ];
   }
 
+  /** Barra de color real (vmin/vmax/paleta del worker) — REPORT-IMG-1, no un valor inventado. */
+  private buildScaleBar(scale: IndexScale): Content {
+    return {
+      margin: [0, 2, 0, 8],
+      stack: [
+        {
+          table: {
+            widths: scale.palette.map(() => '*'),
+            heights: 8,
+            body: [scale.palette.map((color) => ({ text: '', fillColor: color }))],
+          },
+          layout: 'noBorders',
+        },
+        {
+          columns: [
+            { text: String(scale.vmin), style: 'muted', fontSize: 8 },
+            { text: String(scale.vmax), style: 'muted', fontSize: 8, alignment: 'right' },
+          ],
+        },
+      ],
+    };
+  }
+
   private buildImagenes(resultJson: any): Content[] {
     const content: Content[] = [
       { ...this.sectionTitle('04. Imágenes satelitales'), pageBreak: 'before' },
     ];
 
+    // --- RGB ---
     const rgb = getRgbImage(resultJson);
 
-    content.push({
-      text: 'Imagen RGB Sentinel-2',
-      bold: true,
-      margin: [0, 4, 0, 4],
-    });
+    content.push(
+      { text: 'RGB', style: 'h2', fontSize: 12, margin: [0, 4, 0, 4] },
+      {
+        text:
+          'La imagen RGB corresponde a una composición de bandas roja, verde y azul, similar a ' +
+          'una vista natural de la superficie.',
+        style: 'muted',
+        lineHeight: 1.3,
+        margin: [0, 0, 0, 8],
+      },
+    );
 
     if (rgb) {
       content.push(
@@ -639,58 +674,136 @@ export class ReportPdfService {
           margin: [0, 0, 0, 4],
         },
         {
-          text: `Composición de bandas B4/B3/B2. Rango de fechas: ${rgb.dateRangeLabel}.`,
+          text: `Rango de fechas: ${rgb.dateRangeLabel}.`,
           style: 'muted',
           alignment: 'center',
           margin: [0, 0, 0, 10],
         },
       );
     } else {
-      content.push(
-        this.emptyNote('Imagen RGB no disponible para este diagnóstico.'),
-      );
+      content.push(this.emptyNote('Imagen RGB no generada para este análisis.'));
     }
 
-    const primary = getPrimaryIndexImages(resultJson);
+    const lotAreaRows = getLotAreaRows(resultJson);
+
+    if (lotAreaRows.length) {
+      const totalHa = getLotAreaTotalHa(lotAreaRows);
+      const body = [
+        [
+          { text: 'Lote', style: 'tableHeader' },
+          { text: 'Hectáreas', style: 'tableHeader' },
+        ],
+        ...lotAreaRows.map((row) => [{ text: row.name }, { text: formatHa(row.areaHa) }]),
+        [
+          { text: 'Total', bold: true },
+          { text: formatHa(totalHa), bold: true },
+        ],
+      ];
+
+      content.push({
+        table: { headerRows: 1, widths: ['*', 'auto'], body },
+        layout: 'lightHorizontalLines',
+        margin: [0, 0, 0, 14],
+      });
+    }
+
+    // --- NDVI ---
+    const ndvi = getIndexImages(resultJson).find((item) => item.index === 'NDVI') || null;
+
+    content.push(
+      { text: 'NDVI', style: 'h2', fontSize: 12, margin: [0, 6, 0, 4] },
+      {
+        text:
+          'Valores altos de NDVI indican mayor presencia y vigor de vegetación activa. Valores ' +
+          'bajos pueden indicar suelo desnudo, rastrojo o baja cobertura vegetal.',
+        style: 'muted',
+        lineHeight: 1.3,
+        margin: [0, 0, 0, 8],
+      },
+    );
+
+    if (ndvi) {
+      content.push(
+        {
+          image: `data:image/png;base64,${ndvi.image_base64}`,
+          width: 300,
+          alignment: 'center',
+          margin: [0, 0, 0, 4],
+        },
+        {
+          text: `Rango de fechas: ${indexImageDateRangeLabel(ndvi)}.`,
+          style: 'muted',
+          alignment: 'center',
+          margin: [0, 0, 0, 6],
+        },
+      );
+
+      const ndviScale = getIndexScale(ndvi);
+
+      if (ndviScale) {
+        content.push(this.buildScaleBar(ndviScale));
+      }
+    } else {
+      content.push(this.emptyNote('Imagen NDVI no generada para este análisis.'));
+    }
 
     content.push({
-      text: 'Índices NDVI / NDMI',
-      bold: true,
-      margin: [0, 10, 0, 4],
+      text:
+        'Este análisis no incluye grillas mensuales NDVI. Se muestra la serie temporal calculada ' +
+        'con imágenes satelitales disponibles.',
+      style: 'muted',
+      margin: [0, 4, 0, 14],
     });
 
-    if (primary.length) {
-      const columns = primary.map((item) => ({
-        width: '*',
-        stack: [
-          {
-            image: `data:image/png;base64,${item.image_base64}`,
-            width: 220,
-            alignment: 'center',
-          },
-          {
-            text: item.index,
-            bold: true,
-            alignment: 'center',
-            margin: [0, 4, 0, 0],
-          },
-          {
-            text: `Rango de fechas: ${indexImageDateRangeLabel(item)}.`,
-            style: 'muted',
-            alignment: 'center',
-          },
-        ],
-      }));
+    // --- NDMI ---
+    const ndmi = getIndexImages(resultJson).find((item) => item.index === 'NDMI') || null;
 
-      content.push({ columns, columnGap: 10 });
-    } else {
+    content.push(
+      { text: 'NDMI', style: 'h2', fontSize: 12, margin: [0, 6, 0, 4] },
+      {
+        text:
+          'Valores altos de NDMI indican mayor presencia de agua o humedad foliar. Valores bajos ' +
+          'pueden indicar menor contenido de humedad o suelo desnudo.',
+        style: 'muted',
+        lineHeight: 1.3,
+        margin: [0, 0, 0, 8],
+      },
+    );
+
+    if (ndmi) {
       content.push(
-        this.emptyNote(
-          'Imágenes de NDVI/NDMI no disponibles para este diagnóstico.',
-        ),
+        {
+          image: `data:image/png;base64,${ndmi.image_base64}`,
+          width: 300,
+          alignment: 'center',
+          margin: [0, 0, 0, 4],
+        },
+        {
+          text: `Rango de fechas: ${indexImageDateRangeLabel(ndmi)}.`,
+          style: 'muted',
+          alignment: 'center',
+          margin: [0, 0, 0, 6],
+        },
       );
+
+      const ndmiScale = getIndexScale(ndmi);
+
+      if (ndmiScale) {
+        content.push(this.buildScaleBar(ndmiScale));
+      }
+    } else {
+      content.push(this.emptyNote('Imagen NDMI no generada para este análisis.'));
     }
 
+    content.push({
+      text:
+        'Este análisis no incluye grillas mensuales NDMI. Se muestra la serie temporal calculada ' +
+        'con imágenes satelitales disponibles.',
+      style: 'muted',
+      margin: [0, 4, 0, 10],
+    });
+
+    // --- Índices adicionales ---
     const additional = getAdditionalIndexImages(resultJson);
 
     if (additional.length) {
@@ -825,6 +938,33 @@ export class ReportPdfService {
       table: { headerRows: 1, widths: ['*', 'auto', 'auto'], body },
       layout: 'lightHorizontalLines',
     });
+
+    const lotCampaigns = getCampaignRowsByLot(resultJson);
+
+    if (lotCampaigns.length > 1) {
+      content.push({
+        text: 'Evolución por lote',
+        bold: true,
+        fontSize: 11,
+        margin: [0, 18, 0, 4],
+      });
+
+      for (const lotGroup of lotCampaigns) {
+        const lotChartSvg = buildNdviNdmiChartSvg(lotGroup.rows);
+        const lotStack: Content[] = [{ text: lotGroup.lot, bold: true, margin: [0, 8, 0, 2] }];
+
+        if (lotChartSvg) {
+          lotStack.push({
+            svg: lotChartSvg,
+            width: 320,
+            alignment: 'center',
+            margin: [0, 0, 0, 2],
+          });
+        }
+
+        content.push({ stack: lotStack, unbreakable: true, margin: [0, 0, 0, 6] });
+      }
+    }
 
     return content;
   }

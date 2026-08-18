@@ -7,7 +7,11 @@ import {
   getAnalyzedAreaHa,
   getBestLotByNdvi,
   getCampaignRows,
+  getCampaignRowsByLot,
   getFieldZoneTotals,
+  getIndexScale,
+  getLotAreaRows,
+  getLotAreaTotalHa,
   getLotsOverview,
   getTopZoneByHectares,
   safeText,
@@ -248,6 +252,88 @@ describe('report-pdf.helpers', () => {
       expect(safeText(undefined)).toBe('No disponible');
       expect(safeText('')).toBe('No disponible');
       expect(safeText(null, 'Campo')).toBe('Campo');
+    });
+  });
+
+  describe('getIndexScale (REPORT-IMG-1)', () => {
+    it('devuelve la escala real (vmin/vmax/paleta) cuando el análisis la trae', () => {
+      expect(
+        getIndexScale({
+          index: 'NDVI',
+          available: true,
+          image_base64: 'AAAA',
+          vmin: 0,
+          vmax: 0.9,
+          palette: ['#d73027', '#fee08b', '#91cf60', '#1a9850'],
+        }),
+      ).toEqual({ vmin: 0, vmax: 0.9, palette: ['#d73027', '#fee08b', '#91cf60', '#1a9850'] });
+    });
+
+    it('devuelve null sin inventar un rango si falta vmin/vmax/paleta (análisis viejos)', () => {
+      expect(getIndexScale({ index: 'NDVI', available: true, image_base64: 'AAAA' })).toBeNull();
+      expect(getIndexScale(null)).toBeNull();
+    });
+  });
+
+  describe('getLotAreaRows / getLotAreaTotalHa (REPORT-IMG-1)', () => {
+    it('arma la tabla de hectáreas por lote a partir de fieldLots y suma el total', () => {
+      const resultJson = {
+        fieldLots: [
+          { id: 'lot-1', name: 'Lote 1', areaHa: 10 },
+          { id: 'lot-2', name: 'Lote 2', areaHa: 5.5 },
+        ],
+      };
+
+      const rows = getLotAreaRows(resultJson);
+      expect(rows).toEqual([
+        { name: 'Lote 1', areaHa: 10 },
+        { name: 'Lote 2', areaHa: 5.5 },
+      ]);
+      expect(getLotAreaTotalHa(rows)).toBe(15.5);
+    });
+
+    it('devuelve una lista vacía si no hay fieldLots con superficie', () => {
+      expect(getLotAreaRows({})).toEqual([]);
+      expect(getLotAreaTotalHa([])).toBe(0);
+    });
+  });
+
+  describe('getCampaignRowsByLot (REPORT-IMG-1)', () => {
+    it('agrupa por lote (lot/lot_id) cuando hay más de una serie en el timeseries', () => {
+      const resultJson = {
+        timeseries: [
+          {
+            lot: 'Lote Norte',
+            lot_id: 'lot-1',
+            rows: [{ date: '2024-01-15', values: { NDVI_mean: 0.6, NDVI_count: 5, NDMI_mean: 0.3 } }],
+          },
+          {
+            lot: 'Lote Sur',
+            lot_id: 'lot-2',
+            rows: [{ date: '2024-01-15', values: { NDVI_mean: 0.4, NDVI_count: 5, NDMI_mean: 0.1 } }],
+          },
+        ],
+      };
+
+      const groups = getCampaignRowsByLot(resultJson);
+      expect(groups).toEqual([
+        { lot: 'Lote Norte', lotId: 'lot-1', rows: [{ campaign: '2024', ndviMean: 0.6, ndmiMean: 0.3 }] },
+        { lot: 'Lote Sur', lotId: 'lot-2', rows: [{ campaign: '2024', ndviMean: 0.4, ndmiMean: 0.1 }] },
+      ]);
+    });
+
+    it('devuelve una lista vacía con un solo lote (no repite el gráfico combinado)', () => {
+      const resultJson = {
+        timeseries: [
+          {
+            lot: 'Lote Único',
+            lot_id: 'lot-1',
+            rows: [{ date: '2024-01-15', values: { NDVI_mean: 0.6, NDVI_count: 5 } }],
+          },
+        ],
+      };
+
+      expect(getCampaignRowsByLot(resultJson)).toEqual([]);
     });
   });
 

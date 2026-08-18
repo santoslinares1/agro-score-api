@@ -258,4 +258,88 @@ describe('ReportPdfService', () => {
       );
     });
   });
+
+  describe('RGB / NDVI / NDMI reestructurados con texto real y hectáreas por lote (REPORT-IMG-1)', () => {
+    it('incluye los títulos y las explicaciones de RGB/NDVI/NDMI, y la tabla de hectáreas por lote', () => {
+      const analysis = buildAnalysis();
+      const imagenes = (service as any).buildImagenes(analysis.resultJson);
+      const serialized = JSON.stringify(imagenes);
+
+      expect(serialized).toContain('RGB');
+      expect(serialized).toContain(
+        'La imagen RGB corresponde a una composición de bandas roja, verde y azul',
+      );
+      expect(serialized).toContain(
+        'Valores altos de NDVI indican mayor presencia y vigor de vegetación activa',
+      );
+      expect(serialized).toContain(
+        'Valores altos de NDMI indican mayor presencia de agua o humedad foliar',
+      );
+      expect(serialized).toContain('Lote 1');
+      expect(serialized).toContain('10.00 ha');
+    });
+
+    it('sin imágenes generadas muestra el aviso honesto por sección, no un placeholder', () => {
+      const analysis = buildAnalysis({
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          totalsByZone: [{ zone: 1, name: 'Alta', hectares: 5, percent: 100 }],
+        } as any,
+      });
+      const imagenes = (service as any).buildImagenes(analysis.resultJson);
+      const serialized = JSON.stringify(imagenes);
+
+      expect(serialized).toContain('Imagen RGB no generada para este análisis.');
+      expect(serialized).toContain('Imagen NDVI no generada para este análisis.');
+      expect(serialized).toContain('Imagen NDMI no generada para este análisis.');
+    });
+
+    it('siempre aclara que no incluye grillas mensuales, sin inventarlas', () => {
+      const analysis = buildAnalysis();
+      const imagenes = (service as any).buildImagenes(analysis.resultJson);
+      const serialized = JSON.stringify(imagenes);
+
+      expect(serialized).toContain('Este análisis no incluye grillas mensuales NDVI');
+      expect(serialized).toContain('Este análisis no incluye grillas mensuales NDMI');
+    });
+
+    it('con más de un lote en el timeseries, agrega "Evolución por lote" con un gráfico por lote', () => {
+      const analysis = buildAnalysis({
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          totalsByZone: [{ zone: 1, name: 'Alta', hectares: 5, percent: 100 }],
+          timeseries: [
+            {
+              lot: 'Lote Norte',
+              lot_id: 'lot-1',
+              rows: [{ date: '2024-02-01', values: { NDVI_mean: 0.7, NDVI_count: 5, NDMI_mean: 0.4 } }],
+            },
+            {
+              lot: 'Lote Sur',
+              lot_id: 'lot-2',
+              rows: [{ date: '2024-02-01', values: { NDVI_mean: 0.5, NDVI_count: 5, NDMI_mean: 0.2 } }],
+            },
+          ],
+        } as any,
+      });
+      const evolucion = (service as any).buildEvolucionTemporal(analysis.resultJson);
+      const serialized = JSON.stringify(evolucion);
+
+      expect(serialized).toContain('Evolución por lote');
+      expect(serialized).toContain('Lote Norte');
+      expect(serialized).toContain('Lote Sur');
+      // un <svg> por el gráfico combinado + uno por cada lote
+      expect((serialized.match(/<svg/g) || []).length).toBe(3);
+    });
+
+    it('con un solo lote no agrega "Evolución por lote" (no repite el gráfico combinado)', () => {
+      const analysis = buildAnalysis();
+      const evolucion = (service as any).buildEvolucionTemporal(analysis.resultJson);
+      const serialized = JSON.stringify(evolucion);
+
+      expect(serialized).not.toContain('Evolución por lote');
+    });
+  });
 });
