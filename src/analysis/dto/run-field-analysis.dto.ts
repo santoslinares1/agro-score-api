@@ -63,6 +63,15 @@ export class RunFieldAnalysisDto {
   includeIndexImages?: boolean;
 
   /**
+   * Fase 2 mínima: grillas mensuales NDVI/NDMI por campaña (resultJson.imageSeries). Apagado
+   * por default — independiente de includeMapAssets/includeIndexImages, no se genera salvo que
+   * se pida explícito.
+   */
+  @IsOptional()
+  @IsBoolean()
+  includeImageSeries?: boolean;
+
+  /**
    * Tope de campañas para la clasificación de zonas productivas. Antes se
    * usaba un año por cada año calendario entre startDate y endDate (podía
    * ser 6-8+ con los rangos default del frontend); ahora se acota a los N

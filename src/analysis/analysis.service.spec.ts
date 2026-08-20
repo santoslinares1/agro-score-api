@@ -65,12 +65,23 @@ describe('AnalysisService', () => {
       ...overrides,
     }) as Field;
 
+  let queryBuilderMock: {
+    innerJoin: jest.Mock;
+    select: jest.Mock;
+    where: jest.Mock;
+    orderBy: jest.Mock;
+    getMany: jest.Mock;
+    getOne: jest.Mock;
+  };
+
   beforeEach(async () => {
-    const queryBuilderMock = {
+    queryBuilderMock = {
       innerJoin: jest.fn().mockReturnThis(),
+      select: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
       orderBy: jest.fn().mockReturnThis(),
       getMany: jest.fn().mockResolvedValue([]),
+      getOne: jest.fn().mockResolvedValue(null),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -178,6 +189,107 @@ describe('AnalysisService', () => {
       analysisRepository.findOne.mockResolvedValue(analysis);
 
       await expect(service.findOneOwned('analysis-1', 'user-A')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(fieldsService.findOne).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('findOneOwnedStatus (PERF-2)', () => {
+    const buildStatusRow = (overrides: Partial<Analysis> = {}): Analysis =>
+      buildAnalysis({
+        status: 'Procesando',
+        startedAt: new Date('2026-01-01T10:00:00Z'),
+        completedAt: null,
+        failedAt: null,
+        durationMs: null,
+        errorMessage: null,
+        // Simula que, si por algún motivo la fila trajera más columnas de las pedidas, igual
+        // nunca deberían terminar en el DTO devuelto — el mapeo campo por campo del service es
+        // la garantía real, no una lista de qué "esconder".
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          mapAssets: { rgb: { available: true, image_base64: 'HUGE_BASE64_STRING' } },
+          imageSeries: {
+            ndvi: [{ campaign: '2024', images: [{ available: true, image_base64: 'HUGE_BASE64_STRING' }] }],
+            ndmi: [],
+          },
+        } as any,
+        ...overrides,
+      });
+
+    it('selecciona solo columnas livianas al consultar Postgres — nunca resultJson', async () => {
+      queryBuilderMock.getOne.mockResolvedValue(buildStatusRow({ scope: 'field', fieldId: 'field-1' }));
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      await service.findOneOwnedStatus('analysis-1', 'user-A');
+
+      expect(queryBuilderMock.select).toHaveBeenCalledWith(
+        expect.arrayContaining(['analysis.id', 'analysis.status', 'analysis.globalScore']),
+      );
+      const selectedColumns = queryBuilderMock.select.mock.calls[0][0] as string[];
+      expect(selectedColumns).not.toContain('analysis.resultJson');
+    });
+
+    it('la respuesta nunca incluye resultJson/mapAssets/imageSeries aunque la fila los tuviera', async () => {
+      queryBuilderMock.getOne.mockResolvedValue(buildStatusRow({ scope: 'field', fieldId: 'field-1' }));
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      const result = await service.findOneOwnedStatus('analysis-1', 'user-A');
+
+      expect(result).not.toHaveProperty('resultJson');
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain('imageSeries');
+      expect(serialized).not.toContain('mapAssets');
+      expect(serialized).not.toContain('HUGE_BASE64_STRING');
+    });
+
+    it('devuelve status, error y timestamps operativos', async () => {
+      queryBuilderMock.getOne.mockResolvedValue(
+        buildStatusRow({
+          scope: 'field',
+          fieldId: 'field-1',
+          status: 'Error',
+          failedAt: new Date('2026-01-01T10:05:00Z'),
+          durationMs: 300000,
+          errorMessage: 'No se pudo conectar con el worker Python.',
+        }),
+      );
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      const result = await service.findOneOwnedStatus('analysis-1', 'user-A');
+
+      expect(result.status).toBe('Error');
+      expect(result.errorMessage).toBe('No se pudo conectar con el worker Python.');
+      expect(result.durationMs).toBe(300000);
+      expect(result.failedAt).toEqual(new Date('2026-01-01T10:05:00Z'));
+    });
+
+    it('lanza NotFoundException si el análisis no existe', async () => {
+      queryBuilderMock.getOne.mockResolvedValue(null);
+
+      await expect(service.findOneOwnedStatus('missing', 'user-A')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(fieldsService.findOne).not.toHaveBeenCalled();
+    });
+
+    it('lanza NotFoundException si el análisis es de otro usuario (Field ajeno)', async () => {
+      queryBuilderMock.getOne.mockResolvedValue(buildStatusRow({ scope: 'field', fieldId: 'field-1' }));
+      fieldsService.findOne.mockRejectedValue(new NotFoundException('Campo no encontrado.'));
+
+      await expect(service.findOneOwnedStatus('analysis-1', 'user-B')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
+    it('lanza NotFoundException para scope=lot, sin consultar FieldsService (mismo default-deny que findOneOwned)', async () => {
+      queryBuilderMock.getOne.mockResolvedValue(
+        buildStatusRow({ scope: 'lot', lotId: 'lot-1', fieldId: null }),
+      );
+
+      await expect(service.findOneOwnedStatus('analysis-1', 'user-A')).rejects.toBeInstanceOf(
         NotFoundException,
       );
       expect(fieldsService.findOne).not.toHaveBeenCalled();

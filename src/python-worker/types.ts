@@ -38,6 +38,34 @@ export type ZoneClassificationMeta = {
   campaignsUsed: number[];
 };
 
+/**
+ * Fase 2 mínima: una imagen mensual (o su ausencia informada) dentro de resultJson.imageSeries.
+ * Mismos nombres de campo que WorkerResultJson (no se agrega ninguna interfaz nueva acá arriba
+ * como IndexImageAsset) que mapAssets.indexImages (image_base64, vmin, vmax, palette) — ver
+ * agro-score-worker/app/pipeline/response_mapper.py.
+ */
+export type MonthlyImageAsset = {
+  date?: string;
+  label?: string;
+  available: boolean;
+  image_base64?: string;
+  cloudiness?: number;
+  vmin?: number;
+  vmax?: number;
+  palette?: string[];
+  notes?: string[];
+};
+
+export type CampaignImageSeries = {
+  campaign: string;
+  images: MonthlyImageAsset[];
+};
+
+export type ImageSeries = {
+  ndvi: CampaignImageSeries[];
+  ndmi: CampaignImageSeries[];
+};
+
 export type WorkerResultJson = {
   mode: 'fake' | 'python-worker' | 'python-worker-v2' | 'error';
   message: string;
@@ -52,6 +80,9 @@ export type WorkerResultJson = {
 
   classificationScope?: string | null;
   zoneClassification?: ZoneClassificationMeta | null;
+
+  /** Fase 2 mínima: solo presente si el análisis se pidió con includeImageSeries=true. */
+  imageSeries?: ImageSeries;
 
   raw?: Record<string, unknown>;
 

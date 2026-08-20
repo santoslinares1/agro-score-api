@@ -4,7 +4,7 @@ import pdfMake from 'pdfmake';
 import { Analysis } from '../entities/analysis.entity';
 import { Field } from '../../fields/entities/field.entity';
 import {
-  buildNdviNdmiChartSvg,
+  buildNdviEvolutionChartSvg,
   buildPdfFilename,
   fieldLocationLabel,
   formatDateDMY,
@@ -13,9 +13,10 @@ import {
   getAnalyzedAreaHa,
   getBestLotByNdvi,
   getCampaignRows,
-  getCampaignRowsByLot,
   getClassificationScopeNote,
   getFieldZoneTotals,
+  getImageSeries,
+  getImageSeriesScale,
   getIndexImages,
   getIndexScale,
   getLotAreaRows,
@@ -23,10 +24,13 @@ import {
   getLotZoneDetails,
   getLotsCount,
   getLotsOverview,
+  getNdviEvolutionByCampaign,
   getRgbImage,
   getTopZoneByHectares,
   IndexScale,
   indexImageDateRangeLabel,
+  LotNdviCampaignSeries,
+  MonthlyImage,
   isSoilClimateAvailable,
   safeText,
   scoreInterpretation,
@@ -44,7 +48,8 @@ const METHODOLOGICAL_LIMITATIONS: string[] = [
   'La lectura se basa en las imágenes satelitales Sentinel-2 disponibles para el período analizado.',
   'La disponibilidad y calidad de esas imágenes depende de la nubosidad y la cobertura satelital de cada fecha.',
   'La clasificación productiva es relativa dentro del campo analizado: no es una escala absoluta ni comparable con otros campos.',
-  'Las imágenes visuales (RGB e índices) corresponden a una ventana puntual de la campaña, no a un promedio mensual ni multi-campaña.',
+  'La imagen RGB y las imágenes puntuales de índice corresponden a una ventana específica de la campaña. Las grillas mensuales NDVI/NDMI se generan a partir de composiciones mensuales disponibles para el período analizado.',
+  'Las curvas de evolución NDVI por lote se calculan con las fechas satelitales disponibles; la cantidad de observaciones puede variar según nubosidad y disponibilidad de imágenes.',
   'No reemplaza mediciones a campo ni decisiones agronómicas profesionales — se recomienda usarla como complemento.',
 ];
 
@@ -292,6 +297,18 @@ export class ReportPdfService {
     return { text, style: 'muted', margin };
   }
 
+  /**
+   * Layout PDF-3: agrupa nodos en un bloque atómico (`unbreakable`) para que un salto de
+   * página natural nunca los separe — típicamente un título (de sección o subsección) junto a
+   * su primer contenido, así nunca queda un título solo al final de una página con el resto
+   * recién arrancando en la siguiente. Solo se usa con contenido acotado (un párrafo, una
+   * escala, una lista corta) — nunca con una tabla potencialmente larga, porque un bloque
+   * `unbreakable` más alto que una página se desborda en vez de paginarse.
+   */
+  private glued(...nodes: Content[]): Content {
+    return { stack: nodes, unbreakable: true };
+  }
+
   /** Pill de una sola celda (fillColor de pdfmake solo pinta en celdas de tabla). */
   private badge(
     text: string,
@@ -507,8 +524,13 @@ export class ReportPdfService {
     const topZone = getTopZoneByHectares(getFieldZoneTotals(resultJson));
 
     return [
-      this.sectionTitle('01. Resumen ejecutivo'),
-      this.mutedText(scoreInterpretation(analysis.globalScore), [0, 0, 0, 10]),
+      this.glued(
+        this.sectionTitle('01. Resumen ejecutivo'),
+        this.mutedText(
+          scoreInterpretation(analysis.globalScore),
+          [0, 0, 0, 10],
+        ),
+      ),
       {
         columns: [
           this.metricCard('Score productivo', `${analysis.globalScore}/100`),
@@ -552,8 +574,7 @@ export class ReportPdfService {
     });
 
     return [
-      this.sectionTitle('02. Metodología'),
-      {
+      this.glued(this.sectionTitle('02. Metodología'), {
         text:
           'El diagnóstico se basa en imágenes satelitales Sentinel-2 y se calcula a partir de los indicadores ' +
           'NDVI y NDMI. Con esa información se identifican zonas de clasificación productiva (Baja, Alta, Muy ' +
@@ -562,7 +583,7 @@ export class ReportPdfService {
           'Se trata de una lectura satelital relativa dentro del campo, no de una medición directa de rendimiento.',
         margin: [0, 0, 0, 10],
         lineHeight: 1.3,
-      },
+      }),
       {
         table: {
           widths: ['*'],
@@ -591,9 +612,11 @@ export class ReportPdfService {
 
     if (!lots.length) {
       return [
-        this.sectionTitle('03. Campo y lotes analizados'),
-        this.emptyNote(
-          'No hay información de lotes disponible para este diagnóstico.',
+        this.glued(
+          this.sectionTitle('03. Campo y lotes analizados'),
+          this.emptyNote(
+            'No hay información de lotes disponible para este diagnóstico.',
+          ),
         ),
       ];
     }
@@ -631,18 +654,154 @@ export class ReportPdfService {
           table: {
             widths: scale.palette.map(() => '*'),
             heights: 8,
-            body: [scale.palette.map((color) => ({ text: '', fillColor: color }))],
+            body: [
+              scale.palette.map((color) => ({ text: '', fillColor: color })),
+            ],
           },
           layout: 'noBorders',
         },
         {
           columns: [
             { text: String(scale.vmin), style: 'muted', fontSize: 8 },
-            { text: String(scale.vmax), style: 'muted', fontSize: 8, alignment: 'right' },
+            {
+              text: String(scale.vmax),
+              style: 'muted',
+              fontSize: 8,
+              alignment: 'right',
+            },
           ],
         },
       ],
     };
+  }
+
+  /** Fase 2 mínima: una celda de la grilla mensual — imagen real o aviso honesto, nunca un placeholder visual. */
+  private buildMonthlyImageCell(img: MonthlyImage): Content {
+    if (img.available && img.image_base64) {
+      return {
+        stack: [
+          {
+            image: `data:image/png;base64,${img.image_base64}`,
+            width: 150,
+            alignment: 'center',
+          },
+          {
+            text: img.label || '',
+            alignment: 'center',
+            fontSize: 8,
+            margin: [0, 3, 0, 0],
+          },
+        ],
+        margin: [0, 0, 0, 10],
+      };
+    }
+
+    return {
+      stack: [
+        {
+          table: {
+            widths: ['*'],
+            body: [
+              [
+                {
+                  text: 'No disponible',
+                  color: COLORS.muted,
+                  fontSize: 8,
+                  alignment: 'center',
+                  fillColor: COLORS.panel,
+                  margin: [0, 22, 0, 22],
+                },
+              ],
+            ],
+          },
+          layout: 'noBorders',
+        },
+        {
+          text: img.label || '',
+          alignment: 'center',
+          fontSize: 8,
+          margin: [0, 3, 0, 0],
+        },
+      ],
+      margin: [0, 0, 0, 10],
+    };
+  }
+
+  /** Grilla de 2 columnas (pdfmake pagina la tabla sola si no entra en una página). */
+  private buildMonthlyImageGrid(images: MonthlyImage[]): Content {
+    const rows: Content[][] = [];
+
+    for (let i = 0; i < images.length; i += 2) {
+      const pair = images
+        .slice(i, i + 2)
+        .map((img) => this.buildMonthlyImageCell(img));
+
+      if (pair.length === 1) {
+        pair.push({ text: '' });
+      }
+
+      rows.push(pair);
+    }
+
+    return {
+      table: { widths: ['*', '*'], body: rows },
+      layout: 'noBorders',
+      margin: [0, 4, 0, 6],
+    };
+  }
+
+  /**
+   * Fase 2 mínima: NDVI/NDMI mensual por campaña. `imageSeries` es completamente independiente
+   * de mapAssets — un análisis puede tener uno, el otro, los dos, o ninguno. Si no hay serie
+   * para el índice, mantiene la nota honesta que ya mostraba buildImagenes.
+   */
+  private buildImageSeriesBlock(
+    resultJson: any,
+    index: 'ndvi' | 'ndmi',
+  ): Content[] {
+    const label = index === 'ndvi' ? 'NDVI' : 'NDMI';
+    const series = getImageSeries(resultJson, index);
+
+    if (!series.length) {
+      return [
+        {
+          text:
+            `Este análisis no incluye grillas mensuales ${label}. Se muestra la serie temporal ` +
+            'calculada con imágenes satelitales disponibles.',
+          style: 'muted',
+          margin: [0, 4, 0, 14],
+        },
+      ];
+    }
+
+    const seriesTitle = {
+      text: `${label} mensual por campaña`,
+      bold: true,
+      fontSize: 11,
+      margin: [0, 8, 0, 4],
+    };
+    const scale = getImageSeriesScale(series);
+
+    // Título + escala pegados (regla 7/8): la escala es corta y casi siempre está presente
+    // (vmin/vmax/paleta viajan incluso en meses no disponibles), así que el título nunca queda
+    // solo al final de una página con la escala recién empezando en la siguiente.
+    const content: Content[] = [
+      scale ? this.glued(seriesTitle, this.buildScaleBar(scale)) : seriesTitle,
+    ];
+
+    for (const campaignSeries of series) {
+      content.push(
+        {
+          text: `Campaña ${campaignSeries.campaign}`,
+          bold: true,
+          fontSize: 9,
+          margin: [0, 6, 0, 2],
+        },
+        this.buildMonthlyImageGrid(campaignSeries.images),
+      );
+    }
+
+    return content;
   }
 
   private buildImagenes(resultJson: any): Content[] {
@@ -654,15 +813,17 @@ export class ReportPdfService {
     const rgb = getRgbImage(resultJson);
 
     content.push(
-      { text: 'RGB', style: 'h2', fontSize: 12, margin: [0, 4, 0, 4] },
-      {
-        text:
-          'La imagen RGB corresponde a una composición de bandas roja, verde y azul, similar a ' +
-          'una vista natural de la superficie.',
-        style: 'muted',
-        lineHeight: 1.3,
-        margin: [0, 0, 0, 8],
-      },
+      this.glued(
+        { text: 'RGB', style: 'h2', fontSize: 12, margin: [0, 4, 0, 4] },
+        {
+          text:
+            'La imagen RGB corresponde a una composición de bandas roja, verde y azul, similar a ' +
+            'una vista natural de la superficie.',
+          style: 'muted',
+          lineHeight: 1.3,
+          margin: [0, 0, 0, 8],
+        },
+      ),
     );
 
     if (rgb) {
@@ -681,7 +842,9 @@ export class ReportPdfService {
         },
       );
     } else {
-      content.push(this.emptyNote('Imagen RGB no generada para este análisis.'));
+      content.push(
+        this.emptyNote('Imagen RGB no generada para este análisis.'),
+      );
     }
 
     const lotAreaRows = getLotAreaRows(resultJson);
@@ -693,7 +856,10 @@ export class ReportPdfService {
           { text: 'Lote', style: 'tableHeader' },
           { text: 'Hectáreas', style: 'tableHeader' },
         ],
-        ...lotAreaRows.map((row) => [{ text: row.name }, { text: formatHa(row.areaHa) }]),
+        ...lotAreaRows.map((row) => [
+          { text: row.name },
+          { text: formatHa(row.areaHa) },
+        ]),
         [
           { text: 'Total', bold: true },
           { text: formatHa(totalHa), bold: true },
@@ -708,18 +874,21 @@ export class ReportPdfService {
     }
 
     // --- NDVI ---
-    const ndvi = getIndexImages(resultJson).find((item) => item.index === 'NDVI') || null;
+    const ndvi =
+      getIndexImages(resultJson).find((item) => item.index === 'NDVI') || null;
 
     content.push(
-      { text: 'NDVI', style: 'h2', fontSize: 12, margin: [0, 6, 0, 4] },
-      {
-        text:
-          'Valores altos de NDVI indican mayor presencia y vigor de vegetación activa. Valores ' +
-          'bajos pueden indicar suelo desnudo, rastrojo o baja cobertura vegetal.',
-        style: 'muted',
-        lineHeight: 1.3,
-        margin: [0, 0, 0, 8],
-      },
+      this.glued(
+        { text: 'NDVI', style: 'h2', fontSize: 12, margin: [0, 6, 0, 4] },
+        {
+          text:
+            'Valores altos de NDVI indican mayor presencia y vigor de vegetación activa. Valores ' +
+            'bajos pueden indicar suelo desnudo, rastrojo o baja cobertura vegetal.',
+          style: 'muted',
+          lineHeight: 1.3,
+          margin: [0, 0, 0, 8],
+        },
+      ),
     );
 
     if (ndvi) {
@@ -744,31 +913,33 @@ export class ReportPdfService {
         content.push(this.buildScaleBar(ndviScale));
       }
     } else {
-      content.push(this.emptyNote('Imagen NDVI no generada para este análisis.'));
+      content.push(
+        this.emptyNote('Imagen NDVI no generada para este análisis.'),
+      );
     }
 
-    content.push({
-      text:
-        'Este análisis no incluye grillas mensuales NDVI. Se muestra la serie temporal calculada ' +
-        'con imágenes satelitales disponibles.',
-      style: 'muted',
-      margin: [0, 4, 0, 14],
-    });
+    content.push(...this.buildImageSeriesBlock(resultJson, 'ndvi'));
 
     // --- NDMI ---
-    const ndmi = getIndexImages(resultJson).find((item) => item.index === 'NDMI') || null;
+    const ndmi =
+      getIndexImages(resultJson).find((item) => item.index === 'NDMI') || null;
 
-    content.push(
-      { text: 'NDMI', style: 'h2', fontSize: 12, margin: [0, 6, 0, 4] },
-      {
-        text:
-          'Valores altos de NDMI indican mayor presencia de agua o humedad foliar. Valores bajos ' +
-          'pueden indicar menor contenido de humedad o suelo desnudo.',
-        style: 'muted',
-        lineHeight: 1.3,
-        margin: [0, 0, 0, 8],
-      },
-    );
+    content.push({
+      // Regla 3 de la ficha de paginación: NDMI siempre arranca en página nueva (antes se
+      // mezclaba con el final de las grillas mensuales de NDVI).
+      ...this.glued(
+        { text: 'NDMI', style: 'h2', fontSize: 12, margin: [0, 6, 0, 4] },
+        {
+          text:
+            'Valores altos de NDMI indican mayor presencia de agua o humedad foliar. Valores bajos ' +
+            'pueden indicar menor contenido de humedad o suelo desnudo.',
+          style: 'muted',
+          lineHeight: 1.3,
+          margin: [0, 0, 0, 8],
+        },
+      ),
+      pageBreak: 'before',
+    });
 
     if (ndmi) {
       content.push(
@@ -792,16 +963,12 @@ export class ReportPdfService {
         content.push(this.buildScaleBar(ndmiScale));
       }
     } else {
-      content.push(this.emptyNote('Imagen NDMI no generada para este análisis.'));
+      content.push(
+        this.emptyNote('Imagen NDMI no generada para este análisis.'),
+      );
     }
 
-    content.push({
-      text:
-        'Este análisis no incluye grillas mensuales NDMI. Se muestra la serie temporal calculada ' +
-        'con imágenes satelitales disponibles.',
-      style: 'muted',
-      margin: [0, 4, 0, 10],
-    });
+    content.push(...this.buildImageSeriesBlock(resultJson, 'ndmi'));
 
     // --- Índices adicionales ---
     const additional = getAdditionalIndexImages(resultJson);
@@ -844,10 +1011,16 @@ export class ReportPdfService {
 
     if (!zones.length) {
       return [
-        this.sectionTitle('05. Clasificación productiva'),
-        this.emptyNote(
-          'Todavía no hay datos consolidados de clasificación productiva para este campo.',
-        ),
+        {
+          // Regla 4: Clasificación productiva siempre arranca en página nueva después de NDMI.
+          ...this.glued(
+            this.sectionTitle('05. Clasificación productiva'),
+            this.emptyNote(
+              'Todavía no hay datos consolidados de clasificación productiva para este campo.',
+            ),
+          ),
+          pageBreak: 'before',
+        },
       ];
     }
 
@@ -865,13 +1038,16 @@ export class ReportPdfService {
     ];
 
     return [
-      this.sectionTitle('05. Clasificación productiva'),
       {
-        text:
-          'Las zonas productivas representan diferencias relativas dentro del campo según la respuesta ' +
-          'satelital. No representa un rendimiento medido.',
-        style: 'muted',
-        margin: [0, 0, 0, 10],
+        // Regla 4: Clasificación productiva siempre arranca en página nueva después de NDMI.
+        ...this.glued(this.sectionTitle('05. Clasificación productiva'), {
+          text:
+            'Las zonas productivas representan diferencias relativas dentro del campo según la respuesta ' +
+            'satelital. No representa un rendimiento medido.',
+          style: 'muted',
+          margin: [0, 0, 0, 10],
+        }),
+        pageBreak: 'before',
       },
       {
         table: { headerRows: 1, widths: ['*', 'auto', 'auto'], body },
@@ -886,84 +1062,140 @@ export class ReportPdfService {
   }
 
   /**
-   * PDF-2: la evolución temporal ahora se ve primero como gráfico de líneas NDVI/NDMI (SVG
-   * inline, ver buildNdviNdmiChartSvg) y se apoya con la misma tabla resumida de PDF-1 debajo —
-   * la tabla no desaparece, solo deja de ser la única forma de leer la evolución.
+   * REPORT-NDVI-EVOL-1: un bloque por lote dentro de una campaña — nombre de lote + curva NDVI
+   * real (fecha por fecha), o un aviso honesto si no hay suficientes observaciones válidas. Se
+   * envuelve en `unbreakable` (regla del helper `glued`) para que un salto de página natural
+   * nunca corte un gráfico a la mitad ni deje el nombre del lote solo al pie de la página.
+   */
+  private buildLotNdviChartBlock(lotSeries: LotNdviCampaignSeries): Content {
+    const label = {
+      text: lotSeries.lot,
+      bold: true,
+      fontSize: 10,
+      margin: [0, 8, 0, 3],
+    };
+    const pointCount = lotSeries.points.length;
+
+    if (pointCount === 0) {
+      return this.glued(
+        label,
+        this.emptyNote(
+          'Sin observaciones NDVI válidas para este lote en esta campaña.',
+        ),
+      );
+    }
+
+    if (pointCount === 1) {
+      return this.glued(
+        label,
+        this.emptyNote(
+          'Solo 1 observación NDVI disponible en esta campaña: insuficiente para graficar evolución.',
+        ),
+      );
+    }
+
+    const chartSvg = buildNdviEvolutionChartSvg(lotSeries.points);
+
+    return this.glued(label, {
+      svg: chartSvg,
+      width: 420,
+      alignment: 'center',
+      margin: [0, 0, 0, 4],
+    });
+  }
+
+  /**
+   * REPORT-NDVI-EVOL-1: reemplaza el gráfico agregado NDVI+NDMI por campaña (un punto por
+   * campaña, promediado) por el patrón del reporte histórico de referencia (Horacio Heinz): una
+   * página por campaña agrícola real, con una curva NDVI real por lote dentro de cada campaña —
+   * fechas y valores tal cual salen de resultJson.timeseries, sin promediar ni inventar puntos.
+   * La tabla de promedios por campaña se mantiene pero baja a "Resumen de campaña", después de
+   * los gráficos, ya no como la única lectura posible de la evolución temporal.
    */
   private buildEvolucionTemporal(resultJson: any): Content[] {
-    const campaigns = getCampaignRows(resultJson);
+    const evolution = getNdviEvolutionByCampaign(resultJson);
 
-    if (!campaigns.length) {
+    if (!evolution.length) {
       return [
-        this.sectionTitle('06. Evolución temporal'),
-        this.emptyNote(
-          'No hay datos suficientes para graficar la evolución temporal.',
-        ),
+        {
+          // Regla 5: arranca en página nueva para separarla con claridad de Clasificación productiva.
+          ...this.glued(
+            this.sectionTitle('06. Gráficos de evolución NDVI'),
+            this.emptyNote(
+              'No hay datos suficientes para graficar la evolución temporal.',
+            ),
+          ),
+          pageBreak: 'before',
+        },
       ];
     }
 
     const content: Content[] = [
-      this.sectionTitle('06. Evolución temporal'),
-      this.mutedText(
-        'Promedio de NDVI y NDMI por campaña, sobre el período analizado.',
-        [0, 0, 0, 10],
-      ),
+      {
+        ...this.glued(
+          this.sectionTitle('06. Gráficos de evolución NDVI'),
+          this.mutedText(
+            'Los siguientes gráficos representan la evolución del índice NDVI para las campañas ' +
+              'estudiadas. El eje X indica la fecha de observación satelital y el eje Y el valor de ' +
+              'NDVI promedio del lote en cada fecha.',
+            [0, 0, 0, 10],
+          ),
+        ),
+        pageBreak: 'before',
+      },
     ];
 
-    const chartSvg = buildNdviNdmiChartSvg(campaigns);
+    evolution.forEach((campaignGroup, index) => {
+      const campaignHeading = {
+        text: `Campaña ${campaignGroup.campaign}`,
+        bold: true,
+        fontSize: 11,
+        margin: [0, index === 0 ? 0 : 10, 0, 2],
+      };
 
-    if (chartSvg) {
-      content.push({
-        svg: chartSvg,
-        width: 460,
-        alignment: 'center',
-        margin: [0, 0, 0, 14],
-      });
-    }
+      const firstLotBlock = this.buildLotNdviChartBlock(campaignGroup.lots[0]);
 
-    const body = [
-      [
-        { text: 'Campaña', style: 'tableHeader' },
-        { text: 'NDVI promedio', style: 'tableHeader' },
-        { text: 'NDMI promedio', style: 'tableHeader' },
-      ],
-      ...campaigns.map((row) => [
-        { text: row.campaign },
-        { text: row.ndviMean.toFixed(2) },
-        { text: row.ndmiMean.toFixed(2) },
-      ]),
-    ];
+      content.push(
+        index === 0
+          ? this.glued(campaignHeading, firstLotBlock)
+          : {
+              ...this.glued(campaignHeading, firstLotBlock),
+              pageBreak: 'before',
+            },
+      );
 
-    content.push({
-      table: { headerRows: 1, widths: ['*', 'auto', 'auto'], body },
-      layout: 'lightHorizontalLines',
+      for (const lotSeries of campaignGroup.lots.slice(1)) {
+        content.push(this.buildLotNdviChartBlock(lotSeries));
+      }
     });
 
-    const lotCampaigns = getCampaignRowsByLot(resultJson);
+    const campaigns = getCampaignRows(resultJson);
 
-    if (lotCampaigns.length > 1) {
+    if (campaigns.length) {
       content.push({
-        text: 'Evolución por lote',
+        text: 'Resumen de campaña',
         bold: true,
         fontSize: 11,
         margin: [0, 18, 0, 4],
       });
 
-      for (const lotGroup of lotCampaigns) {
-        const lotChartSvg = buildNdviNdmiChartSvg(lotGroup.rows);
-        const lotStack: Content[] = [{ text: lotGroup.lot, bold: true, margin: [0, 8, 0, 2] }];
+      const body = [
+        [
+          { text: 'Campaña', style: 'tableHeader' },
+          { text: 'NDVI promedio', style: 'tableHeader' },
+          { text: 'NDMI promedio', style: 'tableHeader' },
+        ],
+        ...campaigns.map((row) => [
+          { text: row.campaign },
+          { text: row.ndviMean.toFixed(2) },
+          { text: row.ndmiMean.toFixed(2) },
+        ]),
+      ];
 
-        if (lotChartSvg) {
-          lotStack.push({
-            svg: lotChartSvg,
-            width: 320,
-            alignment: 'center',
-            margin: [0, 0, 0, 2],
-          });
-        }
-
-        content.push({ stack: lotStack, unbreakable: true, margin: [0, 0, 0, 6] });
-      }
+      content.push({
+        table: { headerRows: 1, widths: ['*', 'auto', 'auto'], body },
+        layout: 'lightHorizontalLines',
+      });
     }
 
     return content;
@@ -974,19 +1206,31 @@ export class ReportPdfService {
 
     if (!lots.length) {
       return [
-        this.sectionTitle('07. Lectura por lote'),
-        this.emptyNote(
-          'Todavía no hay lectura por lote interno para este campo.',
-        ),
+        {
+          // Regla 6: Lectura por lote siempre arranca en página nueva (antes esta rama sin
+          // datos no forzaba el salto, a diferencia de la rama con datos).
+          ...this.glued(
+            this.sectionTitle('07. Lectura por lote'),
+            this.emptyNote(
+              'Todavía no hay lectura por lote interno para este campo.',
+            ),
+          ),
+          pageBreak: 'before',
+        },
       ];
     }
 
     const content: Content[] = [
-      { ...this.sectionTitle('07. Lectura por lote'), pageBreak: 'before' },
-      this.mutedText(
-        'Superficie, zona predominante y clasificación productiva de cada lote analizado.',
-        [0, 0, 0, 10],
-      ),
+      {
+        ...this.glued(
+          this.sectionTitle('07. Lectura por lote'),
+          this.mutedText(
+            'Superficie, zona predominante y clasificación productiva de cada lote analizado.',
+            [0, 0, 0, 10],
+          ),
+        ),
+        pageBreak: 'before',
+      },
     ];
 
     for (const lot of lots) {
@@ -1078,8 +1322,10 @@ export class ReportPdfService {
     );
 
     return [
-      this.sectionTitle('08. Conclusión técnica preliminar'),
-      { ul: bullets, margin: [0, 0, 0, 10] },
+      this.glued(this.sectionTitle('08. Conclusión técnica preliminar'), {
+        ul: bullets,
+        margin: [0, 0, 0, 10],
+      }),
       {
         table: {
           widths: ['*'],
@@ -1117,8 +1363,10 @@ export class ReportPdfService {
     }
 
     return [
-      this.sectionTitle('09. Limitaciones metodológicas'),
-      { ul: items, lineHeight: 1.3 },
+      this.glued(this.sectionTitle('09. Limitaciones metodológicas'), {
+        ul: items,
+        lineHeight: 1.3,
+      }),
     ];
   }
 }

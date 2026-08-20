@@ -14,6 +14,7 @@ describe('AnalysisController', () => {
     Pick<
       AnalysisService,
       | 'findOneOwned'
+      | 'findOneOwnedStatus'
       | 'getReportPath'
       | 'buildReportPdf'
       | 'findAll'
@@ -38,6 +39,7 @@ describe('AnalysisController', () => {
           provide: AnalysisService,
           useValue: {
             findOneOwned: jest.fn(),
+            findOneOwnedStatus: jest.fn(),
             getReportPath: jest.fn(),
             buildReportPdf: jest.fn(),
             findAll: jest.fn(),
@@ -66,6 +68,12 @@ describe('AnalysisController', () => {
       expect(analysisService.findOneOwned).toHaveBeenCalledWith('analysis-1', 'user-A');
     });
 
+    it('findOneStatus (PERF-2) llama a findOneOwnedStatus(id, user.sub), no a findOneOwned', () => {
+      controller.findOneStatus('analysis-1', req);
+      expect(analysisService.findOneOwnedStatus).toHaveBeenCalledWith('analysis-1', 'user-A');
+      expect(analysisService.findOneOwned).not.toHaveBeenCalled();
+    });
+
     it('findAll llama a findAll(user.sub)', () => {
       controller.findAll(req);
       expect(analysisService.findAll).toHaveBeenCalledWith('user-A');
@@ -80,6 +88,45 @@ describe('AnalysisController', () => {
       const body = { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 } as any;
       controller.runFieldAnalysis('field-1', body, req);
       expect(analysisService.runFieldAnalysis).toHaveBeenCalledWith('field-1', body, 'user-A');
+    });
+  });
+
+  describe('findOneStatus (PERF-2): respeta permisos igual que findOne', () => {
+    it('propaga NotFoundException si el análisis no existe o es de otro usuario', async () => {
+      analysisService.findOneOwnedStatus.mockRejectedValue(
+        new NotFoundException('Análisis no encontrado.'),
+      );
+
+      await expect(controller.findOneStatus('missing-or-foreign', req)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
+    it('camino feliz: devuelve exactamente lo que resuelve el service (proyección liviana)', async () => {
+      const statusDto = {
+        id: 'analysis-1',
+        status: 'Procesando',
+        scope: 'field',
+        fieldId: 'field-1',
+        lotId: null,
+        createdAt: new Date('2026-01-01'),
+        updatedAt: new Date('2026-01-01'),
+        startedAt: new Date('2026-01-01'),
+        completedAt: null,
+        failedAt: null,
+        durationMs: null,
+        errorMessage: null,
+        globalScore: 0,
+        productivityScore: 0,
+        stabilityScore: 0,
+        confidenceScore: 0,
+      };
+      analysisService.findOneOwnedStatus.mockResolvedValue(statusDto as any);
+
+      const result = await controller.findOneStatus('analysis-1', req);
+
+      expect(result).toBe(statusDto);
+      expect(result).not.toHaveProperty('resultJson');
     });
   });
 

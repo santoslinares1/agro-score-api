@@ -32,6 +32,7 @@ type NewWorkerPayload = {
   include_index_images?: boolean;
   index_image_indices?: string[];
   index_image_dimensions?: number;
+  include_image_series?: boolean;
 };
 
 type FieldWorkerInput = {
@@ -46,6 +47,7 @@ type FieldWorkerInput = {
   indexImageIndices?: string[];
   includeMapAssets?: boolean;
   includeIndexImages?: boolean;
+  includeImageSeries?: boolean;
   maxZoneCampaigns?: number;
   lots: Array<{
     id: string;
@@ -129,7 +131,8 @@ export class PythonWorkerService {
         `zone_campaign_years=${JSON.stringify(payload.zone_campaign_years)} ` +
         `include_map_assets=${payload.include_map_assets ?? false} ` +
         `include_index_images=${payload.include_index_images ?? false} ` +
-        `index_image_indices=${JSON.stringify(payload.index_image_indices)}`,
+        `index_image_indices=${JSON.stringify(payload.index_image_indices)} ` +
+        `include_image_series=${payload.include_image_series ?? false}`,
     );
 
     try {
@@ -432,6 +435,10 @@ export class PythonWorkerService {
       include_index_images: input.includeIndexImages ?? false,
       index_image_indices: this.normalizeIndices(input.indexImageIndices),
       index_image_dimensions: 280,
+
+      // Fase 2 mínima: independiente de includeMapAssets/includeIndexImages — el caller lo
+      // tiene que pedir explícito, apagado por default en los dos modos actuales.
+      include_image_series: input.includeImageSeries ?? false,
     };
   }
   async runFieldAnalysis(

@@ -124,6 +124,19 @@ export class AnalysisController {
     stream.end();
   }
 
+  // PERF-2: versión liviana para el polling del frontend mientras el análisis está
+  // 'Procesando' — nunca trae resultJson (mapAssets/imageSeries pueden pesar varios MB). No
+  // hay ambigüedad de ruteo con GET /analysis/:id: los path segments son distintos
+  // ('analysis/:id' vs. 'analysis/:id/status'), Express/Nest los resuelve sin conflicto.
+  @UseGuards(JwtAuthGuard)
+  @Get('analysis/:id/status')
+  findOneStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.analysisService.findOneOwnedStatus(id, req.user.sub);
+  }
+
   @UseGuards(JwtAuthGuard)
   @Get('analysis/:id')
   findOne(

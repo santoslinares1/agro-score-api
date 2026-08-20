@@ -1,6 +1,8 @@
 import {
+  buildNdviEvolutionChartSvg,
   buildNdviNdmiChartSvg,
   buildPdfFilename,
+  campaignLabelFromDate,
   fieldLocationLabel,
   formatDateDMY,
   formatHa,
@@ -9,10 +11,13 @@ import {
   getCampaignRows,
   getCampaignRowsByLot,
   getFieldZoneTotals,
+  getImageSeries,
+  getImageSeriesScale,
   getIndexScale,
   getLotAreaRows,
   getLotAreaTotalHa,
   getLotsOverview,
+  getNdviEvolutionByCampaign,
   getTopZoneByHectares,
   safeText,
   scoreInterpretation,
@@ -266,11 +271,17 @@ describe('report-pdf.helpers', () => {
           vmax: 0.9,
           palette: ['#d73027', '#fee08b', '#91cf60', '#1a9850'],
         }),
-      ).toEqual({ vmin: 0, vmax: 0.9, palette: ['#d73027', '#fee08b', '#91cf60', '#1a9850'] });
+      ).toEqual({
+        vmin: 0,
+        vmax: 0.9,
+        palette: ['#d73027', '#fee08b', '#91cf60', '#1a9850'],
+      });
     });
 
     it('devuelve null sin inventar un rango si falta vmin/vmax/paleta (análisis viejos)', () => {
-      expect(getIndexScale({ index: 'NDVI', available: true, image_base64: 'AAAA' })).toBeNull();
+      expect(
+        getIndexScale({ index: 'NDVI', available: true, image_base64: 'AAAA' }),
+      ).toBeNull();
       expect(getIndexScale(null)).toBeNull();
     });
   });
@@ -305,20 +316,38 @@ describe('report-pdf.helpers', () => {
           {
             lot: 'Lote Norte',
             lot_id: 'lot-1',
-            rows: [{ date: '2024-01-15', values: { NDVI_mean: 0.6, NDVI_count: 5, NDMI_mean: 0.3 } }],
+            rows: [
+              {
+                date: '2024-01-15',
+                values: { NDVI_mean: 0.6, NDVI_count: 5, NDMI_mean: 0.3 },
+              },
+            ],
           },
           {
             lot: 'Lote Sur',
             lot_id: 'lot-2',
-            rows: [{ date: '2024-01-15', values: { NDVI_mean: 0.4, NDVI_count: 5, NDMI_mean: 0.1 } }],
+            rows: [
+              {
+                date: '2024-01-15',
+                values: { NDVI_mean: 0.4, NDVI_count: 5, NDMI_mean: 0.1 },
+              },
+            ],
           },
         ],
       };
 
       const groups = getCampaignRowsByLot(resultJson);
       expect(groups).toEqual([
-        { lot: 'Lote Norte', lotId: 'lot-1', rows: [{ campaign: '2024', ndviMean: 0.6, ndmiMean: 0.3 }] },
-        { lot: 'Lote Sur', lotId: 'lot-2', rows: [{ campaign: '2024', ndviMean: 0.4, ndmiMean: 0.1 }] },
+        {
+          lot: 'Lote Norte',
+          lotId: 'lot-1',
+          rows: [{ campaign: '2024', ndviMean: 0.6, ndmiMean: 0.3 }],
+        },
+        {
+          lot: 'Lote Sur',
+          lotId: 'lot-2',
+          rows: [{ campaign: '2024', ndviMean: 0.4, ndmiMean: 0.1 }],
+        },
       ]);
     });
 
@@ -328,12 +357,85 @@ describe('report-pdf.helpers', () => {
           {
             lot: 'Lote Único',
             lot_id: 'lot-1',
-            rows: [{ date: '2024-01-15', values: { NDVI_mean: 0.6, NDVI_count: 5 } }],
+            rows: [
+              { date: '2024-01-15', values: { NDVI_mean: 0.6, NDVI_count: 5 } },
+            ],
           },
         ],
       };
 
       expect(getCampaignRowsByLot(resultJson)).toEqual([]);
+    });
+  });
+
+  describe('getImageSeries / getImageSeriesScale (Fase 2 mínima)', () => {
+    it('devuelve las campañas con imágenes y filtra campañas vacías', () => {
+      const resultJson = {
+        imageSeries: {
+          ndvi: [
+            {
+              campaign: '2024/25',
+              images: [
+                {
+                  date: '2024-10-15',
+                  label: 'Oct 2024',
+                  available: true,
+                  image_base64: 'AAAA',
+                  vmin: 0,
+                  vmax: 0.9,
+                  palette: ['#d73027', '#1a9850'],
+                },
+                {
+                  date: '2024-11-15',
+                  label: 'Nov 2024',
+                  available: false,
+                  notes: ['Sin imágenes por nubosidad'],
+                },
+              ],
+            },
+            { campaign: '2023/24', images: [] },
+          ],
+          ndmi: [],
+        },
+      };
+
+      const ndvi = getImageSeries(resultJson, 'ndvi');
+      expect(ndvi.length).toBe(1);
+      expect(ndvi[0].campaign).toBe('2024/25');
+      expect(ndvi[0].images.length).toBe(2);
+      expect(ndvi[0].images[1].available).toBe(false);
+
+      expect(getImageSeries(resultJson, 'ndmi')).toEqual([]);
+    });
+
+    it('devuelve una lista vacía sin inventar nada cuando falta imageSeries (análisis viejos)', () => {
+      expect(getImageSeries({}, 'ndvi')).toEqual([]);
+      expect(getImageSeries({ mode: 'python-worker-v2' }, 'ndmi')).toEqual([]);
+    });
+
+    it('deriva la escala real de la primera imagen de la serie', () => {
+      const series = [
+        {
+          campaign: '2024/25',
+          images: [
+            {
+              date: '2024-10-15',
+              label: 'Oct 2024',
+              available: true,
+              vmin: 0,
+              vmax: 0.9,
+              palette: ['#d73027', '#1a9850'],
+            },
+          ],
+        },
+      ];
+
+      expect(getImageSeriesScale(series)).toEqual({
+        vmin: 0,
+        vmax: 0.9,
+        palette: ['#d73027', '#1a9850'],
+      });
+      expect(getImageSeriesScale([])).toBeNull();
     });
   });
 
@@ -352,8 +454,57 @@ describe('report-pdf.helpers', () => {
       expect(svg).toContain('</svg>');
       expect(svg).toContain('NDVI');
       expect(svg).toContain('NDMI');
-      // Cruza cero (NDVI positivo, NDMI negativo): debe dibujar la línea de base en 0.
-      expect(svg).toContain('stroke-dasharray');
+    });
+
+    it('NDVI (izq.) usa siempre el eje fijo 0–1, NDMI (der.) usa siempre el eje fijo -0.3–0.6, sin auto-escalar según los datos (NDVI-1)', () => {
+      // Con valores de NDVI/NDMI bien distintos entre campañas, las etiquetas de eje deben ser
+      // siempre las mismas 3 de NDVI (0.00/0.50/1.00) y las mismas 3 de NDMI (-0.30/0.00/0.60):
+      // si estuviera auto-escalando (como antes de NDVI-1), estos valores cambiarían con los datos.
+      const svgA = buildNdviNdmiChartSvg([
+        { campaign: '2023', ndviMean: 0.1, ndmiMean: -0.25 },
+        { campaign: '2024', ndviMean: 0.2, ndmiMean: -0.2 },
+      ]);
+      const svgB = buildNdviNdmiChartSvg([
+        { campaign: '2023', ndviMean: 0.8, ndmiMean: 0.5 },
+        { campaign: '2024', ndviMean: 0.95, ndmiMean: 0.55 },
+      ]);
+
+      for (const svg of [svgA, svgB]) {
+        expect(svg).toContain('>0.00<');
+        expect(svg).toContain('>0.50<');
+        expect(svg).toContain('>1.00<');
+        expect(svg).toContain('>-0.30<');
+        expect(svg).toContain('>0.60<');
+      }
+
+      // Mismo eje NDVI en ambos casos -> la etiqueta "1.00" (borde superior fijo) queda a la
+      // misma altura Y en los dos gráficos, sin importar que los datos de svgB sean mucho más
+      // altos que los de svgA.
+      const yOfNdviTop = (svg: string) =>
+        svg.match(/y="([\d.]+)"[^>]*>1\.00</)?.[1];
+      expect(yOfNdviTop(svgA as string)).toBe(yOfNdviTop(svgB as string));
+    });
+
+    it('NDMI ya no comparte el eje 0–1 de NDVI: con NDMI en su rango típico (~0.2), su punto no queda pegado al piso del gráfico', () => {
+      // Antes de NDVI-1, un NDMI de 0.2 contra el eje 0-1 de NDVI se dibujaba casi en el piso
+      // del gráfico (cerca de innerHeight completo). Con el eje propio -0.3-0.6, 0.2 cae bastante
+      // más arriba, cerca del medio del gráfico.
+      const svg = buildNdviNdmiChartSvg([
+        { campaign: '2023', ndviMean: 0.7, ndmiMean: 0.2 },
+        { campaign: '2024', ndviMean: 0.75, ndmiMean: 0.22 },
+      ]);
+
+      const ndmiCircleY = Number(
+        svg?.match(
+          /<circle cx="[\d.]+" cy="([\d.]+)" r="3" fill="#2563eb"/,
+        )?.[1],
+      );
+      const plotTop = 34; // CHART_PADDING.top
+      const plotBottom = 220 - 30; // CHART_HEIGHT - CHART_PADDING.bottom
+      const plotHeight = plotBottom - plotTop;
+
+      // A menos del 75% de la altura del gráfico (lejos del piso), no pegado al fondo.
+      expect(ndmiCircleY).toBeLessThan(plotTop + plotHeight * 0.75);
     });
 
     it('con un solo punto dibuja los círculos pero no una línea inventada entre dos fechas', () => {
@@ -376,6 +527,173 @@ describe('report-pdf.helpers', () => {
       expect(svg).not.toContain('>2021<');
       expect(svg).not.toContain('>2022<');
       expect(svg).not.toContain('>2023<');
+    });
+  });
+
+  describe('campaignLabelFromDate (REPORT-NDVI-EVOL-1)', () => {
+    it('usa el corte de octubre (mismo criterio que zones.py/sentinel.py en el worker)', () => {
+      expect(campaignLabelFromDate('2023-10-01')).toBe('2023/24');
+      expect(campaignLabelFromDate('2023-12-31')).toBe('2023/24');
+      expect(campaignLabelFromDate('2024-01-01')).toBe('2023/24');
+      expect(campaignLabelFromDate('2024-09-30')).toBe('2023/24');
+      expect(campaignLabelFromDate('2024-10-01')).toBe('2024/25');
+    });
+
+    it('devuelve null sin inventar una campaña si falta o es inválida la fecha', () => {
+      expect(campaignLabelFromDate(undefined)).toBeNull();
+      expect(campaignLabelFromDate('fecha-invalida')).toBeNull();
+    });
+  });
+
+  describe('getNdviEvolutionByCampaign (REPORT-NDVI-EVOL-1)', () => {
+    it('agrupa las observaciones reales por campaña y, dentro de cada campaña, por lote', () => {
+      const resultJson = {
+        timeseries: [
+          {
+            lot: 'Lote Norte',
+            lot_id: 'lot-1',
+            rows: [
+              { date: '2023-11-01', values: { NDVI_mean: 0.3, NDVI_count: 5 } },
+              { date: '2023-12-01', values: { NDVI_mean: 0.4, NDVI_count: 5 } },
+              { date: '2024-11-01', values: { NDVI_mean: 0.5, NDVI_count: 5 } },
+            ],
+          },
+          {
+            lot: 'Lote Sur',
+            lot_id: 'lot-2',
+            rows: [
+              {
+                date: '2023-11-15',
+                values: { NDVI_mean: 0.35, NDVI_count: 5 },
+              },
+            ],
+          },
+        ],
+      };
+
+      const evolution = getNdviEvolutionByCampaign(resultJson);
+
+      expect(evolution.map((g) => g.campaign)).toEqual(['2023/24', '2024/25']);
+
+      const campaign2324 = evolution[0];
+      expect(campaign2324.lots).toEqual([
+        {
+          lot: 'Lote Norte',
+          lotId: 'lot-1',
+          points: [
+            { date: '2023-11-01', ndviMean: 0.3, ndviStdDev: null },
+            { date: '2023-12-01', ndviMean: 0.4, ndviStdDev: null },
+          ],
+        },
+        {
+          lot: 'Lote Sur',
+          lotId: 'lot-2',
+          points: [{ date: '2023-11-15', ndviMean: 0.35, ndviStdDev: null }],
+        },
+      ]);
+
+      // La campaña 2024/25 sigue listando Lote Sur (sin puntos), en vez de hacerlo desaparecer.
+      const campaign2425 = evolution[1];
+      expect(campaign2425.lots).toEqual([
+        {
+          lot: 'Lote Norte',
+          lotId: 'lot-1',
+          points: [{ date: '2024-11-01', ndviMean: 0.5, ndviStdDev: null }],
+        },
+        { lot: 'Lote Sur', lotId: 'lot-2', points: [] },
+      ]);
+    });
+
+    it('conserva NDVI_stdDev real cuando está presente, sin inventarlo cuando falta', () => {
+      const resultJson = {
+        timeseries: [
+          {
+            lot: 'Lote 1',
+            lot_id: 'lot-1',
+            rows: [
+              {
+                date: '2023-11-01',
+                values: { NDVI_mean: 0.3, NDVI_count: 5, NDVI_stdDev: 0.05 },
+              },
+              { date: '2023-12-01', values: { NDVI_mean: 0.4, NDVI_count: 5 } },
+            ],
+          },
+        ],
+      };
+
+      const [campaign] = getNdviEvolutionByCampaign(resultJson);
+      expect(campaign.lots[0].points).toEqual([
+        { date: '2023-11-01', ndviMean: 0.3, ndviStdDev: 0.05 },
+        { date: '2023-12-01', ndviMean: 0.4, ndviStdDev: null },
+      ]);
+    });
+
+    it('ignora filas sin observaciones válidas (NDVI_count en 0 o NDVI_mean no numérico), sin inventar puntos', () => {
+      const resultJson = {
+        timeseries: [
+          {
+            lot: 'Lote 1',
+            lot_id: 'lot-1',
+            rows: [
+              { date: '2023-11-01', values: { NDVI_mean: 0.3, NDVI_count: 0 } },
+              {
+                date: '2023-12-01',
+                values: { NDVI_mean: null, NDVI_count: 5 },
+              },
+              { date: '2024-01-01', values: { NDVI_mean: 0.6, NDVI_count: 5 } },
+            ],
+          },
+        ],
+      };
+
+      const [campaign] = getNdviEvolutionByCampaign(resultJson);
+      expect(campaign.lots[0].points).toEqual([
+        { date: '2024-01-01', ndviMean: 0.6, ndviStdDev: null },
+      ]);
+    });
+
+    it('devuelve una lista vacía sin inventar campañas cuando no hay timeseries (análisis viejos)', () => {
+      expect(getNdviEvolutionByCampaign({})).toEqual([]);
+      expect(getNdviEvolutionByCampaign({ mode: 'python-worker-v2' })).toEqual(
+        [],
+      );
+    });
+  });
+
+  describe('buildNdviEvolutionChartSvg (REPORT-NDVI-EVOL-1)', () => {
+    it('devuelve null con menos de 2 puntos (no hay curva real que trazar)', () => {
+      expect(buildNdviEvolutionChartSvg([])).toBeNull();
+      expect(
+        buildNdviEvolutionChartSvg([
+          { date: '2024-01-01', ndviMean: 0.5, ndviStdDev: null },
+        ]),
+      ).toBeNull();
+    });
+
+    it('genera un <svg> con las fechas reales en el eje X', () => {
+      const svg = buildNdviEvolutionChartSvg([
+        { date: '2024-01-15', ndviMean: 0.4, ndviStdDev: null },
+        { date: '2024-02-20', ndviMean: 0.6, ndviStdDev: null },
+      ]);
+
+      expect(svg).toContain('<svg');
+      expect(svg).toContain('<path');
+      expect(svg).toContain('15/01');
+      expect(svg).toContain('20/02');
+    });
+
+    it('dibuja la banda ±1σ solo cuando todos los puntos tienen NDVI_stdDev válido', () => {
+      const conBanda = buildNdviEvolutionChartSvg([
+        { date: '2024-01-01', ndviMean: 0.4, ndviStdDev: 0.05 },
+        { date: '2024-02-01', ndviMean: 0.5, ndviStdDev: 0.06 },
+      ]);
+      expect(conBanda).toContain('#dcfce7');
+
+      const sinBandaCompleta = buildNdviEvolutionChartSvg([
+        { date: '2024-01-01', ndviMean: 0.4, ndviStdDev: 0.05 },
+        { date: '2024-02-01', ndviMean: 0.5, ndviStdDev: null },
+      ]);
+      expect(sinBandaCompleta).not.toContain('#dcfce7');
     });
   });
 });

@@ -10,8 +10,34 @@ import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { Analysis } from './entities/analysis.entity';
 import { Field } from '../fields/entities/field.entity';
 import { FieldsService } from '../fields/fields.service';
+import { AnalysisStatusDto } from './dto/analysis-status.dto';
 import { FieldAnalysisSummary } from './dto/field-analysis-summary.dto';
 import { ReportPdfService } from './report-pdf/report-pdf.service';
+
+/**
+ * PERF-2: columnas que selecciona GET /analysis/:id/status — deliberadamente nunca incluye
+ * `resultJson` (jsonb que puede pesar varios MB con mapAssets/imageSeries, ver auditoría
+ * PERF-2). No es una lista de "qué esconder de la respuesta": es qué se le pide a Postgres,
+ * así que el jsonb pesado ni siquiera sale de la base de datos durante el polling.
+ */
+const ANALYSIS_STATUS_COLUMNS = [
+  'analysis.id',
+  'analysis.status',
+  'analysis.scope',
+  'analysis.fieldId',
+  'analysis.lotId',
+  'analysis.createdAt',
+  'analysis.updatedAt',
+  'analysis.startedAt',
+  'analysis.completedAt',
+  'analysis.failedAt',
+  'analysis.durationMs',
+  'analysis.errorMessage',
+  'analysis.globalScore',
+  'analysis.productivityScore',
+  'analysis.stabilityScore',
+  'analysis.confidenceScore',
+];
 
 // ADMIN-1: cota para errorMessage — nunca stack traces completos ni datos
 // sensibles, solo lo suficiente para que el panel admin muestre qué pasó.
@@ -113,6 +139,56 @@ export class AnalysisService {
   }
 
   /**
+   * PERF-2: versión liviana de findOneOwned para GET /analysis/:id/status — mismo chequeo de
+   * ownership (AUTH-3/AUTH-4, default-deny vía resolveOwnedFieldId), pero la query a Postgres
+   * solo trae ANALYSIS_STATUS_COLUMNS: resultJson (y todo lo que cuelga de él — mapAssets,
+   * imageSeries, zones) nunca se lee de la base de datos ni viaja al proceso Node, no solo se
+   * omite al responder. Pensado para el polling del frontend mientras status='Procesando'.
+   */
+  async findOneOwnedStatus(id: string, userId: string): Promise<AnalysisStatusDto> {
+    const analysis = await this.analysisRepository
+      .createQueryBuilder('analysis')
+      .select(ANALYSIS_STATUS_COLUMNS)
+      .where('analysis.id = :id', { id })
+      .getOne();
+
+    if (!analysis) {
+      throw new NotFoundException('Análisis no encontrado.');
+    }
+
+    const fieldId = this.resolveOwnedFieldId(analysis);
+
+    if (!fieldId) {
+      throw new NotFoundException('Análisis no encontrado.');
+    }
+
+    const field = await this.fieldsService.findOne(fieldId, userId).catch(() => null);
+
+    if (!field) {
+      throw new NotFoundException('Análisis no encontrado.');
+    }
+
+    return {
+      id: analysis.id,
+      status: analysis.status,
+      scope: analysis.scope,
+      fieldId: analysis.fieldId,
+      lotId: analysis.lotId,
+      createdAt: analysis.createdAt,
+      updatedAt: analysis.updatedAt,
+      startedAt: analysis.startedAt,
+      completedAt: analysis.completedAt,
+      failedAt: analysis.failedAt,
+      durationMs: analysis.durationMs,
+      errorMessage: analysis.errorMessage,
+      globalScore: analysis.globalScore,
+      productivityScore: analysis.productivityScore,
+      stabilityScore: analysis.stabilityScore,
+      confidenceScore: analysis.confidenceScore,
+    };
+  }
+
+  /**
    * Historial de análisis de un campo, en formato liviano (sin resultJson)
    * para no traer zones/timeseries/png en un listado. Los análisis nuevos
    * usan la columna `fieldId` dedicada (scope='field'); los creados antes de
@@ -199,6 +275,7 @@ export class AnalysisService {
       indexImageIndices?: string[];
       includeMapAssets?: boolean;
       includeIndexImages?: boolean;
+      includeImageSeries?: boolean;
       maxZoneCampaigns?: number;
     },
     userId: string,
@@ -279,6 +356,7 @@ export class AnalysisService {
       indexImageIndices: input.indexImageIndices,
       includeMapAssets: input.includeMapAssets,
       includeIndexImages: input.includeIndexImages,
+      includeImageSeries: input.includeImageSeries,
       maxZoneCampaigns: input.maxZoneCampaigns,
     });
 
@@ -299,6 +377,7 @@ export class AnalysisService {
       indexImageIndices?: string[];
       includeMapAssets?: boolean;
       includeIndexImages?: boolean;
+      includeImageSeries?: boolean;
       maxZoneCampaigns?: number;
       lots: Array<{
         id: string;
