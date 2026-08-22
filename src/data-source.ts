@@ -10,6 +10,8 @@ import { FieldLot } from './fields/entities/field-lot.entity';
 import { PasswordResetToken } from './users/entities/password-reset-token.entity';
 import { UserInvitation } from './users/entities/user-invitation.entity';
 import { User } from './users/user.entity';
+import { WeeklyFieldReport } from './weekly-reports/entities/weekly-field-report.entity';
+import { WeeklyLotIndexObservation } from './weekly-reports/entities/weekly-lot-index-observation.entity';
 
 /**
  * DataSource para el CLI de TypeORM (migration:generate/run/revert) y para
@@ -41,6 +43,8 @@ export const AppDataSource = new DataSource({
     AdminAuditLog,
     UserInvitation,
     PasswordResetToken,
+    WeeklyFieldReport,
+    WeeklyLotIndexObservation,
   ],
   migrations: ['src/migrations/*.ts'],
   migrationsTableName: 'migrations',

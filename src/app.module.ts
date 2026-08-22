@@ -12,6 +12,7 @@ import { AuthModule } from './auth/auth.module';
 import { ContactModule } from './contact/contact.module';
 import { AccessRequestModule } from './access-request/access-request.module';
 import { AdminModule } from './admin/admin.module';
+import { WeeklyReportsModule } from './weekly-reports/weekly-reports.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
@@ -70,6 +71,7 @@ import { AppService } from './app.service';
     ContactModule,
     AccessRequestModule,
     AdminModule,
+    WeeklyReportsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

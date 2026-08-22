@@ -8,7 +8,12 @@ import { ConfigService } from '@nestjs/config';
 import { AxiosError } from 'axios';
 import { firstValueFrom } from 'rxjs';
 
-import { PipelineInput, WorkerAnalysisResult } from './types';
+import {
+  PipelineInput,
+  WeeklyReportWorkerInput,
+  WeeklyReportWorkerResult,
+  WorkerAnalysisResult,
+} from './types';
 
 type NewWorkerPayload = {
   field_name: string;
@@ -446,5 +451,80 @@ export class PythonWorkerService {
   ): Promise<WorkerAnalysisResult> {
     const workerPayload = this.mapFieldInputToWorkerPayload(input);
     return this.postToWorker(workerPayload);
+  }
+
+  /**
+   * Fase 2 (seguimiento semanal): POST /weekly-report/spike del worker Python.
+   *
+   * IMPORTANTE — a la fecha de esta ficha, agro-score-worker NO expone ese endpoint. La Fase 1
+   * (ver agro-score-worker/app/pipeline/weekly.py y scripts/weekly_report_spike.py) construyó
+   * deliberadamente solo funciones testeables + un script manual, no un endpoint HTTP — "no
+   * exponerlo como funcionalidad final" fue una decisión explícita de esa fase. Este método deja
+   * el lado backend completamente preparado contra el contrato documentado en
+   * WeeklyReportWorkerInput/WeeklyReportWorkerResult (types.ts, espejo de
+   * weekly_report_to_json()), pero una llamada real hoy va a fallar con "network/unreachable" o
+   * "http 404" — eso es esperado, no un bug: WeeklyReportsService debe tratarlo como cualquier
+   * otra falla del worker (marca el WeeklyFieldReport como 'failed', no inventa observaciones).
+   * Cuando el worker agregue el endpoint real, alcanza con que devuelva este contrato — no hace
+   * falta tocar este método.
+   */
+  async runWeeklyReport(
+    input: WeeklyReportWorkerInput,
+  ): Promise<WeeklyReportWorkerResult> {
+    const lots = input.lots.map((lot) => ({
+      lotId: lot.id,
+      lotName: lot.name,
+      coordinates: this.closeRing(this.extractPolygonCoordinates(lot.geojson)),
+    }));
+
+    if (!lots.length) {
+      throw new Error('No hay lotes para el seguimiento semanal.');
+    }
+
+    const payload = {
+      fieldId: input.fieldId,
+      lots,
+      campaignStart: input.campaignStart,
+      campaignEnd: input.campaignEnd,
+      targetDate: input.targetDate,
+      indices: input.indices,
+      includeNdreExperimental: input.includeNdreExperimental,
+    };
+
+    this.logger.log(
+      `Weekly report payload: fieldId=${input.fieldId} lots=${lots.length} ` +
+        `indices=${JSON.stringify(input.indices)} includeNdreExperimental=${input.includeNdreExperimental}`,
+    );
+
+    try {
+      const response = await firstValueFrom(
+        this.httpService.post<WeeklyReportWorkerResult>(
+          `${this.workerUrl}/weekly-report/spike`,
+          payload,
+          { timeout: 600_000 },
+        ),
+      );
+
+      return response.data;
+    } catch (error) {
+      const axiosError = error as AxiosError;
+      const status = axiosError?.response?.status;
+      const isTimeout = axiosError?.code === 'ECONNABORTED';
+      const reason = isTimeout
+        ? 'timeout'
+        : status
+          ? `http ${status}`
+          : 'network/unreachable';
+
+      this.logger.error(
+        `Python worker weekly-report call failed (${reason}): ${JSON.stringify(
+          axiosError?.response?.data ?? axiosError?.message ?? error,
+        )}`,
+      );
+
+      throw new ServiceUnavailableException(
+        'No se pudo conectar con el worker Python para el seguimiento semanal.',
+      );
+    }
   }
 }

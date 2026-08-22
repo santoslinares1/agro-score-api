@@ -110,3 +110,62 @@ export type WorkerAnalysisResult = {
   zonesDetected: number;
   resultJson: WorkerResultJson;
 };
+
+/**
+ * Fase 2 (seguimiento semanal): input para PythonWorkerService.runWeeklyReport. Se arma desde
+ * WeeklyReportsService a partir de Field/FieldLot ya validados por ownership — mismo criterio
+ * que FieldWorkerInput para /analyze.
+ */
+export type WeeklyReportWorkerInput = {
+  fieldId: string;
+  lots: Array<{ id: string; name: string; geojson: unknown }>;
+  campaignStart: string;
+  campaignEnd: string | null;
+  targetDate: string;
+  indices: string[];
+  includeNdreExperimental: boolean;
+};
+
+/**
+ * Espejo exacto de weekly_report_to_json() en agro-score-worker/app/pipeline/weekly.py (Fase 1)
+ * — no del ejemplo ilustrativo del handoff de Fase 2, que omite scaleWarning/notes. Si
+ * weekly.py cambia de forma, este tipo se desalinea silenciosamente (no hay contrato compartido
+ * entre los dos repos todavía) — ver aviso en PythonWorkerService.runWeeklyReport.
+ */
+export type WeeklyReportWorkerStats = {
+  mean: number | null;
+  stdDev: number | null;
+  min: number | null;
+  max: number | null;
+  validPixelCount: number | null;
+};
+
+export type WeeklyReportWorkerObservation = {
+  lotId: string | null;
+  lotName: string;
+  index: string;
+  experimental: boolean;
+  available: boolean;
+  weekAnchorDate: string;
+  imageDate: string | null;
+  cloudPct: number | null;
+  scaleM: number | null;
+  scaleWarning: string | null;
+  stats: WeeklyReportWorkerStats | null;
+  deltaVsPrevious: number | null;
+  notes: string[];
+};
+
+export type WeeklyReportWorkerResult = {
+  methodologyVersion: string;
+  campaign: {
+    start: string;
+    targetDate: string;
+    weekAnchorDate: string;
+    stepDays: number;
+  };
+  indices: string[];
+  experimentalIndices: string[];
+  lots: WeeklyReportWorkerObservation[];
+  warnings: string[];
+};
