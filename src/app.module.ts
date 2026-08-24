@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { resolveDatabaseSsl } from './config/database-ssl.util';
@@ -13,6 +14,7 @@ import { ContactModule } from './contact/contact.module';
 import { AccessRequestModule } from './access-request/access-request.module';
 import { AdminModule } from './admin/admin.module';
 import { WeeklyReportsModule } from './weekly-reports/weekly-reports.module';
+import { ScheduledAnalysisModule } from './scheduled-analysis/scheduled-analysis.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
@@ -21,6 +23,10 @@ import { AppService } from './app.service';
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+
+    // Fase 4A (scheduled-analysis): habilita @Interval()/@Cron() en toda la app. Un único
+    // registro global acá alcanza — los feature modules no vuelven a importar ScheduleModule.
+    ScheduleModule.forRoot(),
 
     // SEC-FIX-1 (SEC-003): baseline global para @Throttle() puntual en rutas
     // públicas sensibles (/auth/login, /auth/register, /contact). No se
@@ -72,6 +78,7 @@ import { AppService } from './app.service';
     AccessRequestModule,
     AdminModule,
     WeeklyReportsModule,
+    ScheduledAnalysisModule,
   ],
   controllers: [AppController],
   providers: [AppService],

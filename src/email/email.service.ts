@@ -5,6 +5,10 @@ import { Resend } from 'resend';
 import { sanitizeHeaderValue } from './email.util';
 import { EmailContent, InvitationEmailParams, buildInvitationEmail } from './templates/invitation.template';
 import { PasswordResetEmailParams, buildPasswordResetEmail } from './templates/password-reset.template';
+import {
+  ScheduledAnalysisEmailParams,
+  buildScheduledAnalysisEmail,
+} from './templates/scheduled-analysis-report.template';
 
 export interface EmailSendResult {
   sent: boolean;
@@ -45,6 +49,15 @@ export class EmailService {
     params: PasswordResetEmailParams,
   ): Promise<EmailSendResult> {
     return this.send(to, buildPasswordResetEmail(params), '[PasswordReset]');
+  }
+
+  /** Fase 4A: aviso de análisis semanal automático disponible — ver
+   * scheduled-analysis/scheduled-analysis-runner.service.ts. */
+  async sendScheduledAnalysisEmail(
+    to: string,
+    params: ScheduledAnalysisEmailParams,
+  ): Promise<EmailSendResult> {
+    return this.send(to, buildScheduledAnalysisEmail(params), '[ScheduledAnalysis]');
   }
 
   private async send(

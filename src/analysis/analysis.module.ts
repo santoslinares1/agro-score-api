@@ -15,5 +15,9 @@ import { ReportPdfService } from './report-pdf/report-pdf.service';
   ],
   controllers: [AnalysisController],
   providers: [AnalysisService, ReportPdfService],
+  // Fase 4A (scheduled-analysis): el scheduler reutiliza AnalysisService.runFieldAnalysis/findOne
+  // tal cual (mismo pipeline manual, sin duplicar lógica) — antes no se exportaba porque nada
+  // fuera de este módulo lo necesitaba. No cambia ningún comportamiento del análisis manual.
+  exports: [AnalysisService],
 })
 export class AnalysisModule {}

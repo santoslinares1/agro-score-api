@@ -7,6 +7,9 @@ import { AdminAuditLog } from './audit-log/entities/admin-audit-log.entity';
 import { resolveDatabaseSsl } from './config/database-ssl.util';
 import { Field } from './fields/entities/field.entity';
 import { FieldLot } from './fields/entities/field-lot.entity';
+import { FieldAnalysisSchedule } from './scheduled-analysis/entities/field-analysis-schedule.entity';
+import { ScheduledAnalysisRun } from './scheduled-analysis/entities/scheduled-analysis-run.entity';
+import { WeeklyAnalysisSnapshot } from './scheduled-analysis/entities/weekly-analysis-snapshot.entity';
 import { PasswordResetToken } from './users/entities/password-reset-token.entity';
 import { UserInvitation } from './users/entities/user-invitation.entity';
 import { User } from './users/user.entity';
@@ -45,6 +48,9 @@ export const AppDataSource = new DataSource({
     PasswordResetToken,
     WeeklyFieldReport,
     WeeklyLotIndexObservation,
+    FieldAnalysisSchedule,
+    ScheduledAnalysisRun,
+    WeeklyAnalysisSnapshot,
   ],
   migrations: ['src/migrations/*.ts'],
   migrationsTableName: 'migrations',
