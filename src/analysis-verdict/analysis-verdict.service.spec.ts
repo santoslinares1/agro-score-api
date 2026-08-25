@@ -1,26 +1,12 @@
+import { ConfigService } from '@nestjs/config';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 
 import { Analysis } from '../analysis/entities/analysis.entity';
 import { AnalysisVerdictService } from './analysis-verdict.service';
-import { generateTechnicalVerdict } from './analysis-verdict-generator.util';
+import { ClaudeTechnicalVerdictGenerator } from './generators/claude-technical-verdict.generator';
+import { DeterministicTechnicalVerdictGenerator } from './generators/deterministic-technical-verdict.generator';
 import { AnalysisTechnicalVerdict } from './entities/analysis-technical-verdict.entity';
-
-jest.mock('./analysis-verdict-generator.util', () => ({
-  generateTechnicalVerdict: jest.fn(),
-}));
-
-const mockGenerateTechnicalVerdict = generateTechnicalVerdict as jest.Mock;
-
-const HAPPY_PATH_RESULT = {
-  verdict: 'favorable' as const,
-  confidence: 'high' as const,
-  summary: 'ok',
-  keyFindings: ['finding'],
-  possibleCauses: ['cause'],
-  recommendations: ['recommendation'],
-  limitations: ['limitation'],
-};
 
 type MockRepo = {
   findOne: jest.Mock;
@@ -29,9 +15,32 @@ type MockRepo = {
   save: jest.Mock;
 };
 
+const DETERMINISTIC_RESULT = {
+  verdict: 'favorable' as const,
+  confidence: 'high' as const,
+  summary: 'deterministic summary',
+  keyFindings: ['finding'],
+  possibleCauses: ['cause'],
+  recommendations: ['recommendation'],
+  limitations: ['limitation'],
+};
+
+const CLAUDE_RESULT = {
+  verdict: 'attention' as const,
+  confidence: 'medium' as const,
+  summary: 'claude summary',
+  keyFindings: ['claude finding'],
+  possibleCauses: ['claude cause'],
+  recommendations: ['claude recommendation'],
+  limitations: ['claude limitation'],
+};
+
 describe('AnalysisVerdictService', () => {
   let service: AnalysisVerdictService;
   let verdictRepository: MockRepo;
+  let configGetMock: jest.Mock;
+  let deterministicGenerate: jest.Mock;
+  let claudeGenerate: jest.Mock;
 
   const buildAnalysis = (overrides: Partial<Analysis> = {}): Analysis =>
     ({
@@ -47,7 +56,17 @@ describe('AnalysisVerdictService', () => {
       ...overrides,
     }) as Analysis;
 
+  const setProvider = (value: string | undefined) => {
+    configGetMock.mockImplementation((key: string) =>
+      key === 'TECHNICAL_VERDICT_PROVIDER' ? value : undefined,
+    );
+  };
+
   beforeEach(async () => {
+    configGetMock = jest.fn().mockReturnValue(undefined);
+    deterministicGenerate = jest.fn().mockResolvedValue(DETERMINISTIC_RESULT);
+    claudeGenerate = jest.fn().mockResolvedValue(CLAUDE_RESULT);
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AnalysisVerdictService,
@@ -60,6 +79,25 @@ describe('AnalysisVerdictService', () => {
             save: jest.fn((entity) => Promise.resolve(entity)),
           },
         },
+        { provide: ConfigService, useValue: { get: configGetMock } },
+        {
+          provide: DeterministicTechnicalVerdictGenerator,
+          useValue: {
+            generatorName: 'deterministic-v1',
+            promptVersion: null,
+            modelId: null,
+            generate: deterministicGenerate,
+          },
+        },
+        {
+          provide: ClaudeTechnicalVerdictGenerator,
+          useValue: {
+            generatorName: 'claude',
+            promptVersion: 'technical-verdict-v1',
+            modelId: 'claude-haiku-4-5',
+            generate: claudeGenerate,
+          },
+        },
       ],
     }).compile();
 
@@ -67,11 +105,80 @@ describe('AnalysisVerdictService', () => {
     verdictRepository = module.get(
       getRepositoryToken(AnalysisTechnicalVerdict),
     );
-    mockGenerateTechnicalVerdict.mockReset().mockReturnValue(HAPPY_PATH_RESULT);
   });
 
-  describe('generateAndPersist', () => {
-    it('camino feliz: genera y guarda un veredicto status=generated', async () => {
+  describe('provider selection (PR 11B)', () => {
+    it('sin TECHNICAL_VERDICT_PROVIDER seteado, usa deterministic', async () => {
+      setProvider(undefined);
+      verdictRepository.findOne.mockResolvedValue(null);
+
+      await service.generateAndPersist(buildAnalysis());
+
+      expect(deterministicGenerate).toHaveBeenCalledTimes(1);
+      expect(claudeGenerate).not.toHaveBeenCalled();
+    });
+
+    it('TECHNICAL_VERDICT_PROVIDER=deterministic explícito usa deterministic', async () => {
+      setProvider('deterministic');
+      verdictRepository.findOne.mockResolvedValue(null);
+
+      await service.generateAndPersist(buildAnalysis());
+
+      expect(deterministicGenerate).toHaveBeenCalledTimes(1);
+      expect(claudeGenerate).not.toHaveBeenCalled();
+    });
+
+    it('TECHNICAL_VERDICT_PROVIDER=claude usa el generador Claude', async () => {
+      setProvider('claude');
+      verdictRepository.findOne.mockResolvedValue(null);
+
+      const result = await service.generateAndPersist(buildAnalysis());
+
+      expect(claudeGenerate).toHaveBeenCalledTimes(1);
+      expect(deterministicGenerate).not.toHaveBeenCalled();
+      expect(result.generator).toBe('claude');
+      expect(result.promptVersion).toBe('technical-verdict-v1');
+    });
+
+    it('TECHNICAL_VERDICT_PROVIDER=claude sin API key (el generador Claude rechaza) → status=failed, no rompe', async () => {
+      setProvider('claude');
+      verdictRepository.findOne.mockResolvedValue(null);
+      claudeGenerate.mockRejectedValue(
+        new Error(
+          'ANTHROPIC_API_KEY no está configurada (requerida cuando TECHNICAL_VERDICT_PROVIDER=claude).',
+        ),
+      );
+
+      const result = await service.generateAndPersist(buildAnalysis());
+
+      expect(result.status).toBe('failed');
+      expect(result.generator).toBe('claude');
+      expect(result.errorMessage).toContain('ANTHROPIC_API_KEY');
+    });
+
+    it('valor de provider desconocido cae a deterministic (con warning, sin romper)', async () => {
+      setProvider('gpt4');
+      verdictRepository.findOne.mockResolvedValue(null);
+
+      await service.generateAndPersist(buildAnalysis());
+
+      expect(deterministicGenerate).toHaveBeenCalledTimes(1);
+      expect(claudeGenerate).not.toHaveBeenCalled();
+    });
+
+    it('provider case-insensitive y con espacios ("Claude ") también resuelve a Claude', async () => {
+      setProvider('Claude ');
+      verdictRepository.findOne.mockResolvedValue(null);
+
+      await service.generateAndPersist(buildAnalysis());
+
+      expect(claudeGenerate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('generateAndPersist — camino feliz', () => {
+    it('deterministic: persiste status=generated con generator=deterministic-v1 y promptVersion=null', async () => {
+      setProvider('deterministic');
       verdictRepository.findOne.mockResolvedValue(null);
 
       const result = await service.generateAndPersist(buildAnalysis());
@@ -79,16 +186,25 @@ describe('AnalysisVerdictService', () => {
       expect(result.status).toBe('generated');
       expect(result.verdict).toBe('favorable');
       expect(result.generator).toBe('deterministic-v1');
+      expect(result.promptVersion).toBeNull();
       expect(result.generatedAt).toBeInstanceOf(Date);
-      expect(verdictRepository.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          analysisId: 'analysis-1',
-          status: 'generated',
-        }),
-      );
+    });
+
+    it('claude: persiste status=generated con generator=claude, promptVersion=technical-verdict-v1, e inputSnapshot.model', async () => {
+      setProvider('claude');
+      verdictRepository.findOne.mockResolvedValue(null);
+
+      const result = await service.generateAndPersist(buildAnalysis());
+
+      expect(result.status).toBe('generated');
+      expect(result.verdict).toBe('attention');
+      expect(result.generator).toBe('claude');
+      expect(result.promptVersion).toBe('technical-verdict-v1');
+      expect((result.inputSnapshot as any).model).toBe('claude-haiku-4-5');
     });
 
     it('si ya existe una fila para el analysisId, la actualiza en vez de crear una nueva (idempotente)', async () => {
+      setProvider('deterministic');
       const existing = {
         id: 'verdict-1',
         analysisId: 'analysis-1',
@@ -104,30 +220,38 @@ describe('AnalysisVerdictService', () => {
         expect.objectContaining({ status: 'generated' }),
       );
     });
+  });
 
-    it('si el generador determinístico revienta, persiste status=failed con errorMessage en vez de propagar', async () => {
+  describe('generateAndPersist — camino de error (PR 11B: shape "seguro" de failed)', () => {
+    it('si el generador falla, persiste status=failed con contenido placeholder seguro (nunca null)', async () => {
+      setProvider('deterministic');
       verdictRepository.findOne.mockResolvedValue(null);
-      mockGenerateTechnicalVerdict.mockImplementation(() => {
-        throw new Error('regla de negocio inesperada');
-      });
+      deterministicGenerate.mockRejectedValue(
+        new Error('regla de negocio inesperada'),
+      );
 
       const result = await service.generateAndPersist(buildAnalysis());
 
       expect(result.status).toBe('failed');
-      expect(result.verdict).toBeNull();
-      expect(result.confidence).toBeNull();
-      expect(result.keyFindings).toEqual([]);
-      expect(result.errorMessage).toBe('regla de negocio inesperada');
-      expect(verdictRepository.create).toHaveBeenCalledWith(
-        expect.objectContaining({ analysisId: 'analysis-1', status: 'failed' }),
+      expect(result.verdict).toBe('insufficient_data');
+      expect(result.confidence).toBe('low');
+      expect(result.summary).toBe(
+        'No se pudo generar el veredicto técnico automático.',
       );
+      expect(result.keyFindings).toEqual([]);
+      expect(result.possibleCauses).toEqual([]);
+      expect(result.recommendations).toEqual([]);
+      expect(result.limitations).toEqual([
+        'El análisis satelital finalizó, pero la interpretación automática no pudo generarse.',
+      ]);
+      expect(result.generatedAt).toBeNull();
+      expect(result.errorMessage).toBe('regla de negocio inesperada');
     });
 
     it('un mensaje de error larguísimo se trunca (mismo criterio que Analysis.errorMessage)', async () => {
+      setProvider('deterministic');
       verdictRepository.findOne.mockResolvedValue(null);
-      mockGenerateTechnicalVerdict.mockImplementation(() => {
-        throw new Error('x'.repeat(1000));
-      });
+      deterministicGenerate.mockRejectedValue(new Error('x'.repeat(1000)));
 
       const result = await service.generateAndPersist(buildAnalysis());
 
@@ -135,10 +259,11 @@ describe('AnalysisVerdictService', () => {
       expect(result.errorMessage!.endsWith('…')).toBe(true);
     });
 
-    it('propaga el error tal cual si hasta guardar el veredicto failed falla (infraestructura, no lógica de negocio) — AnalysisService es quien pone la red final', async () => {
-      mockGenerateTechnicalVerdict.mockImplementation(() => {
-        throw new Error('regla de negocio inesperada');
-      });
+    it('propaga el error tal cual si hasta guardar la fila failed falla (infraestructura) — AnalysisService pone la red final', async () => {
+      setProvider('deterministic');
+      deterministicGenerate.mockRejectedValue(
+        new Error('regla de negocio inesperada'),
+      );
       verdictRepository.findOne.mockRejectedValue(new Error('DB caída'));
 
       await expect(service.generateAndPersist(buildAnalysis())).rejects.toThrow(
