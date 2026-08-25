@@ -14,6 +14,7 @@ describe('AnalysisController', () => {
     Pick<
       AnalysisService,
       | 'findOneOwned'
+      | 'findOneOwnedWithVerdict'
       | 'findOneOwnedStatus'
       | 'getReportPath'
       | 'buildReportPdf'
@@ -23,7 +24,11 @@ describe('AnalysisController', () => {
     >
   >;
 
-  const user: AuthenticatedUser = { sub: 'user-A', email: 'usera@example.com', role: 'owner' };
+  const user: AuthenticatedUser = {
+    sub: 'user-A',
+    email: 'usera@example.com',
+    role: 'owner',
+  };
   const req = { user } as any;
 
   const buildRes = () => {
@@ -39,6 +44,7 @@ describe('AnalysisController', () => {
           provide: AnalysisService,
           useValue: {
             findOneOwned: jest.fn(),
+            findOneOwnedWithVerdict: jest.fn(),
             findOneOwnedStatus: jest.fn(),
             getReportPath: jest.fn(),
             buildReportPdf: jest.fn(),
@@ -63,14 +69,52 @@ describe('AnalysisController', () => {
   });
 
   describe('delegación simple con req.user.sub', () => {
-    it('findOne llama a findOneOwned(id, user.sub)', () => {
+    // PR 11A: GET /analysis/:id ahora resuelve technicalVerdict junto con el análisis — ver
+    // AnalysisService.findOneOwnedWithVerdict. Las rutas de reporte (getReport/downloadReport/
+    // downloadPdfReport) siguen usando findOneOwned "pelado" sin cambios.
+    it('findOne llama a findOneOwnedWithVerdict(id, user.sub), no a findOneOwned', () => {
       controller.findOne('analysis-1', req);
-      expect(analysisService.findOneOwned).toHaveBeenCalledWith('analysis-1', 'user-A');
+      expect(analysisService.findOneOwnedWithVerdict).toHaveBeenCalledWith(
+        'analysis-1',
+        'user-A',
+      );
+      expect(analysisService.findOneOwned).not.toHaveBeenCalled();
+    });
+
+    it('findOne devuelve exactamente lo que resuelve el service, incluido technicalVerdict', async () => {
+      const withVerdict = {
+        id: 'analysis-1',
+        status: 'Finalizado',
+        globalScore: 82,
+        technicalVerdict: {
+          status: 'generated',
+          verdict: 'favorable',
+          confidence: 'high',
+          summary: 'ok',
+          keyFindings: [],
+          possibleCauses: [],
+          recommendations: [],
+          limitations: [],
+          generatedAt: '2026-01-01T00:00:00.000Z',
+          generator: 'deterministic-v1',
+          promptVersion: null,
+        },
+      };
+      analysisService.findOneOwnedWithVerdict.mockResolvedValue(
+        withVerdict as any,
+      );
+
+      const result = await controller.findOne('analysis-1', req);
+
+      expect(result).toBe(withVerdict);
     });
 
     it('findOneStatus (PERF-2) llama a findOneOwnedStatus(id, user.sub), no a findOneOwned', () => {
       controller.findOneStatus('analysis-1', req);
-      expect(analysisService.findOneOwnedStatus).toHaveBeenCalledWith('analysis-1', 'user-A');
+      expect(analysisService.findOneOwnedStatus).toHaveBeenCalledWith(
+        'analysis-1',
+        'user-A',
+      );
       expect(analysisService.findOneOwned).not.toHaveBeenCalled();
     });
 
@@ -81,13 +125,24 @@ describe('AnalysisController', () => {
 
     it('findByField llama a findByField(fieldId, user.sub)', () => {
       controller.findByField('field-1', req);
-      expect(analysisService.findByField).toHaveBeenCalledWith('field-1', 'user-A');
+      expect(analysisService.findByField).toHaveBeenCalledWith(
+        'field-1',
+        'user-A',
+      );
     });
 
     it('runFieldAnalysis llama a runFieldAnalysis(fieldId, body, user.sub)', () => {
-      const body = { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 } as any;
+      const body = {
+        startDate: '2024-01-01',
+        endDate: '2024-06-01',
+        maxCloudiness: 30,
+      } as any;
       controller.runFieldAnalysis('field-1', body, req);
-      expect(analysisService.runFieldAnalysis).toHaveBeenCalledWith('field-1', body, 'user-A');
+      expect(analysisService.runFieldAnalysis).toHaveBeenCalledWith(
+        'field-1',
+        body,
+        'user-A',
+      );
     });
   });
 
@@ -97,9 +152,9 @@ describe('AnalysisController', () => {
         new NotFoundException('Análisis no encontrado.'),
       );
 
-      await expect(controller.findOneStatus('missing-or-foreign', req)).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        controller.findOneStatus('missing-or-foreign', req),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
 
     it('camino feliz: devuelve exactamente lo que resuelve el service (proyección liviana)', async () => {
@@ -171,41 +226,60 @@ describe('AnalysisController', () => {
         });
 
         it('si el análisis es propio pero no tiene reporte generado, propaga el error del service sin tocar fs', async () => {
-          analysisService.findOneOwned.mockResolvedValue({ id: 'analysis-1' } as any);
-          (analysisService[testCase.pathMethod] as jest.Mock).mockImplementation(() => {
-            throw new NotFoundException('El análisis no tiene reporte generado.');
+          analysisService.findOneOwned.mockResolvedValue({
+            id: 'analysis-1',
+          } as any);
+          (
+            analysisService[testCase.pathMethod] as jest.Mock
+          ).mockImplementation(() => {
+            throw new NotFoundException(
+              'El análisis no tiene reporte generado.',
+            );
           });
 
-          await expect(testCase.call('analysis-1', req, buildRes())).rejects.toThrow(
-            'El análisis no tiene reporte generado.',
-          );
+          await expect(
+            testCase.call('analysis-1', req, buildRes()),
+          ).rejects.toThrow('El análisis no tiene reporte generado.');
 
           expect(fs.existsSync).not.toHaveBeenCalled();
         });
 
         it('si el path no existe en disco, responde 404 sin exponer contenido', async () => {
-          analysisService.findOneOwned.mockResolvedValue({ id: 'analysis-1' } as any);
-          (analysisService[testCase.pathMethod] as jest.Mock).mockReturnValue('/tmp/does-not-exist');
+          analysisService.findOneOwned.mockResolvedValue({
+            id: 'analysis-1',
+          } as any);
+          (analysisService[testCase.pathMethod] as jest.Mock).mockReturnValue(
+            '/tmp/does-not-exist',
+          );
           (fs.existsSync as jest.Mock).mockReturnValue(false);
 
-          await expect(testCase.call('analysis-1', req, buildRes())).rejects.toThrow(
-            /no existe/,
-          );
+          await expect(
+            testCase.call('analysis-1', req, buildRes()),
+          ).rejects.toThrow(/no existe/);
 
           expect(fs.createReadStream).not.toHaveBeenCalled();
         });
 
         it('camino feliz: ownership + path + archivo existente -> sirve el stream con los headers correctos', async () => {
-          analysisService.findOneOwned.mockResolvedValue({ id: 'analysis-1' } as any);
-          (analysisService[testCase.pathMethod] as jest.Mock).mockReturnValue('/tmp/report.file');
+          analysisService.findOneOwned.mockResolvedValue({
+            id: 'analysis-1',
+          } as any);
+          (analysisService[testCase.pathMethod] as jest.Mock).mockReturnValue(
+            '/tmp/report.file',
+          );
           (fs.existsSync as jest.Mock).mockReturnValue(true);
           const pipeMock = jest.fn();
-          (fs.createReadStream as jest.Mock).mockReturnValue({ pipe: pipeMock });
+          (fs.createReadStream as jest.Mock).mockReturnValue({
+            pipe: pipeMock,
+          });
 
           const res = buildRes();
           await testCase.call('analysis-1', req, res);
 
-          expect(res.setHeader).toHaveBeenCalledWith('Content-Type', testCase.contentType);
+          expect(res.setHeader).toHaveBeenCalledWith(
+            'Content-Type',
+            testCase.contentType,
+          );
           expect(res.setHeader).toHaveBeenCalledWith(
             'Content-Disposition',
             testCase.disposition,
@@ -231,14 +305,20 @@ describe('AnalysisController', () => {
     });
 
     it('si el análisis es propio pero no tiene datos suficientes, propaga el error del service', async () => {
-      analysisService.findOneOwned.mockResolvedValue({ id: 'analysis-1' } as any);
+      analysisService.findOneOwned.mockResolvedValue({
+        id: 'analysis-1',
+      } as any);
       analysisService.buildReportPdf.mockRejectedValue(
-        new NotFoundException('El análisis no tiene datos suficientes para generar el reporte.'),
+        new NotFoundException(
+          'El análisis no tiene datos suficientes para generar el reporte.',
+        ),
       );
 
       await expect(
         controller.downloadPdfReport('analysis-1', req, buildRes()),
-      ).rejects.toThrow('El análisis no tiene datos suficientes para generar el reporte.');
+      ).rejects.toThrow(
+        'El análisis no tiene datos suficientes para generar el reporte.',
+      );
     });
 
     it('camino feliz: ownership + PDF generado -> streamea la respuesta con los headers correctos', async () => {
@@ -255,8 +335,14 @@ describe('AnalysisController', () => {
       const res = buildRes();
       await controller.downloadPdfReport('analysis-1', req, res);
 
-      expect(analysisService.buildReportPdf).toHaveBeenCalledWith(analysis, 'user-A');
-      expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'application/pdf');
+      expect(analysisService.buildReportPdf).toHaveBeenCalledWith(
+        analysis,
+        'user-A',
+      );
+      expect(res.setHeader).toHaveBeenCalledWith(
+        'Content-Type',
+        'application/pdf',
+      );
       expect(res.setHeader).toHaveBeenCalledWith(
         'Content-Disposition',
         'attachment; filename="agroscore-reporte-campo-a-2026-01-01.pdf"',

@@ -137,13 +137,15 @@ export class AnalysisController {
     return this.analysisService.findOneOwnedStatus(id, req.user.sub);
   }
 
+  // PR 11A: incluye technicalVerdict (null mientras no exista) — ver
+  // AnalysisService.findOneOwnedWithVerdict para el porqué de que solo esta ruta lo resuelva.
   @UseGuards(JwtAuthGuard)
   @Get('analysis/:id')
   findOne(
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.analysisService.findOneOwned(id, req.user.sub);
+    return this.analysisService.findOneOwnedWithVerdict(id, req.user.sub);
   }
 
   // Ruta histórica. El alias 'analysis/field/:fieldId' es el nombre preferido

@@ -8,10 +8,13 @@ import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { AnalysisService } from './analysis.service';
 import { Analysis } from './entities/analysis.entity';
 import { ReportPdfService } from './report-pdf/report-pdf.service';
+import { AnalysisVerdictService } from '../analysis-verdict/analysis-verdict.service';
 
 type MockRepo = {
   findOne: jest.Mock;
   find: jest.Mock;
+  create: jest.Mock;
+  save: jest.Mock;
   createQueryBuilder: jest.Mock;
 };
 
@@ -22,6 +25,15 @@ describe('AnalysisService', () => {
     Pick<FieldsService, 'findOne' | 'findByIdOrFail' | 'getPipelineInput'>
   >;
   let reportPdfService: jest.Mocked<Pick<ReportPdfService, 'build'>>;
+  let analysisVerdictService: jest.Mocked<
+    Pick<
+      AnalysisVerdictService,
+      'generateAndPersist' | 'findResponseByAnalysisId'
+    >
+  >;
+  let pythonWorkerService: jest.Mocked<
+    Pick<PythonWorkerService, 'runFieldAnalysis'>
+  >;
 
   const buildAnalysis = (overrides: Partial<Analysis> = {}): Analysis =>
     ({
@@ -50,20 +62,19 @@ describe('AnalysisService', () => {
       ...overrides,
     }) as Analysis;
 
-  const buildField = (overrides: Partial<Field> = {}): Field =>
-    ({
-      id: 'field-1',
-      userId: 'user-A',
-      name: 'Campo A',
-      totalAreaHa: 10,
-      lots: [],
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      startDate: '2024-01-01',
-      endDate: '2024-06-01',
-      maxCloudiness: 30,
-      ...overrides,
-    }) as Field;
+  const buildField = (overrides: Partial<Field> = {}): Field => ({
+    id: 'field-1',
+    userId: 'user-A',
+    name: 'Campo A',
+    totalAreaHa: 10,
+    lots: [],
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    startDate: '2024-01-01',
+    endDate: '2024-06-01',
+    maxCloudiness: 30,
+    ...overrides,
+  });
 
   let queryBuilderMock: {
     innerJoin: jest.Mock;
@@ -92,10 +103,17 @@ describe('AnalysisService', () => {
           useValue: {
             findOne: jest.fn(),
             find: jest.fn(),
+            create: jest.fn((data) => ({ ...data })),
+            save: jest.fn((entity) =>
+              Promise.resolve({ id: entity.id ?? 'analysis-1', ...entity }),
+            ),
             createQueryBuilder: jest.fn(() => queryBuilderMock),
           },
         },
-        { provide: PythonWorkerService, useValue: {} },
+        {
+          provide: PythonWorkerService,
+          useValue: { runFieldAnalysis: jest.fn() },
+        },
         {
           provide: FieldsService,
           useValue: {
@@ -105,6 +123,13 @@ describe('AnalysisService', () => {
           },
         },
         { provide: ReportPdfService, useValue: { build: jest.fn() } },
+        {
+          provide: AnalysisVerdictService,
+          useValue: {
+            generateAndPersist: jest.fn().mockResolvedValue(undefined),
+            findResponseByAnalysisId: jest.fn().mockResolvedValue(null),
+          },
+        },
       ],
     }).compile();
 
@@ -112,16 +137,21 @@ describe('AnalysisService', () => {
     analysisRepository = module.get(getRepositoryToken(Analysis));
     fieldsService = module.get(FieldsService);
     reportPdfService = module.get(ReportPdfService);
+    analysisVerdictService = module.get(AnalysisVerdictService);
+    pythonWorkerService = module.get(PythonWorkerService);
   });
+
+  const flushBackgroundWork = () =>
+    new Promise((resolve) => setImmediate(resolve));
 
   describe('findOneOwned', () => {
     // A. El análisis no existe.
     it('lanza NotFoundException si el análisis no existe', async () => {
       analysisRepository.findOne.mockResolvedValue(null);
 
-      await expect(service.findOneOwned('missing', 'user-A')).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.findOneOwned('missing', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(fieldsService.findOne).not.toHaveBeenCalled();
     });
 
@@ -141,28 +171,38 @@ describe('AnalysisService', () => {
     it('lanza NotFoundException si scope=field pero el Field es de otro usuario', async () => {
       const analysis = buildAnalysis({ scope: 'field', fieldId: 'field-1' });
       analysisRepository.findOne.mockResolvedValue(analysis);
-      fieldsService.findOne.mockRejectedValue(new NotFoundException('Campo no encontrado.'));
-
-      await expect(service.findOneOwned('analysis-1', 'user-B')).rejects.toBeInstanceOf(
-        NotFoundException,
+      fieldsService.findOne.mockRejectedValue(
+        new NotFoundException('Campo no encontrado.'),
       );
+
+      await expect(
+        service.findOneOwned('analysis-1', 'user-B'),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
 
     // D. scope='lot' (el bug corregido en AUTH-3): debe bloquearse SIEMPRE,
     // sin siquiera intentar resolver ownership por Field.
     it('lanza NotFoundException para scope=lot aunque el análisis exista, sin consultar FieldsService', async () => {
-      const analysis = buildAnalysis({ scope: 'lot', lotId: 'lot-1', fieldId: null });
+      const analysis = buildAnalysis({
+        scope: 'lot',
+        lotId: 'lot-1',
+        fieldId: null,
+      });
       analysisRepository.findOne.mockResolvedValue(analysis);
 
-      await expect(service.findOneOwned('analysis-1', 'user-A')).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.findOneOwned('analysis-1', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(fieldsService.findOne).not.toHaveBeenCalled();
     });
 
     // E. scope=null (legacy) con lotId que resuelve a un Field propio.
     it('devuelve el análisis para scope=null si el lotId legacy resuelve a un Field propio', async () => {
-      const analysis = buildAnalysis({ scope: null, lotId: 'field-1', fieldId: null });
+      const analysis = buildAnalysis({
+        scope: null,
+        lotId: 'field-1',
+        fieldId: null,
+      });
       analysisRepository.findOne.mockResolvedValue(analysis);
       fieldsService.findOne.mockResolvedValue(buildField());
 
@@ -174,23 +214,33 @@ describe('AnalysisService', () => {
 
     // F. scope=null con lotId que no resuelve a ningún Field.
     it('lanza NotFoundException para scope=null si el lotId legacy no resuelve a un Field', async () => {
-      const analysis = buildAnalysis({ scope: null, lotId: 'orphan-lot', fieldId: null });
+      const analysis = buildAnalysis({
+        scope: null,
+        lotId: 'orphan-lot',
+        fieldId: null,
+      });
       analysisRepository.findOne.mockResolvedValue(analysis);
-      fieldsService.findOne.mockRejectedValue(new NotFoundException('Campo no encontrado.'));
-
-      await expect(service.findOneOwned('analysis-1', 'user-A')).rejects.toBeInstanceOf(
-        NotFoundException,
+      fieldsService.findOne.mockRejectedValue(
+        new NotFoundException('Campo no encontrado.'),
       );
+
+      await expect(
+        service.findOneOwned('analysis-1', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
 
     // G. Sin fieldId y sin lotId: no hay nada que resolver.
     it('lanza NotFoundException si el análisis no tiene fieldId ni lotId', async () => {
-      const analysis = buildAnalysis({ scope: null, lotId: null, fieldId: null });
+      const analysis = buildAnalysis({
+        scope: null,
+        lotId: null,
+        fieldId: null,
+      });
       analysisRepository.findOne.mockResolvedValue(analysis);
 
-      await expect(service.findOneOwned('analysis-1', 'user-A')).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.findOneOwned('analysis-1', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(fieldsService.findOne).not.toHaveBeenCalled();
     });
   });
@@ -210,9 +260,18 @@ describe('AnalysisService', () => {
         resultJson: {
           mode: 'python-worker-v2',
           message: '',
-          mapAssets: { rgb: { available: true, image_base64: 'HUGE_BASE64_STRING' } },
+          mapAssets: {
+            rgb: { available: true, image_base64: 'HUGE_BASE64_STRING' },
+          },
           imageSeries: {
-            ndvi: [{ campaign: '2024', images: [{ available: true, image_base64: 'HUGE_BASE64_STRING' }] }],
+            ndvi: [
+              {
+                campaign: '2024',
+                images: [
+                  { available: true, image_base64: 'HUGE_BASE64_STRING' },
+                ],
+              },
+            ],
             ndmi: [],
           },
         } as any,
@@ -220,20 +279,29 @@ describe('AnalysisService', () => {
       });
 
     it('selecciona solo columnas livianas al consultar Postgres — nunca resultJson', async () => {
-      queryBuilderMock.getOne.mockResolvedValue(buildStatusRow({ scope: 'field', fieldId: 'field-1' }));
+      queryBuilderMock.getOne.mockResolvedValue(
+        buildStatusRow({ scope: 'field', fieldId: 'field-1' }),
+      );
       fieldsService.findOne.mockResolvedValue(buildField());
 
       await service.findOneOwnedStatus('analysis-1', 'user-A');
 
       expect(queryBuilderMock.select).toHaveBeenCalledWith(
-        expect.arrayContaining(['analysis.id', 'analysis.status', 'analysis.globalScore']),
+        expect.arrayContaining([
+          'analysis.id',
+          'analysis.status',
+          'analysis.globalScore',
+        ]),
       );
-      const selectedColumns = queryBuilderMock.select.mock.calls[0][0] as string[];
+      const selectedColumns = queryBuilderMock.select.mock
+        .calls[0][0] as string[];
       expect(selectedColumns).not.toContain('analysis.resultJson');
     });
 
     it('la respuesta nunca incluye resultJson/mapAssets/imageSeries aunque la fila los tuviera', async () => {
-      queryBuilderMock.getOne.mockResolvedValue(buildStatusRow({ scope: 'field', fieldId: 'field-1' }));
+      queryBuilderMock.getOne.mockResolvedValue(
+        buildStatusRow({ scope: 'field', fieldId: 'field-1' }),
+      );
       fieldsService.findOne.mockResolvedValue(buildField());
 
       const result = await service.findOneOwnedStatus('analysis-1', 'user-A');
@@ -261,7 +329,9 @@ describe('AnalysisService', () => {
       const result = await service.findOneOwnedStatus('analysis-1', 'user-A');
 
       expect(result.status).toBe('Error');
-      expect(result.errorMessage).toBe('No se pudo conectar con el worker Python.');
+      expect(result.errorMessage).toBe(
+        'No se pudo conectar con el worker Python.',
+      );
       expect(result.durationMs).toBe(300000);
       expect(result.failedAt).toEqual(new Date('2026-01-01T10:05:00Z'));
     });
@@ -269,19 +339,23 @@ describe('AnalysisService', () => {
     it('lanza NotFoundException si el análisis no existe', async () => {
       queryBuilderMock.getOne.mockResolvedValue(null);
 
-      await expect(service.findOneOwnedStatus('missing', 'user-A')).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.findOneOwnedStatus('missing', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(fieldsService.findOne).not.toHaveBeenCalled();
     });
 
     it('lanza NotFoundException si el análisis es de otro usuario (Field ajeno)', async () => {
-      queryBuilderMock.getOne.mockResolvedValue(buildStatusRow({ scope: 'field', fieldId: 'field-1' }));
-      fieldsService.findOne.mockRejectedValue(new NotFoundException('Campo no encontrado.'));
-
-      await expect(service.findOneOwnedStatus('analysis-1', 'user-B')).rejects.toBeInstanceOf(
-        NotFoundException,
+      queryBuilderMock.getOne.mockResolvedValue(
+        buildStatusRow({ scope: 'field', fieldId: 'field-1' }),
       );
+      fieldsService.findOne.mockRejectedValue(
+        new NotFoundException('Campo no encontrado.'),
+      );
+
+      await expect(
+        service.findOneOwnedStatus('analysis-1', 'user-B'),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
 
     it('lanza NotFoundException para scope=lot, sin consultar FieldsService (mismo default-deny que findOneOwned)', async () => {
@@ -289,9 +363,9 @@ describe('AnalysisService', () => {
         buildStatusRow({ scope: 'lot', lotId: 'lot-1', fieldId: null }),
       );
 
-      await expect(service.findOneOwnedStatus('analysis-1', 'user-A')).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.findOneOwnedStatus('analysis-1', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(fieldsService.findOne).not.toHaveBeenCalled();
     });
   });
@@ -305,7 +379,10 @@ describe('AnalysisService', () => {
     // prueba de integración contra Postgres real para las reglas de
     // exclusión de scope='lot'/huérfanos (ver deuda restante en la entrega).
     it('arma el query filtrando por el userId recibido y devuelve el resultado del builder', async () => {
-      const analyses = [buildAnalysis({ id: 'a1' }), buildAnalysis({ id: 'a2' })];
+      const analyses = [
+        buildAnalysis({ id: 'a1' }),
+        buildAnalysis({ id: 'a2' }),
+      ];
       const queryBuilder = analysisRepository.createQueryBuilder();
       queryBuilder.getMany.mockResolvedValue(analyses);
 
@@ -331,20 +408,24 @@ describe('AnalysisService', () => {
     });
 
     it('propaga NotFoundException si el Field es ajeno, sin consultar el historial', async () => {
-      fieldsService.findOne.mockRejectedValue(new NotFoundException('Campo no encontrado.'));
-
-      await expect(service.findByField('field-1', 'user-B')).rejects.toBeInstanceOf(
-        NotFoundException,
+      fieldsService.findOne.mockRejectedValue(
+        new NotFoundException('Campo no encontrado.'),
       );
+
+      await expect(
+        service.findByField('field-1', 'user-B'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(analysisRepository.find).not.toHaveBeenCalled();
     });
 
     it('propaga NotFoundException si el Field no existe, sin consultar el historial', async () => {
-      fieldsService.findOne.mockRejectedValue(new NotFoundException('Campo no encontrado.'));
-
-      await expect(service.findByField('missing-field', 'user-A')).rejects.toBeInstanceOf(
-        NotFoundException,
+      fieldsService.findOne.mockRejectedValue(
+        new NotFoundException('Campo no encontrado.'),
       );
+
+      await expect(
+        service.findByField('missing-field', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(analysisRepository.find).not.toHaveBeenCalled();
     });
   });
@@ -355,7 +436,11 @@ describe('AnalysisService', () => {
     // no pueden saltarse el chequeo de ownership.
     it('getReportPath devuelve el path si el análisis tiene reporte generado', () => {
       const analysis = buildAnalysis({
-        resultJson: { mode: 'python-worker-v2', message: '', report: { htmlPath: '/tmp/report.html' } },
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          report: { htmlPath: '/tmp/report.html' },
+        },
       });
 
       expect(service.getReportPath(analysis)).toBe('/tmp/report.html');
@@ -368,7 +453,6 @@ describe('AnalysisService', () => {
         'El análisis no tiene reporte generado.',
       );
     });
-
   });
 
   describe('buildReportPdf (PDF-1)', () => {
@@ -378,7 +462,10 @@ describe('AnalysisService', () => {
     it('resuelve el Field por scope=field y delega en ReportPdfService.build', async () => {
       const analysis = buildAnalysis({ scope: 'field', fieldId: 'field-1' });
       const field = buildField();
-      const built = { stream: {} as any, filename: 'agroscore-reporte-campo-a-2026-01-01.pdf' };
+      const built = {
+        stream: {} as any,
+        filename: 'agroscore-reporte-campo-a-2026-01-01.pdf',
+      };
 
       fieldsService.findOne.mockResolvedValue(field);
       reportPdfService.build.mockResolvedValue(built);
@@ -391,11 +478,18 @@ describe('AnalysisService', () => {
     });
 
     it('resuelve el Field por scope=null legacy (fieldId guardado en lotId)', async () => {
-      const analysis = buildAnalysis({ scope: null, lotId: 'field-1', fieldId: null });
+      const analysis = buildAnalysis({
+        scope: null,
+        lotId: 'field-1',
+        fieldId: null,
+      });
       const field = buildField();
 
       fieldsService.findOne.mockResolvedValue(field);
-      reportPdfService.build.mockResolvedValue({ stream: {} as any, filename: 'x.pdf' });
+      reportPdfService.build.mockResolvedValue({
+        stream: {} as any,
+        filename: 'x.pdf',
+      });
 
       await service.buildReportPdf(analysis, 'user-A');
 
@@ -403,22 +497,28 @@ describe('AnalysisService', () => {
     });
 
     it('lanza NotFoundException para scope=lot sin llamar a FieldsService ni a ReportPdfService', async () => {
-      const analysis = buildAnalysis({ scope: 'lot', lotId: 'lot-1', fieldId: null });
+      const analysis = buildAnalysis({
+        scope: 'lot',
+        lotId: 'lot-1',
+        fieldId: null,
+      });
 
-      await expect(service.buildReportPdf(analysis, 'user-A')).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.buildReportPdf(analysis, 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(fieldsService.findOne).not.toHaveBeenCalled();
       expect(reportPdfService.build).not.toHaveBeenCalled();
     });
 
     it('propaga NotFoundException si el Field resuelto es de otro usuario, sin generar el PDF', async () => {
       const analysis = buildAnalysis({ scope: 'field', fieldId: 'field-1' });
-      fieldsService.findOne.mockRejectedValue(new NotFoundException('Campo no encontrado.'));
-
-      await expect(service.buildReportPdf(analysis, 'user-B')).rejects.toBeInstanceOf(
-        NotFoundException,
+      fieldsService.findOne.mockRejectedValue(
+        new NotFoundException('Campo no encontrado.'),
       );
+
+      await expect(
+        service.buildReportPdf(analysis, 'user-B'),
+      ).rejects.toBeInstanceOf(NotFoundException);
       expect(reportPdfService.build).not.toHaveBeenCalled();
     });
 
@@ -426,12 +526,186 @@ describe('AnalysisService', () => {
       const analysis = buildAnalysis({ scope: 'field', fieldId: 'field-1' });
       fieldsService.findOne.mockResolvedValue(buildField());
       reportPdfService.build.mockRejectedValue(
-        new NotFoundException('El análisis no tiene datos suficientes para generar el reporte.'),
+        new NotFoundException(
+          'El análisis no tiene datos suficientes para generar el reporte.',
+        ),
       );
 
       await expect(service.buildReportPdf(analysis, 'user-A')).rejects.toThrow(
         'El análisis no tiene datos suficientes para generar el reporte.',
       );
+    });
+  });
+
+  describe('findOneOwnedWithVerdict (PR 11A)', () => {
+    it('adjunta technicalVerdict resuelto desde AnalysisVerdictService, preservando el resto del análisis', async () => {
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        globalScore: 82,
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      const verdictResponse = {
+        status: 'generated',
+        verdict: 'favorable',
+        confidence: 'high',
+        summary: 'ok',
+        keyFindings: [],
+        possibleCauses: [],
+        recommendations: [],
+        limitations: [],
+        generatedAt: '2026-01-01T00:00:00.000Z',
+        generator: 'deterministic-v1',
+        promptVersion: null,
+      } as any;
+      analysisVerdictService.findResponseByAnalysisId.mockResolvedValue(
+        verdictResponse,
+      );
+
+      const result = await service.findOneOwnedWithVerdict(
+        'analysis-1',
+        'user-A',
+      );
+
+      expect(result.technicalVerdict).toBe(verdictResponse);
+      expect(result.globalScore).toBe(82);
+      expect(
+        analysisVerdictService.findResponseByAnalysisId,
+      ).toHaveBeenCalledWith('analysis-1');
+    });
+
+    it('technicalVerdict es null si todavía no existe ninguna fila (p.ej. análisis Procesando)', async () => {
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Procesando',
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisVerdictService.findResponseByAnalysisId.mockResolvedValue(null);
+
+      const result = await service.findOneOwnedWithVerdict(
+        'analysis-1',
+        'user-A',
+      );
+
+      expect(result.technicalVerdict).toBeNull();
+    });
+
+    it('propaga NotFoundException de findOneOwned sin llegar a consultar AnalysisVerdictService', async () => {
+      analysisRepository.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.findOneOwnedWithVerdict('missing', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(
+        analysisVerdictService.findResponseByAnalysisId,
+      ).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('runFieldAnalysis → processFieldAnalysisInBackground (PR 11A: veredicto técnico)', () => {
+    const buildFieldInput = () => ({
+      fieldId: 'field-1',
+      name: 'Campo A',
+      lots: [
+        {
+          id: 'lot-1',
+          name: 'Lote 1',
+          geojson: {},
+          areaHa: 10,
+          includeInProductivityClassification: true,
+        },
+      ],
+    });
+
+    const workerResult = {
+      globalScore: 82,
+      category: 'Buena aptitud productiva',
+      confidenceScore: 90,
+      productivityScore: 80,
+      stabilityScore: 70,
+      soilScore: 60,
+      climateScore: 50,
+      ndviAverageMax: 0.7,
+      ndviVariability: 'Media' as const,
+      zonesDetected: 3,
+      resultJson: {
+        mode: 'python-worker-v2' as const,
+        message: '',
+        totalsByZone: [{ zone: 0, name: 'Alta', hectares: 10, percent: 100 }],
+      },
+    };
+
+    const runAnalysisAndFlush = async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(
+        buildFieldInput() as any,
+      );
+      analysisRepository.findOne
+        .mockResolvedValueOnce(null) // sin análisis Procesando duplicado
+        .mockResolvedValueOnce(
+          buildAnalysis({
+            id: 'analysis-1',
+            status: 'Procesando',
+            startedAt: new Date(),
+          }),
+        ); // this.findOne(analysisId) dentro de processFieldAnalysisInBackground
+
+      await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      await flushBackgroundWork();
+    };
+
+    it('al finalizar exitosamente, genera y persiste el veredicto técnico con el análisis ya guardado como Finalizado', async () => {
+      pythonWorkerService.runFieldAnalysis.mockResolvedValue(
+        workerResult as any,
+      );
+
+      await runAnalysisAndFlush();
+
+      expect(analysisVerdictService.generateAndPersist).toHaveBeenCalledTimes(
+        1,
+      );
+      const persistedAnalysis =
+        analysisVerdictService.generateAndPersist.mock.calls[0][0];
+      expect(persistedAnalysis.status).toBe('Finalizado');
+      expect(persistedAnalysis.globalScore).toBe(82);
+    });
+
+    it('si la generación del veredicto falla, el análisis sigue guardado como Finalizado (no se revierte ni se marca Error)', async () => {
+      pythonWorkerService.runFieldAnalysis.mockResolvedValue(
+        workerResult as any,
+      );
+      analysisVerdictService.generateAndPersist.mockRejectedValue(
+        new Error('boom'),
+      );
+
+      await runAnalysisAndFlush();
+
+      const finalizedSaveCalls = analysisRepository.save.mock.calls.filter(
+        ([entity]) => entity.status === 'Finalizado',
+      );
+      const errorSaveCalls = analysisRepository.save.mock.calls.filter(
+        ([entity]) => entity.status === 'Error',
+      );
+      expect(finalizedSaveCalls.length).toBeGreaterThan(0);
+      expect(errorSaveCalls).toHaveLength(0);
+    });
+
+    it('nunca llama a AnalysisVerdictService si el pipeline del worker falla (no hay análisis exitoso que interpretar)', async () => {
+      pythonWorkerService.runFieldAnalysis.mockRejectedValue(
+        new Error('worker caído'),
+      );
+
+      await runAnalysisAndFlush();
+
+      expect(analysisVerdictService.generateAndPersist).not.toHaveBeenCalled();
     });
   });
 });

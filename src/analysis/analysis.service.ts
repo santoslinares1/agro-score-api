@@ -13,6 +13,12 @@ import { FieldsService } from '../fields/fields.service';
 import { AnalysisStatusDto } from './dto/analysis-status.dto';
 import { FieldAnalysisSummary } from './dto/field-analysis-summary.dto';
 import { ReportPdfService } from './report-pdf/report-pdf.service';
+import { AnalysisVerdictService } from '../analysis-verdict/analysis-verdict.service';
+import { AnalysisTechnicalVerdictResponse } from '../analysis-verdict/dto/analysis-technical-verdict.dto';
+
+export type AnalysisWithTechnicalVerdict = Analysis & {
+  technicalVerdict: AnalysisTechnicalVerdictResponse | null;
+};
 
 /**
  * PERF-2: columnas que selecciona GET /analysis/:id/status — deliberadamente nunca incluye
@@ -53,6 +59,7 @@ export class AnalysisService {
     private readonly pythonWorkerService: PythonWorkerService,
     private readonly fieldsService: FieldsService,
     private readonly reportPdfService: ReportPdfService,
+    private readonly analysisVerdictService: AnalysisVerdictService,
   ) {}
 
   /**
@@ -129,7 +136,9 @@ export class AnalysisService {
       throw new NotFoundException('Análisis no encontrado.');
     }
 
-    const field = await this.fieldsService.findOne(fieldId, userId).catch(() => null);
+    const field = await this.fieldsService
+      .findOne(fieldId, userId)
+      .catch(() => null);
 
     if (!field) {
       throw new NotFoundException('Análisis no encontrado.');
@@ -139,13 +148,39 @@ export class AnalysisService {
   }
 
   /**
+   * PR 11A: versión de findOneOwned para GET /analysis/:id que además adjunta el veredicto
+   * técnico (technicalVerdict) — la única ruta que lo necesita (ver AnalysisVerdictService y el
+   * diagnóstico del PR: la pantalla de resultado hace un único fetch acá una vez que
+   * /analysis/:id/status reporta 'Finalizado'). Las rutas de reporte (HTML/PDF) siguen usando
+   * findOneOwned "pelado" para no pagar esta consulta extra cuando no la necesitan.
+   *
+   * technicalVerdict es null si todavía no existe fila (análisis 'Procesando', o 'Error' — nunca
+   * se genera veredicto para un análisis que no terminó bien, ver AnalysisService.
+   * processFieldAnalysisInBackground). No es un estado paralelo a analysis.status: el frontend
+   * decide qué mostrar combinando ambos.
+   */
+  async findOneOwnedWithVerdict(
+    id: string,
+    userId: string,
+  ): Promise<AnalysisWithTechnicalVerdict> {
+    const analysis = await this.findOneOwned(id, userId);
+    const technicalVerdict =
+      await this.analysisVerdictService.findResponseByAnalysisId(analysis.id);
+
+    return { ...analysis, technicalVerdict };
+  }
+
+  /**
    * PERF-2: versión liviana de findOneOwned para GET /analysis/:id/status — mismo chequeo de
    * ownership (AUTH-3/AUTH-4, default-deny vía resolveOwnedFieldId), pero la query a Postgres
    * solo trae ANALYSIS_STATUS_COLUMNS: resultJson (y todo lo que cuelga de él — mapAssets,
    * imageSeries, zones) nunca se lee de la base de datos ni viaja al proceso Node, no solo se
    * omite al responder. Pensado para el polling del frontend mientras status='Procesando'.
    */
-  async findOneOwnedStatus(id: string, userId: string): Promise<AnalysisStatusDto> {
+  async findOneOwnedStatus(
+    id: string,
+    userId: string,
+  ): Promise<AnalysisStatusDto> {
     const analysis = await this.analysisRepository
       .createQueryBuilder('analysis')
       .select(ANALYSIS_STATUS_COLUMNS)
@@ -162,7 +197,9 @@ export class AnalysisService {
       throw new NotFoundException('Análisis no encontrado.');
     }
 
-    const field = await this.fieldsService.findOne(fieldId, userId).catch(() => null);
+    const field = await this.fieldsService
+      .findOne(fieldId, userId)
+      .catch(() => null);
 
     if (!field) {
       throw new NotFoundException('Análisis no encontrado.');
@@ -200,7 +237,10 @@ export class AnalysisService {
    * AUTH-1). Ahora exige que el Field sea del usuario autenticado, mismo
    * patrón que runFieldAnalysis.
    */
-  async findByField(fieldId: string, userId: string): Promise<FieldAnalysisSummary[]> {
+  async findByField(
+    fieldId: string,
+    userId: string,
+  ): Promise<FieldAnalysisSummary[]> {
     await this.fieldsService.findOne(fieldId, userId);
 
     const analyses = await this.analysisRepository.find({
@@ -252,7 +292,10 @@ export class AnalysisService {
   async buildReportPdf(
     analysis: Analysis,
     userId: string,
-  ): Promise<{ stream: NodeJS.ReadableStream & { end(): void }; filename: string }> {
+  ): Promise<{
+    stream: NodeJS.ReadableStream & { end(): void };
+    filename: string;
+  }> {
     const fieldId = this.resolveOwnedFieldId(analysis);
 
     if (!fieldId) {
@@ -431,6 +474,20 @@ export class AnalysisService {
         `Análisis de campo finalizado (analysisId=${analysisId}, fieldId=${fieldId}, ` +
           `classificationScope=${result.resultJson?.classificationScope ?? 'n/a'}).`,
       );
+
+      // PR 11A: el veredicto técnico es best-effort — AnalysisVerdictService ya se protege
+      // internamente (persiste status='failed' si el generador o el guardado fallan), pero este
+      // .catch() es la última red: si incluso guardar el 'failed' tirara, no puede escapar hacia
+      // el catch de abajo y marcar como 'Error' un análisis que en realidad terminó bien.
+      await this.analysisVerdictService
+        .generateAndPersist(analysis)
+        .catch((error) => {
+          this.logger.error(
+            `Generación de veredicto técnico interrumpida de forma inesperada (analysisId=${analysisId}): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
     } catch (error) {
       this.logger.error(
         `Field pipeline error (analysisId=${analysisId}, fieldId=${fieldId}): ${
@@ -473,7 +530,10 @@ export class AnalysisService {
    * no tienen forma real de calcular duración — se deja null en vez de
    * inventar un número con createdAt como sustituto.
    */
-  private computeDurationMs(startedAt: Date | null, endedAt: Date): number | null {
+  private computeDurationMs(
+    startedAt: Date | null,
+    endedAt: Date,
+  ): number | null {
     if (!startedAt) {
       return null;
     }

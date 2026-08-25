@@ -6,12 +6,14 @@ import { AnalysisService } from './analysis.service';
 import { Analysis } from './entities/analysis.entity';
 import { FieldsModule } from 'src/fields/fields.module';
 import { ReportPdfService } from './report-pdf/report-pdf.service';
+import { AnalysisVerdictModule } from '../analysis-verdict/analysis-verdict.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Analysis]),
     PythonWorkerModule,
     FieldsModule,
+    AnalysisVerdictModule,
   ],
   controllers: [AnalysisController],
   providers: [AnalysisService, ReportPdfService],
