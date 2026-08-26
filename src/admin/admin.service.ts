@@ -1014,7 +1014,10 @@ export class AdminService {
         'schedule.field',
         Field,
         'field',
-        'field.id::text = schedule."fieldId"',
+        // A diferencia de Analysis.fieldId (texto libre histórico, ver listAnalysis más abajo),
+        // FieldAnalysisSchedule.fieldId es uuid real — sin el cast ::text que necesita ese otro
+        // join (con el cast, "text = uuid" no tiene operador válido en Postgres).
+        'field.id = schedule."fieldId"',
       )
       .leftJoinAndMapOne('field.user', User, 'user', 'user.id = field."userId"')
       .orderBy('schedule.createdAt', 'DESC')
