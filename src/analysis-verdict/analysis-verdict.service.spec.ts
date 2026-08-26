@@ -6,6 +6,7 @@ import { Analysis } from '../analysis/entities/analysis.entity';
 import { AnalysisVerdictService } from './analysis-verdict.service';
 import { ClaudeTechnicalVerdictGenerator } from './generators/claude-technical-verdict.generator';
 import { DeterministicTechnicalVerdictGenerator } from './generators/deterministic-technical-verdict.generator';
+import { TECHNICAL_VERDICT_PROMPT_VERSION } from './generators/technical-verdict-prompt';
 import { AnalysisTechnicalVerdict } from './entities/analysis-technical-verdict.entity';
 
 type MockRepo = {
@@ -93,7 +94,7 @@ describe('AnalysisVerdictService', () => {
           provide: ClaudeTechnicalVerdictGenerator,
           useValue: {
             generatorName: 'claude',
-            promptVersion: 'technical-verdict-v1',
+            promptVersion: TECHNICAL_VERDICT_PROMPT_VERSION,
             modelId: 'claude-haiku-4-5',
             generate: claudeGenerate,
           },
@@ -137,7 +138,7 @@ describe('AnalysisVerdictService', () => {
       expect(claudeGenerate).toHaveBeenCalledTimes(1);
       expect(deterministicGenerate).not.toHaveBeenCalled();
       expect(result.generator).toBe('claude');
-      expect(result.promptVersion).toBe('technical-verdict-v1');
+      expect(result.promptVersion).toBe(TECHNICAL_VERDICT_PROMPT_VERSION);
     });
 
     it('TECHNICAL_VERDICT_PROVIDER=claude sin API key (el generador Claude rechaza) → status=failed, no rompe', async () => {
@@ -190,7 +191,7 @@ describe('AnalysisVerdictService', () => {
       expect(result.generatedAt).toBeInstanceOf(Date);
     });
 
-    it('claude: persiste status=generated con generator=claude, promptVersion=technical-verdict-v1, e inputSnapshot.model', async () => {
+    it('claude: persiste status=generated con generator=claude, promptVersion vigente, e inputSnapshot.model', async () => {
       setProvider('claude');
       verdictRepository.findOne.mockResolvedValue(null);
 
@@ -199,7 +200,7 @@ describe('AnalysisVerdictService', () => {
       expect(result.status).toBe('generated');
       expect(result.verdict).toBe('attention');
       expect(result.generator).toBe('claude');
-      expect(result.promptVersion).toBe('technical-verdict-v1');
+      expect(result.promptVersion).toBe(TECHNICAL_VERDICT_PROMPT_VERSION);
       expect((result.inputSnapshot as any).model).toBe('claude-haiku-4-5');
     });
 

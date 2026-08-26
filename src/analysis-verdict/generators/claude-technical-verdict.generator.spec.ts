@@ -89,7 +89,7 @@ describe('ClaudeTechnicalVerdictGenerator', () => {
     generator = module.get(ClaudeTechnicalVerdictGenerator);
   });
 
-  it('generatorName/promptVersion quedan fijos en "claude"/technical-verdict-v1', () => {
+  it('generatorName/promptVersion quedan fijos en "claude"/TECHNICAL_VERDICT_PROMPT_VERSION', () => {
     expect(generator.generatorName).toBe('claude');
     expect(generator.promptVersion).toBe(TECHNICAL_VERDICT_PROMPT_VERSION);
   });

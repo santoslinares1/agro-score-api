@@ -133,4 +133,63 @@ describe('validateAndNormalizeGeneratedVerdict', () => {
       }),
     ).toThrow(/prohibido/i);
   });
+
+  describe('lenguaje afirmativo sobre causas agronómicas (PR 14A)', () => {
+    it.each([
+      'hay estrés hídrico',
+      'presenta estrés hídrico',
+      'existe estrés hídrico',
+      'hay déficit hídrico',
+      'déficit de humedad en el suelo',
+      'la causa es compactación',
+      'el problema es la falta de riego',
+      'se debe a una plaga',
+      'hay compactación',
+      'hay plaga',
+      'hay enfermedad',
+      'hay deficiencia nutricional',
+      'el lote tiene compactación',
+    ])(
+      'rechaza el output si el texto afirma una causa como hecho: "%s"',
+      (summary) => {
+        expect(() =>
+          validateAndNormalizeGeneratedVerdict({ ...validRaw, summary }),
+        ).toThrow(/afirmativo/i);
+      },
+    );
+
+    it.each([
+      'posibles señales compatibles con menor disponibilidad hídrica',
+      'podría estar asociado a diferencias de humedad',
+      'validar en campo si existe compactación',
+      'descartar plagas o enfermedades con observación en campo',
+      'posibles señales compatibles con estrés hídrico',
+      'podría estar asociado a estrés hídrico',
+      'validar si existe compactación',
+      'descartar plagas o enfermedades en campo',
+    ])('acepta lenguaje hipotético/hedgeado: "%s"', (summary) => {
+      expect(() =>
+        validateAndNormalizeGeneratedVerdict({ ...validRaw, summary }),
+      ).not.toThrow();
+    });
+
+    it('detecta la afirmación aunque esté en un item de array, no solo en summary', () => {
+      expect(() =>
+        validateAndNormalizeGeneratedVerdict({
+          ...validRaw,
+          possibleCauses: ['La causa es un manejo de riego inadecuado.'],
+        }),
+      ).toThrow(/afirmativo/i);
+    });
+
+    it('no bloquea "compactación"/"plaga"/"enfermedad" cuando no siguen a un verbo afirmativo', () => {
+      const result = validateAndNormalizeGeneratedVerdict({
+        ...validRaw,
+        summary:
+          'Zonas con menor vigor podrían estar asociadas a compactación, plaga o enfermedad — se sugiere descartarlas con observación en campo.',
+      });
+
+      expect(result.summary).toContain('compactación');
+    });
+  });
 });

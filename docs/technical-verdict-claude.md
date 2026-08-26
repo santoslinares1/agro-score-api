@@ -165,3 +165,37 @@ de `GET /analysis/:id`, `null` mientras no exista fila. El frontend no sabe
 (ni necesita saber) si el veredicto vino del generador determinístico o de
 Claude; `generator`/`promptVersion` son metadata interna para auditar/depurar,
 no texto pensado para mostrarse tal cual en la UI.
+
+## PR 14A — Lenguaje conservador (`technical-verdict-v1.1`)
+
+AgroScore trabaja con índices satelitales (NDVI/NDMI) que deben validarse en
+campo, no con diagnósticos agronómicos definitivos. PR 14A ajustó el system
+prompt (`buildSystemPrompt()` en `technical-verdict-prompt.ts`) y agregó una
+segunda capa de validación en `claude-output.validator.ts` para reforzar
+esto:
+
+- El veredicto técnico usa lenguaje hipotético y conservador ("podría estar
+  asociado a...", "es compatible con...", "conviene validar si...") en vez
+  de afirmaciones causales definitivas ("hay estrés hídrico", "la causa
+  es...").
+- Los índices satelitales (NDVI/NDMI) no confirman causas agronómicas por sí
+  solos — son indicadores que orientan la interpretación y siempre requieren
+  contraste con observación en campo, manejo, riego, suelo, relieve y clima.
+- El output debe recomendar validación en campo antes de concluir una causa,
+  y nunca recomienda productos, dosis, fertilización específica,
+  fitosanitarios ni riego en cantidad/frecuencia concreta.
+- `claude-output.validator.ts` agrega `containsUnhedgedCausalClaim` como
+  defensa en profundidad (igual criterio que `containsForbiddenTerms` para
+  autorreferencias): rechaza afirmaciones directas no hedgeadas de causas
+  agronómicas (`hay estrés hídrico`, `existe compactación`, `la causa es...`,
+  `el problema es...`, `se debe a...`) sin bloquear el mismo vocabulario
+  cuando aparece hedgeado (`podría estar asociado a estrés hídrico`,
+  `validar si existe compactación`). Es un chequeo acotado a patrones
+  concretos, no un detector de hedging general — si el texto es dudoso pero
+  no matchea ninguno de esos patrones, se deja pasar (el prompt es la
+  primera línea de defensa).
+- La `promptVersion` nueva (`technical-verdict-v1.1`, no `v2`: mismo
+  contrato/schema de la tool, solo cambia la política de redacción) aplica
+  únicamente a veredictos nuevos. Los veredictos ya persistidos con
+  `promptVersion="technical-verdict-v1"` no se regeneran — quedan
+  identificables contra la política de redacción anterior.

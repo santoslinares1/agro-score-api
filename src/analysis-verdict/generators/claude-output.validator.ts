@@ -48,6 +48,46 @@ function containsForbiddenTerms(value: string): boolean {
   return FORBIDDEN_TERM_PATTERNS.some((pattern) => pattern.test(value));
 }
 
+/**
+ * PR 14A: defensa en profundidad detrás de la regla de lenguaje hipotético del prompt (ver
+ * buildSystemPrompt en technical-verdict-prompt.ts) — igual criterio que FORBIDDEN_TERM_PATTERNS
+ * arriba: no confiar ciegamente en que el prompt alcance.
+ *
+ * Deliberadamente acotado a los patrones concretos pedidos por producto, no un detector de
+ * hedging genérico (eso requeriría NLP real y generaría falsos positivos impredecibles). Mismo
+ * criterio que \bia\b más abajo: prefiere dejar pasar un caso dudoso antes que rechazar un
+ * veredicto por lo demás correcto.
+ *
+ * Sustantivos que solo se prohíben en afirmación directa ("hay X", "presenta X", "tiene X", o
+ * "existe X" sin el condicional "si existe" antes) — en forma hedgeada ("podría estar asociado a
+ * estrés hídrico", "validar si existe compactación") son exactamente el lenguaje que el prompt
+ * pide usar, así que nunca se bloquean como mención bare.
+ */
+const ASSERTIVE_CLAIM_NOUNS =
+  '(estrés\\s+hídrico|compactación|plagas?|enfermedad(es)?|deficiencias?\\s+nutricional(es)?|falta\\s+de\\s+nutrientes)';
+
+const UNHEDGED_CLAIM_PATTERNS = [
+  new RegExp(`\\b(hay|presenta|tiene)\\s+${ASSERTIVE_CLAIM_NOUNS}\\b`, 'i'),
+  new RegExp(`\\bexiste\\s+${ASSERTIVE_CLAIM_NOUNS}\\b`, 'i'),
+  // "déficit hídrico"/"déficit de humedad" se prohíben como mención bare (no solo en afirmación
+  // directa): el objetivo es que Claude use directamente vocabulario más prudente
+  // ("disponibilidad hídrica", "diferencias de humedad"), no que hedgee esa frase en particular.
+  /\bdéficit\s+(hídrico|de\s+humedad)\b/i,
+  /\bla\s+causa\s+es\b/i,
+  /\bel\s+problema\s+es\b/i,
+  /\bse\s+debe\s+a\b/i,
+];
+
+// Condicionales que vuelven prudente una afirmación que de otra forma matchearía arriba ("si
+// existe compactación", "si hay plaga") — se remueven del texto antes de chequear, para no
+// generar falsos positivos con el lenguaje hedgeado que el prompt pide.
+const HEDGE_LEAD_IN_PATTERN = /\bsi\s+(existe|hay|presenta|tiene)\b/gi;
+
+function containsUnhedgedCausalClaim(value: string): boolean {
+  const withoutHedges = value.replace(HEDGE_LEAD_IN_PATTERN, ' ');
+  return UNHEDGED_CLAIM_PATTERNS.some((pattern) => pattern.test(withoutHedges));
+}
+
 function clampString(value: string, maxLength: number): string {
   const trimmed = value.trim();
   return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
@@ -80,6 +120,8 @@ function clampStringArray(value: unknown, maxItems: number): string[] {
  * - `summary` falta, no es string, o queda vacío tras trim;
  * - el texto (summary o cualquier item de los arrays) menciona Claude/IA/Anthropic/chatbot —
  *   ver FORBIDDEN_TERM_PATTERNS.
+ * - el texto afirma una causa agronómica como hecho en vez de como hipótesis (PR 14A) — ver
+ *   UNHEDGED_CLAIM_PATTERNS / containsUnhedgedCausalClaim.
  * Los arrays (keyFindings/possibleCauses/recommendations/limitations) son más tolerantes: si
  * faltan, no son array, o traen items no-string, se normalizan a lo que sí sea válido en vez de
  * fallar — un array mal formado no es motivo para descartar un veredicto por lo demás válido.
@@ -130,6 +172,12 @@ export function validateAndNormalizeGeneratedVerdict(
   if (containsForbiddenTerms(allText)) {
     throw new Error(
       'Claude mencionó un término prohibido (Claude/IA/Anthropic/chatbot) en el texto generado.',
+    );
+  }
+
+  if (containsUnhedgedCausalClaim(allText)) {
+    throw new Error(
+      'Claude usó lenguaje demasiado afirmativo sobre una causa agronómica (debe hablar en hipótesis, no en certezas).',
     );
   }
 
