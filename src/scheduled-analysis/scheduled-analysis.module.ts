@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { AnalysisModule } from '../analysis/analysis.module';
+import { AnalysisVerdictModule } from '../analysis-verdict/analysis-verdict.module';
 import { EmailModule } from '../email/email.module';
 import { FieldsModule } from '../fields/fields.module';
 import { UsersModule } from '../users/users.module';
@@ -27,9 +28,14 @@ import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.servic
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([FieldAnalysisSchedule, ScheduledAnalysisRun, WeeklyAnalysisSnapshot]),
+    TypeOrmModule.forFeature([
+      FieldAnalysisSchedule,
+      ScheduledAnalysisRun,
+      WeeklyAnalysisSnapshot,
+    ]),
     FieldsModule,
     AnalysisModule,
+    AnalysisVerdictModule,
     UsersModule,
     EmailModule,
   ],
@@ -40,6 +46,10 @@ import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.servic
     ScheduledAnalysisScheduler,
     WeeklyAnalysisSnapshotService,
   ],
-  exports: [FieldAnalysisScheduleService, ScheduledAnalysisRunnerService, WeeklyAnalysisSnapshotService],
+  exports: [
+    FieldAnalysisScheduleService,
+    ScheduledAnalysisRunnerService,
+    WeeklyAnalysisSnapshotService,
+  ],
 })
 export class ScheduledAnalysisModule {}

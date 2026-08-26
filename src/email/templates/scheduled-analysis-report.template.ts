@@ -1,5 +1,10 @@
 import { escapeHtml } from '../email.util';
 import type { WeeklySnapshotDataQuality } from '../../scheduled-analysis/entities/weekly-analysis-snapshot.entity';
+import {
+  confidenceLabel,
+  verdictLabel,
+} from '../../analysis-verdict/analysis-verdict-labels';
+import type { AnalysisTechnicalVerdictResponse } from '../../analysis-verdict/dto/analysis-technical-verdict.dto';
 import type { EmailContent } from './invitation.template';
 
 export interface ScheduledAnalysisEmailParams {
@@ -15,6 +20,131 @@ export interface ScheduledAnalysisEmailParams {
   hasNdmiImage: boolean;
   hasImageSeries: boolean;
   summary: string[];
+  /**
+   * PR 12A: veredicto ya persistido para el Analysis de esta semana (nunca se regenera acá —
+   * ver ScheduledAnalysisRunnerService.sendCompletionEmail). undefined/null omite la sección por
+   * completo; generator/promptVersion/generatedAt/errorMessage nunca se renderizan, aunque vengan
+   * en el objeto — ver buildTechnicalVerdictHtml/buildTechnicalVerdictText.
+   */
+  technicalVerdict?: AnalysisTechnicalVerdictResponse | null;
+}
+
+const VERDICT_DISCLAIMER =
+  'Veredicto técnico generado automáticamente a partir del análisis satelital. Debe validarse con observación en campo.';
+
+const VERDICT_FAILED_NOTICE =
+  'El análisis satelital finalizó correctamente, pero no se pudo generar el veredicto técnico automático.';
+
+function htmlList(title: string, items: string[]): string {
+  if (!items.length) {
+    return '';
+  }
+
+  const itemsHtml = items
+    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .join('');
+
+  return (
+    `<p style="font-weight: bold; margin: 12px 0 4px; font-size: 13px;">${title}</p>` +
+    `<ul style="padding-left: 20px; margin: 0; color: #374151; font-size: 13px;">${itemsHtml}</ul>`
+  );
+}
+
+function textList(title: string, items: string[]): string[] {
+  if (!items.length) {
+    return [];
+  }
+
+  return ['', `${title}:`, ...items.map((item) => `- ${item}`)];
+}
+
+/**
+ * PR 12A: mismos estados/copy que analysis-result.component.ts (PR 11C) y
+ * report-pdf.service.ts (PR 11D) — 'generated' arma la sección completa, 'failed' un aviso sobrio
+ * no bloqueante, y null/undefined/'pending' omiten la sección entera (nunca se manda un mail con
+ * un estado "esperando" — para entonces el runner ya decidió mandar sin veredicto, ver
+ * ScheduledAnalysisRunnerService.isWithinVerdictWaitWindow). Nunca renderiza generator,
+ * promptVersion, generatedAt ni errorMessage, aunque estén en el objeto recibido.
+ */
+function buildTechnicalVerdictHtml(
+  technicalVerdict: AnalysisTechnicalVerdictResponse | null | undefined,
+): string {
+  if (!technicalVerdict || technicalVerdict.status === 'pending') {
+    return '';
+  }
+
+  if (technicalVerdict.status === 'failed') {
+    return `
+      <p style="font-weight: bold; margin-bottom: 4px;">Veredicto técnico</p>
+      <p style="font-size: 13px; color: #92400e; background-color: #fef9c3; padding: 10px 12px; border-radius: 8px; margin: 0 0 20px;">
+        ${escapeHtml(VERDICT_FAILED_NOTICE)}
+      </p>
+    `;
+  }
+
+  if (technicalVerdict.status !== 'generated') {
+    return '';
+  }
+
+  const confidence = confidenceLabel(technicalVerdict.confidence);
+  const summaryHtml = technicalVerdict.summary
+    ? `<p style="margin: 0 0 4px; color: #374151;">${escapeHtml(technicalVerdict.summary)}</p>`
+    : '';
+
+  return `
+    <p style="font-weight: bold; margin-bottom: 4px;">Veredicto técnico</p>
+    <p style="font-size: 13px; color: #374151; margin: 0 0 8px;">
+      Estado: <strong>${escapeHtml(verdictLabel(technicalVerdict.verdict))}</strong>${
+        confidence
+          ? ` &middot; Confianza: <strong>${escapeHtml(confidence)}</strong>`
+          : ''
+      }
+    </p>
+    ${summaryHtml}
+    ${htmlList('Hallazgos principales', technicalVerdict.keyFindings)}
+    ${htmlList('Posibles causas', technicalVerdict.possibleCauses)}
+    ${htmlList('Recomendaciones', technicalVerdict.recommendations)}
+    ${htmlList('Limitaciones', technicalVerdict.limitations)}
+    <p style="font-size: 12px; color: #6b7280; margin: 12px 0 20px;">${escapeHtml(VERDICT_DISCLAIMER)}</p>
+  `;
+}
+
+function buildTechnicalVerdictText(
+  technicalVerdict: AnalysisTechnicalVerdictResponse | null | undefined,
+): string[] {
+  if (!technicalVerdict || technicalVerdict.status === 'pending') {
+    return [];
+  }
+
+  if (technicalVerdict.status === 'failed') {
+    return ['', 'Veredicto técnico:', VERDICT_FAILED_NOTICE];
+  }
+
+  if (technicalVerdict.status !== 'generated') {
+    return [];
+  }
+
+  const confidence = confidenceLabel(technicalVerdict.confidence);
+  const lines = [
+    '',
+    'Veredicto técnico:',
+    `Estado: ${verdictLabel(technicalVerdict.verdict)}${confidence ? ` · Confianza: ${confidence}` : ''}`,
+  ];
+
+  if (technicalVerdict.summary) {
+    lines.push('', technicalVerdict.summary);
+  }
+
+  lines.push(
+    ...textList('Hallazgos principales', technicalVerdict.keyFindings),
+    ...textList('Posibles causas', technicalVerdict.possibleCauses),
+    ...textList('Recomendaciones', technicalVerdict.recommendations),
+    ...textList('Limitaciones', technicalVerdict.limitations),
+    '',
+    VERDICT_DISCLAIMER,
+  );
+
+  return lines;
 }
 
 const DATA_QUALITY_LABEL: Record<WeeklySnapshotDataQuality, string> = {
@@ -43,7 +173,9 @@ function availabilityLabel(available: boolean): string {
  * (dataQualityStatus). El texto de `summary` ya viene armado y honesto desde
  * compareWeeklySnapshots — este template solo lo renderiza, nunca inventa contenido nuevo.
  */
-export function buildScheduledAnalysisEmail(params: ScheduledAnalysisEmailParams): EmailContent {
+export function buildScheduledAnalysisEmail(
+  params: ScheduledAnalysisEmailParams,
+): EmailContent {
   const {
     userName,
     fieldName,
@@ -57,6 +189,7 @@ export function buildScheduledAnalysisEmail(params: ScheduledAnalysisEmailParams
     hasNdmiImage,
     hasImageSeries,
     summary,
+    technicalVerdict,
   } = params;
   const greetingName = userName?.trim() ? userName.trim() : null;
 
@@ -65,12 +198,18 @@ export function buildScheduledAnalysisEmail(params: ScheduledAnalysisEmailParams
   const safeFieldName = escapeHtml(fieldName);
   const safeAnalysisUrl = escapeHtml(analysisUrl);
   const safeReportUrl = escapeHtml(reportUrl);
-  const htmlGreeting = greetingName ? `Hola ${escapeHtml(greetingName)},` : 'Hola,';
+  const htmlGreeting = greetingName
+    ? `Hola ${escapeHtml(greetingName)},`
+    : 'Hola,';
   const textGreeting = greetingName ? `Hola ${greetingName},` : 'Hola,';
   const weekLabel = `${formatDate(weekStart)} — ${formatDate(weekEnd)}`;
   const qualityLabel = DATA_QUALITY_LABEL[dataQualityStatus];
 
-  const summaryHtml = summary.map((line) => `<li>${escapeHtml(line)}</li>`).join('');
+  const summaryHtml = summary
+    .map((line) => `<li>${escapeHtml(line)}</li>`)
+    .join('');
+  const technicalVerdictHtml = buildTechnicalVerdictHtml(technicalVerdict);
+  const technicalVerdictTextLines = buildTechnicalVerdictText(technicalVerdict);
 
   const html = `
     <div style="font-family: Arial, Helvetica, sans-serif; color: #1f2937; line-height: 1.6; max-width: 480px;">
@@ -80,6 +219,8 @@ export function buildScheduledAnalysisEmail(params: ScheduledAnalysisEmailParams
 
       <p style="font-weight: bold; margin-bottom: 4px;">Resumen</p>
       <ul style="padding-left: 20px; margin: 0 0 20px;">${summaryHtml}</ul>
+
+      ${technicalVerdictHtml}
 
       <p style="font-weight: bold; margin-bottom: 4px;">Disponibilidad de datos</p>
       <ul style="padding-left: 20px; margin: 0 0 20px; color: #374151;">
@@ -118,6 +259,7 @@ export function buildScheduledAnalysisEmail(params: ScheduledAnalysisEmailParams
     '',
     'Resumen:',
     ...summary.map((line) => `- ${line}`),
+    ...technicalVerdictTextLines,
     '',
     'Disponibilidad de datos:',
     `- RGB: ${availabilityLabel(hasRgbImage)}`,

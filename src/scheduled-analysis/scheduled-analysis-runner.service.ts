@@ -4,6 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { LessThanOrEqual, Repository } from 'typeorm';
 
 import { AnalysisService } from '../analysis/analysis.service';
+import { AnalysisVerdictService } from '../analysis-verdict/analysis-verdict.service';
 import { EmailService } from '../email/email.service';
 import { FieldsService } from '../fields/fields.service';
 import { UsersService } from '../users/users.service';
@@ -11,10 +12,22 @@ import { FieldAnalysisSchedule } from './entities/field-analysis-schedule.entity
 import { ScheduledAnalysisRun } from './entities/scheduled-analysis-run.entity';
 import { WeeklyAnalysisSnapshot } from './entities/weekly-analysis-snapshot.entity';
 import { computeScheduledAnalysisDateRange } from './scheduled-analysis-date-range.util';
-import { computeNextRunAt, resolveScheduledForDate } from './schedule-time.util';
+import {
+  computeNextRunAt,
+  resolveScheduledForDate,
+} from './schedule-time.util';
 import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.service';
 
 const ERROR_MESSAGE_MAX_LENGTH = 500;
+
+// PR 12A: ventana de gracia para esperar a que AnalysisVerdictService termine de generar (o de
+// fallar) el veredicto técnico antes de mandar el mail sin esa sección. generateAndPersist corre
+// best-effort DESPUÉS de que Analysis pasa a 'Finalizado' (ver
+// AnalysisService.processFieldAnalysisInBackground) — no hay ningún hook que avise cuándo
+// termina, así que reconcile (@Interval cada 2 min) puede encontrar el run 'completed' antes de
+// que exista la fila en analysis_technical_verdicts. Pasados 10 minutos sin veredicto, se manda
+// el mail igual: mejor un reporte semanal sin esa sección que uno que nunca sale.
+const VERDICT_WAIT_WINDOW_MS = 10 * 60 * 1000;
 
 /**
  * Motor de ejecución de Fase 4A. Reutiliza el pipeline manual TAL CUAL — nunca duplica lógica de
@@ -38,6 +51,7 @@ export class ScheduledAnalysisRunnerService {
     private readonly emailService: EmailService,
     private readonly configService: ConfigService,
     private readonly weeklySnapshotService: WeeklyAnalysisSnapshotService,
+    private readonly analysisVerdictService: AnalysisVerdictService,
   ) {}
 
   // --- Dispatcher: busca schedules vencidos y los dispara ------------------------------------
@@ -67,7 +81,10 @@ export class ScheduledAnalysisRunnerService {
    * nextRunAt al final — así el dispatcher nunca vuelve a seleccionar el mismo schedule en el
    * próximo tick, sin importar si esta llamada creó una corrida nueva o reencontró una existente.
    */
-  async triggerRun(schedule: FieldAnalysisSchedule, now: Date): Promise<ScheduledAnalysisRun> {
+  async triggerRun(
+    schedule: FieldAnalysisSchedule,
+    now: Date,
+  ): Promise<ScheduledAnalysisRun> {
     const scheduledFor = resolveScheduledForDate(now, schedule);
 
     const existingRun = await this.runRepository.findOne({
@@ -83,7 +100,9 @@ export class ScheduledAnalysisRunnerService {
     // auditoría predeploy) para TODO trigger de scheduled-analysis, automático o "Ejecutar
     // ahora". El flujo manual (field-detail.component.ts → POST /analysis/field/:fieldId) no se
     // toca: sigue mandando las fechas que el usuario elige en su propio modal.
-    const dateRange = computeScheduledAnalysisDateRange(now, { timezone: schedule.timezone });
+    const dateRange = computeScheduledAnalysisDateRange(now, {
+      timezone: schedule.timezone,
+    });
     this.logger.log(
       `[scheduled-analysis] fieldId=${schedule.fieldId} ventana móvil ${dateRange.startDate} → ${dateRange.endDate} (${dateRange.source}).`,
     );
@@ -113,7 +132,10 @@ export class ScheduledAnalysisRunnerService {
     let run = created.run;
 
     try {
-      const field = await this.fieldsService.findOne(schedule.fieldId, schedule.userId);
+      const field = await this.fieldsService.findOne(
+        schedule.fieldId,
+        schedule.userId,
+      );
 
       // FIX CRÍTICO (auditoría predeploy): AnalysisService.runFieldAnalysis puede devolver
       // silenciosamente un Analysis 'Procesando' preexistente (ej. disparado manualmente segundos
@@ -123,7 +145,10 @@ export class ScheduledAnalysisRunnerService {
       // reintentable la próxima semana que un email atado al análisis de otro (con flags que no
       // son necesariamente las del informe completo). Reusa AnalysisService.findByField, ya
       // público y ya usado por el historial de diagnósticos — no toca AnalysisService.
-      const history = await this.analysisService.findByField(schedule.fieldId, schedule.userId);
+      const history = await this.analysisService.findByField(
+        schedule.fieldId,
+        schedule.userId,
+      );
 
       if (history.some((item) => item.status === 'Procesando')) {
         throw new Error(
@@ -179,7 +204,10 @@ export class ScheduledAnalysisRunnerService {
     return run;
   }
 
-  private async advanceNextRunAt(schedule: FieldAnalysisSchedule, from: Date): Promise<void> {
+  private async advanceNextRunAt(
+    schedule: FieldAnalysisSchedule,
+    from: Date,
+  ): Promise<void> {
     const nextRunAt = computeNextRunAt(from, schedule);
     await this.scheduleRepository.update(schedule.id, { nextRunAt });
   }
@@ -202,7 +230,9 @@ export class ScheduledAnalysisRunnerService {
         throw error;
       }
 
-      const existing = await this.runRepository.findOne({ where: { scheduleId, scheduledFor } });
+      const existing = await this.runRepository.findOne({
+        where: { scheduleId, scheduledFor },
+      });
 
       if (!existing) {
         throw error;
@@ -214,7 +244,10 @@ export class ScheduledAnalysisRunnerService {
 
   private isUniqueViolation(error: unknown): boolean {
     return Boolean(
-      error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === '23505',
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: string }).code === '23505',
     );
   }
 
@@ -237,7 +270,9 @@ export class ScheduledAnalysisRunnerService {
       try {
         await this.reconcileRun(run);
       } catch (error) {
-        this.logger.error(`[scheduled-analysis] Fallo reconciliando run ${run.id}: ${this.describe(error)}`);
+        this.logger.error(
+          `[scheduled-analysis] Fallo reconciliando run ${run.id}: ${this.describe(error)}`,
+        );
       }
     }
   }
@@ -296,11 +331,14 @@ export class ScheduledAnalysisRunnerService {
       // próximo tick de reconciliación no la vuelva a intentar (el query de arriba solo busca
       // 'processing'/'completed' — 'failed' queda afuera para siempre, sin necesitar una columna
       // nueva). schedule.lastStatus no se toca: el análisis en sí terminó bien.
-      const schedule = await this.scheduleRepository.findOne({ where: { id: run.scheduleId } });
+      const schedule = await this.scheduleRepository.findOne({
+        where: { id: run.scheduleId },
+      });
 
       if (!schedule || !schedule.enabled) {
         run.status = 'failed';
-        run.errorMessage = 'Envío de email omitido: el seguimiento semanal fue desactivado antes de poder enviarlo.';
+        run.errorMessage =
+          'Envío de email omitido: el seguimiento semanal fue desactivado antes de poder enviarlo.';
         await this.runRepository.save(run);
         return;
       }
@@ -318,11 +356,29 @@ export class ScheduledAnalysisRunnerService {
     // Analysis — si todavía no existe (createFromAnalysis falló en un tick anterior, ver
     // reconcileRun), no inventamos un email genérico: se reintenta en el próximo ciclo, mismo
     // mecanismo que una falla transitoria de Resend.
-    const snapshot = await this.weeklySnapshotService.findByScheduledRunId(run.id);
+    const snapshot = await this.weeklySnapshotService.findByScheduledRunId(
+      run.id,
+    );
 
     if (!snapshot) {
       this.logger.error(
         `[scheduled-analysis] No se pudo enviar el email: todavía no hay snapshot semanal para runId=${run.id}. Se reintenta en el próximo ciclo.`,
+      );
+      return;
+    }
+
+    // PR 12A: solo LEE lo que AnalysisVerdictService ya generó y persistió al finalizar el
+    // análisis (ver AnalysisService.processFieldAnalysisInBackground) — nunca llama a
+    // generateAndPersist ni a Claude desde acá. Si todavía no existe fila y el run terminó hace
+    // poco, se espera al próximo ciclo de reconcile en vez de mandar un mail incompleto de una vez.
+    const technicalVerdict =
+      await this.analysisVerdictService.findResponseByAnalysisId(
+        run.analysisId,
+      );
+
+    if (!technicalVerdict && this.isWithinVerdictWaitWindow(run)) {
+      this.logger.log(
+        `[scheduled-analysis] Esperando el veredicto técnico antes de mandar el email (runId=${run.id}). Se reintenta en el próximo ciclo.`,
       );
       return;
     }
@@ -333,7 +389,9 @@ export class ScheduledAnalysisRunnerService {
     ]);
 
     if (!user) {
-      this.logger.error(`[scheduled-analysis] No se pudo enviar el email: usuario ${run.userId} no existe (runId=${run.id}).`);
+      this.logger.error(
+        `[scheduled-analysis] No se pudo enviar el email: usuario ${run.userId} no existe (runId=${run.id}).`,
+      );
       return;
     }
 
@@ -361,27 +419,35 @@ export class ScheduledAnalysisRunnerService {
     // "Descargar PDF" de esa página sí funciona — ver docs de Fase 4A / entregable final.
     const analysisUrl = `${baseUrl}/app/analysis/${run.analysisId}`;
     const reportUrl = `${baseUrl}/app/analysis/${run.analysisId}/report`;
-    const comparison = (snapshot.comparisonVsPrevious as { summary?: string[] } | null)?.summary ?? [];
+    const comparison =
+      (snapshot.comparisonVsPrevious as { summary?: string[] } | null)
+        ?.summary ?? [];
 
-    const result = await this.emailService.sendScheduledAnalysisEmail(user.email, {
-      userName: user.fullName,
-      fieldName: field.name,
-      weekStart: snapshot.weekStart,
-      weekEnd: snapshot.weekEnd,
-      analysisUrl,
-      reportUrl,
-      dataQualityStatus: snapshot.dataQualityStatus,
-      hasRgbImage: snapshot.hasRgbImage,
-      hasNdviImage: snapshot.hasNdviImage,
-      hasNdmiImage: snapshot.hasNdmiImage,
-      hasImageSeries: snapshot.hasImageSeries,
-      summary: comparison,
-    });
+    const result = await this.emailService.sendScheduledAnalysisEmail(
+      user.email,
+      {
+        userName: user.fullName,
+        fieldName: field.name,
+        weekStart: snapshot.weekStart,
+        weekEnd: snapshot.weekEnd,
+        analysisUrl,
+        reportUrl,
+        dataQualityStatus: snapshot.dataQualityStatus,
+        hasRgbImage: snapshot.hasRgbImage,
+        hasNdviImage: snapshot.hasNdviImage,
+        hasNdmiImage: snapshot.hasNdmiImage,
+        hasImageSeries: snapshot.hasImageSeries,
+        summary: comparison,
+        technicalVerdict,
+      },
+    );
 
     if (result.sent) {
       run.emailSentAt = new Date();
       await this.runRepository.save(run);
-      await this.scheduleRepository.update(run.scheduleId, { lastStatus: 'completed' });
+      await this.scheduleRepository.update(run.scheduleId, {
+        lastStatus: 'completed',
+      });
     } else {
       this.logger.error(
         `[scheduled-analysis] No se pudo enviar el email de reporte semanal (runId=${run.id}) — se reintenta en el próximo ciclo.`,
@@ -389,12 +455,29 @@ export class ScheduledAnalysisRunnerService {
     }
   }
 
+  /**
+   * PR 12A: usa run.completedAt (seteado en reconcileRun apenas el Analysis llega a
+   * 'Finalizado', ver arriba) en vez de agregar una columna de intentos nueva — es la marca de
+   * tiempo más precisa ya disponible de "cuándo terminó esta corrida en particular". Sin
+   * completedAt (no debería pasar para un run 'completed' real, pero es un dato externo) no hay
+   * forma de medir la espera, así que no bloquea: se manda el mail sin veredicto.
+   */
+  private isWithinVerdictWaitWindow(run: ScheduledAnalysisRun): boolean {
+    if (!run.completedAt) {
+      return false;
+    }
+
+    return Date.now() - run.completedAt.getTime() < VERDICT_WAIT_WINDOW_MS;
+  }
+
   // --- Ejecutar ahora (POST .../analysis-schedule/run-now) -----------------------------------
 
   async runNow(fieldId: string, userId: string): Promise<ScheduledAnalysisRun> {
     await this.fieldsService.findOne(fieldId, userId);
 
-    const schedule = await this.scheduleRepository.findOne({ where: { fieldId } });
+    const schedule = await this.scheduleRepository.findOne({
+      where: { fieldId },
+    });
 
     if (!schedule) {
       throw new BadRequestException(
@@ -406,7 +489,9 @@ export class ScheduledAnalysisRunnerService {
     // activa — un schedule desactivado (creado y después apagado) igual podía disparar una
     // corrida y terminar mandando un email, contradiciendo lo que el usuario acaba de pedir.
     if (!schedule.enabled) {
-      throw new BadRequestException('El análisis semanal está desactivado para este campo.');
+      throw new BadRequestException(
+        'El análisis semanal está desactivado para este campo.',
+      );
     }
 
     // triggerRun ya dedupea por (scheduleId, scheduledFor) — mismo mecanismo que usa el
