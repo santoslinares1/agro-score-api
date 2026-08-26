@@ -14,6 +14,7 @@ import { ScheduledAnalysisRun } from '../scheduled-analysis/entities/scheduled-a
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { UsersModule } from '../users/users.module';
+import { WeeklyTechnicalVerdictModule } from '../weekly-technical-verdict/weekly-technical-verdict.module';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 
@@ -50,6 +51,14 @@ import { AdminService } from './admin.service';
  * repositorio directo, no ScheduledAnalysisModule (que además arrastra
  * EmailModule/PythonWorkerModule/etc. innecesarios solo para leer dos
  * tablas de solo lectura).
+ *
+ * PR 16D: weeklyTechnicalVerdict es la ÚNICA excepción al criterio de arriba — importa
+ * WeeklyTechnicalVerdictModule (liviano: solo TypeOrmModule.forFeature + sus 2 generadores, sin
+ * EmailModule/PythonWorkerModule) y reusa WeeklyTechnicalVerdictService.findResponsesByScheduledRunIds
+ * en vez de inyectar el repositorio directo. A diferencia de AnalysisTechnicalVerdict (donde
+ * findResponseByAnalysisId no servía porque el shape público omite errorMessage, ver PR 13A),
+ * WeeklyTechnicalVerdictResponse ya incluye errorMessage por diseño desde PR 16B — no hay motivo
+ * real para duplicar la query/el mapeo entidad→DTO que el servicio ya resuelve.
  */
 @Module({
   imports: [
@@ -57,6 +66,7 @@ import { AdminService } from './admin.service';
     PythonWorkerModule,
     AuditLogModule,
     EmailModule,
+    WeeklyTechnicalVerdictModule,
     TypeOrmModule.forFeature([
       Field,
       FieldLot,

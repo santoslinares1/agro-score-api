@@ -1,14 +1,16 @@
 # Weekly Technical Verdict / Diagnóstico semanal
 
 PR 16B — backend de persistencia y generación del **diagnóstico semanal**
-(`weeklyTechnicalVerdict`). PR 16C lo muestra en el mail semanal. Ver
-`docs/technical-verdict-claude.md` para el veredicto individual
-(`technicalVerdict`) — son dos features relacionadas pero deliberadamente
-separadas (ver PR 16A, la auditoría/diseño que precede a este PR).
+(`weeklyTechnicalVerdict`). PR 16C lo muestra en el mail semanal. PR 16D lo
+muestra en Admin Programados. Ver `docs/technical-verdict-claude.md` para
+el veredicto individual (`technicalVerdict`) — son dos features
+relacionadas pero deliberadamente separadas (ver PR 16A, la
+auditoría/diseño que precede a este PR).
 
-**Estado actual: backend + mail semanal.** El diagnóstico semanal ya se ve
-en el mail (PR 16C). Todavía no hay nada en admin Programados ni en la web
-pública — eso es PR 16D y, opcionalmente, PR 16E.
+**Estado actual: backend + mail semanal + admin Programados.** El
+diagnóstico semanal ya se ve en el mail (PR 16C) y en
+Admin → Programados (PR 16D, agro-score-admin). Todavía no hay nada en la
+web pública — eso es PR 16E, opcional.
 
 ## Diferencia con `technicalVerdict`
 
@@ -205,16 +207,59 @@ duplicados a propósito (mismo criterio de no acoplar módulos hermanos ya
 usado en todo `weekly-technical-verdict`); `trendLabel` es nuevo, sin
 equivalente en el veredicto individual.
 
-## Qué NO hace este PR (16B/16C)
+## Admin Programados (PR 16D)
 
-- No hay pantalla admin con esto todavía (PR 16D).
-- No hay nada visible en la web pública (PR 16E, si aplica).
+`GET /admin/scheduled-analysis` (`AdminService.listScheduledAnalysis`)
+suma `weeklyTechnicalVerdict` a cada item, resuelto en una cuarta consulta
+en lote (batch, nunca N+1): `WeeklyTechnicalVerdictService.
+findResponsesByScheduledRunIds(scheduledRunIds)`, donde `scheduledRunIds`
+son los `id` de `latestRun` de cada schedule de la página — una sola
+query `IN` sin importar cuántos schedules haya.
+
+- **Excepción deliberada al criterio "repositorio directo"** que usa el
+  resto de `AdminService` (`AnalysisTechnicalVerdict`, `Field`,
+  `ScheduledAnalysisRun`, etc.): acá sí se importa `WeeklyTechnicalVerdictModule`
+  y se reusa `WeeklyTechnicalVerdictService` en vez de inyectar el
+  repositorio a mano. Motivo: `WeeklyTechnicalVerdictResponse` (el shape
+  que el servicio ya devuelve) **ya incluye `errorMessage`** por diseño
+  desde PR 16B — a diferencia de `AnalysisTechnicalVerdictResponse` (el
+  contrato público del veredicto individual, que sí lo omite y por eso
+  forzó el bypass del repositorio en PR 13A), acá no hay un shape público
+  más angosto del que distinguirse todavía, así que reusar el servicio es
+  simplemente no reinventar la query/el mapeo entidad→DTO que ya existen.
+- Se resuelve por `scheduledRunId` (no por `snapshotId`): `WeeklyTechnicalVerdict`
+  ya denormaliza `scheduledRunId` (mismo criterio que `analysisId`, ver la
+  entidad en PR 16B), así que no hace falta pasar por
+  `WeeklyAnalysisSnapshot` primero.
+- Shape: se reusa `WeeklyTechnicalVerdictResponse` tal cual (no un tipo
+  `Admin*` separado, a diferencia de `AdminAnalysisTechnicalVerdict`) — ver
+  razón arriba. Admin ve `generator`/`promptVersion`/`errorMessage` sin
+  restricciones, igual que en el veredicto individual.
+
+En agro-score-admin, la pantalla "Programados" (`/scheduled-analysis`)
+suma una sección "Diagnóstico semanal" al panel expandible de cada fila,
+entre "Veredicto técnico" y "Mail" — mismo componente/CSS ya existentes de
+PR 13A/13B (`.verdict-panel__summary`, `.verdict-panel__section-title`,
+`.verdict-panel__tech-data`, `.verdict-panel__error`), sin CSS nuevo.
+Estados: `generated` (panel completo), `failed` (badge + "Error técnico" en
+rojo con el `errorMessage`), `null` ("Diagnóstico semanal no disponible."
+— admin sí necesita ver la ausencia, a diferencia del mail que la omite).
+`trendLabel`/`trendTone` nuevos en
+`src/app/shared/utils/technical-verdict-labels.ts`; `AdminWeeklyTechnicalVerdict`
+en `scheduled-analysis.model.ts` reusa los enums de `AnalysisTechnicalVerdict`
+(mismo criterio que el propio modelo ya hacía con `technicalVerdict`, a
+diferencia del backend que sí duplica esos tipos entre módulos).
+
+## Qué NO hace este PR (16B/16C/16D)
+
+- No hay nada visible en la web pública todavía (PR 16E, si aplica).
 - No hay endpoint manual para disparar/regenerar un diagnóstico semanal.
-- No hay botón de ningún tipo.
+- No hay botón de ningún tipo, ni en el mail ni en admin.
 - No se regeneran diagnósticos semanales existentes — un cambio de
   provider/prompt solo afecta a los que se generen después del cambio.
-- El mail nunca llama a `generateAndPersist` ni a Claude — solo lee lo ya
-  persistido por el tick de `reconcileRun` que generó el snapshot.
+- Ni el mail ni admin llaman a `generateAndPersist` ni a Claude — ambos
+  solo leen lo ya persistido por el tick de `reconcileRun` que generó el
+  snapshot.
 
 ## Archivos clave
 
@@ -240,6 +285,14 @@ src/scheduled-analysis/scheduled-analysis-runner.service.ts  — enganche en rec
 src/scheduled-analysis/weekly-analysis-snapshot-comparison.util.ts  — SCORE_STABLE_THRESHOLD/INDEX_STABLE_THRESHOLD exportados
 
 src/email/templates/scheduled-analysis-report.template.ts  — sección "Diagnóstico semanal" (PR 16C)
+
+src/admin/admin.service.ts  — listScheduledAnalysis suma weeklyTechnicalVerdict (batch, PR 16D)
+src/admin/admin.module.ts   — importa WeeklyTechnicalVerdictModule (PR 16D)
+src/admin/dto/admin-scheduled-analysis.dto.ts  — AdminScheduledAnalysisItem.weeklyTechnicalVerdict (PR 16D)
+
+agro-score-admin/src/app/core/models/scheduled-analysis.model.ts       — AdminWeeklyTechnicalVerdict (PR 16D)
+agro-score-admin/src/app/shared/utils/technical-verdict-labels.ts      — trendLabel/trendTone (PR 16D)
+agro-score-admin/src/app/features/scheduled-analysis/scheduled-analysis.component.{ts,html}  — sección "Diagnóstico semanal" (PR 16D)
 
 .env.example — WEEKLY_TECHNICAL_VERDICT_PROVIDER
 docs/weekly-technical-verdict.md — este documento

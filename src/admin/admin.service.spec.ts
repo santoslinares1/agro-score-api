@@ -1,4 +1,8 @@
-import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+} from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
@@ -7,7 +11,10 @@ import { In } from 'typeorm';
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
 import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
-import { AuditActorContext, AuditLogService } from '../audit-log/audit-log.service';
+import {
+  AuditActorContext,
+  AuditLogService,
+} from '../audit-log/audit-log.service';
 import { AdminAuditLog } from '../audit-log/entities/admin-audit-log.entity';
 import { EmailService } from '../email/email.service';
 import { Field } from '../fields/entities/field.entity';
@@ -20,6 +27,8 @@ import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
 import { UserRole } from '../users/user-role.enum';
 import { UsersService } from '../users/users.service';
+import { WeeklyTechnicalVerdictService } from '../weekly-technical-verdict/weekly-technical-verdict.service';
+import { WeeklyTechnicalVerdictResponse } from '../weekly-technical-verdict/dto/weekly-technical-verdict.dto';
 import { AdminService } from './admin.service';
 
 function buildUser(overrides: Partial<User> = {}): User {
@@ -37,7 +46,9 @@ function buildUser(overrides: Partial<User> = {}): User {
   };
 }
 
-function buildAccessRequest(overrides: Partial<AccessRequest> = {}): AccessRequest {
+function buildAccessRequest(
+  overrides: Partial<AccessRequest> = {},
+): AccessRequest {
   return {
     id: 'access-request-1',
     name: 'Lead de prueba',
@@ -54,10 +65,14 @@ function buildAccessRequest(overrides: Partial<AccessRequest> = {}): AccessReque
     discardedAt: null,
     createdAt: new Date(),
     ...overrides,
-  } as AccessRequest;
+  };
 }
 
-const actor: AuditActorContext = { actorUserId: 'admin-1', ip: '127.0.0.1', userAgent: 'jest' };
+const actor: AuditActorContext = {
+  actorUserId: 'admin-1',
+  ip: '127.0.0.1',
+  userAgent: 'jest',
+};
 
 // Repos que AdminService no ejercita en la mayoría de estos tests — solo
 // necesitan existir como providers para que Nest arme el módulo.
@@ -86,6 +101,9 @@ describe('AdminService', () => {
   let analysisVerdictRepo: ReturnType<typeof noopRepo>;
   let fieldAnalysisScheduleRepo: ReturnType<typeof noopRepo>;
   let scheduledAnalysisRunRepo: ReturnType<typeof noopRepo>;
+  let weeklyTechnicalVerdictService: jest.Mocked<
+    Pick<WeeklyTechnicalVerdictService, 'findResponsesByScheduledRunIds'>
+  >;
 
   beforeEach(async () => {
     accessRequestRepo = noopRepo();
@@ -125,17 +143,23 @@ describe('AdminService', () => {
         {
           provide: EmailService,
           useValue: {
-            sendInvitationEmail: jest
-              .fn()
-              .mockResolvedValue({ sent: true, provider: 'resend', dryRun: true }),
-            sendPasswordResetEmail: jest
-              .fn()
-              .mockResolvedValue({ sent: true, provider: 'resend', dryRun: true }),
+            sendInvitationEmail: jest.fn().mockResolvedValue({
+              sent: true,
+              provider: 'resend',
+              dryRun: true,
+            }),
+            sendPasswordResetEmail: jest.fn().mockResolvedValue({
+              sent: true,
+              provider: 'resend',
+              dryRun: true,
+            }),
           },
         },
         {
           provide: PythonWorkerService,
-          useValue: { checkHealth: jest.fn().mockResolvedValue({ status: 'ok' }) },
+          useValue: {
+            checkHealth: jest.fn().mockResolvedValue({ status: 'ok' }),
+          },
         },
         {
           provide: ConfigService,
@@ -156,10 +180,27 @@ describe('AdminService', () => {
           provide: getRepositoryToken(ScheduledAnalysisRun),
           useValue: scheduledAnalysisRunRepo,
         },
-        { provide: getRepositoryToken(AccessRequest), useValue: accessRequestRepo },
+        {
+          provide: getRepositoryToken(AccessRequest),
+          useValue: accessRequestRepo,
+        },
         { provide: getRepositoryToken(AdminAuditLog), useValue: noopRepo() },
-        { provide: getRepositoryToken(UserInvitation), useValue: invitationRepo },
-        { provide: getRepositoryToken(PasswordResetToken), useValue: passwordResetRepo },
+        {
+          provide: getRepositoryToken(UserInvitation),
+          useValue: invitationRepo,
+        },
+        {
+          provide: getRepositoryToken(PasswordResetToken),
+          useValue: passwordResetRepo,
+        },
+        {
+          provide: WeeklyTechnicalVerdictService,
+          useValue: {
+            findResponsesByScheduledRunIds: jest
+              .fn()
+              .mockResolvedValue(new Map()),
+          },
+        },
       ],
     }).compile();
 
@@ -169,12 +210,15 @@ describe('AdminService', () => {
     emailService = module.get(EmailService);
     pythonWorkerService = module.get(PythonWorkerService);
     configService = module.get(ConfigService);
+    weeklyTechnicalVerdictService = module.get(WeeklyTechnicalVerdictService);
   });
 
   describe('createUser', () => {
     it('hashea la password, nunca devuelve passwordHash y audita admin.user.created', async () => {
       usersService.findByEmail.mockResolvedValue(null);
-      usersService.create.mockResolvedValue(buildUser({ role: UserRole.ADMIN }));
+      usersService.create.mockResolvedValue(
+        buildUser({ role: UserRole.ADMIN }),
+      );
 
       const result = await service.createUser(
         {
@@ -232,9 +276,13 @@ describe('AdminService', () => {
 
   describe('updateUser — auditoría', () => {
     it('audita admin.user.role_changed cuando cambia el rol', async () => {
-      usersService.findById.mockResolvedValue(buildUser({ role: UserRole.USER }));
+      usersService.findById.mockResolvedValue(
+        buildUser({ role: UserRole.USER }),
+      );
       usersService.countActiveByRole.mockResolvedValue(1);
-      usersService.update.mockResolvedValue(buildUser({ role: UserRole.ADMIN }));
+      usersService.update.mockResolvedValue(
+        buildUser({ role: UserRole.ADMIN }),
+      );
 
       await service.updateUser('user-1', { role: UserRole.ADMIN }, actor);
 
@@ -245,7 +293,9 @@ describe('AdminService', () => {
 
     it('audita admin.user.updated cuando cambian otros campos', async () => {
       usersService.findById.mockResolvedValue(buildUser());
-      usersService.update.mockResolvedValue(buildUser({ fullName: 'Nuevo nombre' }));
+      usersService.update.mockResolvedValue(
+        buildUser({ fullName: 'Nuevo nombre' }),
+      );
 
       await service.updateUser('user-1', { fullName: 'Nuevo nombre' }, actor);
 
@@ -274,7 +324,9 @@ describe('AdminService', () => {
         buildUser({ role: UserRole.OWNER, isActive: true }),
       );
       usersService.countActiveByRole.mockResolvedValue(1);
-      usersService.update.mockResolvedValue(buildUser({ role: UserRole.ADMIN }));
+      usersService.update.mockResolvedValue(
+        buildUser({ role: UserRole.ADMIN }),
+      );
 
       await service.updateUser('user-1', { role: UserRole.ADMIN }, actor);
 
@@ -287,9 +339,9 @@ describe('AdminService', () => {
       );
       usersService.countActiveByRole.mockResolvedValue(0);
 
-      await expect(service.deactivateUser('user-1', actor)).rejects.toBeInstanceOf(
-        BadRequestException,
-      );
+      await expect(
+        service.deactivateUser('user-1', actor),
+      ).rejects.toBeInstanceOf(BadRequestException);
 
       expect(usersService.update).not.toHaveBeenCalled();
     });
@@ -305,7 +357,9 @@ describe('AdminService', () => {
       await service.deactivateUser('user-1', actor);
 
       expect(usersService.countActiveByRole).not.toHaveBeenCalled();
-      expect(usersService.update).toHaveBeenCalledWith('user-1', { isActive: false });
+      expect(usersService.update).toHaveBeenCalledWith('user-1', {
+        isActive: false,
+      });
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'admin.user.deactivated' }),
       );
@@ -316,7 +370,9 @@ describe('AdminService', () => {
     it('setea contactedAt la primera vez que status pasa a contacted', async () => {
       const accessRequest = buildAccessRequest();
       accessRequestRepo.findOne.mockResolvedValue(accessRequest);
-      accessRequestRepo.save.mockImplementation((v: AccessRequest) => Promise.resolve(v));
+      accessRequestRepo.save.mockImplementation((v: AccessRequest) =>
+        Promise.resolve(v),
+      );
 
       const result = await service.updateAccessRequest(
         'access-request-1',
@@ -335,7 +391,9 @@ describe('AdminService', () => {
         contactedAt: alreadyContactedAt,
       });
       accessRequestRepo.findOne.mockResolvedValue(accessRequest);
-      accessRequestRepo.save.mockImplementation((v: AccessRequest) => Promise.resolve(v));
+      accessRequestRepo.save.mockImplementation((v: AccessRequest) =>
+        Promise.resolve(v),
+      );
 
       const result = await service.updateAccessRequest(
         'access-request-1',
@@ -349,7 +407,9 @@ describe('AdminService', () => {
     it('setea discardedAt al pasar a discarded y audita admin.access_request.updated', async () => {
       const accessRequest = buildAccessRequest();
       accessRequestRepo.findOne.mockResolvedValue(accessRequest);
-      accessRequestRepo.save.mockImplementation((v: AccessRequest) => Promise.resolve(v));
+      accessRequestRepo.save.mockImplementation((v: AccessRequest) =>
+        Promise.resolve(v),
+      );
 
       const result = await service.updateAccessRequest(
         'access-request-1',
@@ -376,7 +436,9 @@ describe('AdminService', () => {
     it('crea invitación, marca la solicitud como converted y audita ambas acciones', async () => {
       const accessRequest = buildAccessRequest();
       accessRequestRepo.findOne.mockResolvedValue(accessRequest);
-      accessRequestRepo.save.mockImplementation((v: AccessRequest) => Promise.resolve(v));
+      accessRequestRepo.save.mockImplementation((v: AccessRequest) =>
+        Promise.resolve(v),
+      );
       usersService.findByEmail.mockResolvedValue(null);
       invitationRepo.save.mockImplementation((v: unknown) =>
         Promise.resolve({ id: 'invitation-1', ...(v as object) }),
@@ -397,7 +459,9 @@ describe('AdminService', () => {
         expect.objectContaining({ invitationUrl: expect.any(String) }),
       );
 
-      const actions = auditLogService.record.mock.calls.map((call) => call[0].action);
+      const actions = auditLogService.record.mock.calls.map(
+        (call) => call[0].action,
+      );
       expect(actions).toContain('admin.invitation.created');
       expect(actions).toContain('admin.invitation.email_sent');
       expect(actions).toContain('admin.access_request.converted');
@@ -406,7 +470,9 @@ describe('AdminService', () => {
     it('rechaza si ya existe un usuario con ese email', async () => {
       const accessRequest = buildAccessRequest();
       accessRequestRepo.findOne.mockResolvedValue(accessRequest);
-      usersService.findByEmail.mockResolvedValue(buildUser({ email: accessRequest.email }));
+      usersService.findByEmail.mockResolvedValue(
+        buildUser({ email: accessRequest.email }),
+      );
 
       await expect(
         service.createUserFromAccessRequest('access-request-1', {}, actor),
@@ -470,11 +536,17 @@ describe('AdminService', () => {
         Promise.resolve({ id: 'invitation-1', ...(v as object) }),
       );
 
-      await service.createInvitation({ email: 'nuevo@example.com', role: UserRole.USER }, actor);
+      await service.createInvitation(
+        { email: 'nuevo@example.com', role: UserRole.USER },
+        actor,
+      );
 
       expect(emailService.sendInvitationEmail).toHaveBeenCalledWith(
         'nuevo@example.com',
-        expect.objectContaining({ invitationUrl: expect.any(String), expiresAt: expect.any(Date) }),
+        expect.objectContaining({
+          invitationUrl: expect.any(String),
+          expiresAt: expect.any(Date),
+        }),
       );
 
       const emailSentCall = auditLogService.record.mock.calls.find(
@@ -509,7 +581,10 @@ describe('AdminService', () => {
       usersService.findByEmail.mockResolvedValue(buildUser());
 
       await expect(
-        service.createInvitation({ email: 'user@agroscorelatam.com', role: UserRole.USER }, actor),
+        service.createInvitation(
+          { email: 'user@agroscorelatam.com', role: UserRole.USER },
+          actor,
+        ),
       ).rejects.toBeInstanceOf(ConflictException);
     });
   });
@@ -529,7 +604,9 @@ describe('AdminService', () => {
       expect(result.emailSent).toBe(true);
       expect(result.dryRun).toBe(true);
 
-      const actions = auditLogService.record.mock.calls.map((call) => call[0].action);
+      const actions = auditLogService.record.mock.calls.map(
+        (call) => call[0].action,
+      );
       expect(actions).toContain('admin.password_reset.created');
       expect(actions).toContain('admin.password_reset.email_sent');
     });
@@ -546,7 +623,10 @@ describe('AdminService', () => {
       expect(result).toHaveProperty('resetUrl');
       expect(emailService.sendPasswordResetEmail).toHaveBeenCalledWith(
         user.email,
-        expect.objectContaining({ resetUrl: expect.any(String), expiresAt: expect.any(Date) }),
+        expect.objectContaining({
+          resetUrl: expect.any(String),
+          expiresAt: expect.any(Date),
+        }),
       );
     });
 
@@ -569,19 +649,22 @@ describe('AdminService', () => {
     it('404 si el usuario no existe', async () => {
       usersService.findById.mockResolvedValue(null);
 
-      await expect(service.createPasswordResetToken('missing', actor)).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.createPasswordResetToken('missing', actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 
   describe('mark-reviewed / retry de diagnósticos', () => {
     it('markAnalysisReviewed rechaza analysis que no está en Error', async () => {
-      analysisRepo.findOne.mockResolvedValue({ id: 'a1', status: 'Finalizado' });
+      analysisRepo.findOne.mockResolvedValue({
+        id: 'a1',
+        status: 'Finalizado',
+      });
 
-      await expect(service.markAnalysisReviewed('a1', actor)).rejects.toBeInstanceOf(
-        BadRequestException,
-      );
+      await expect(
+        service.markAnalysisReviewed('a1', actor),
+      ).rejects.toBeInstanceOf(BadRequestException);
     });
 
     it('retryAnalysis incrementa retryCount y audita admin.analysis.retry_requested', async () => {
@@ -608,7 +691,12 @@ describe('AdminService', () => {
       id: 'a1',
       fieldId: 'field-1',
       lotName: null,
-      field: { id: 'field-1', name: 'Campo A', userId: 'user-1', user: { id: 'user-1', email: 'a@x.com', fullName: 'A' } },
+      field: {
+        id: 'field-1',
+        name: 'Campo A',
+        userId: 'user-1',
+        user: { id: 'user-1', email: 'a@x.com', fullName: 'A' },
+      },
       status: 'Finalizado',
       startedAt: new Date(),
       completedAt: new Date(),
@@ -632,7 +720,13 @@ describe('AdminService', () => {
         andWhere: jest.fn(),
         getManyAndCount: jest.fn().mockResolvedValue([items, total]),
       };
-      for (const key of ['leftJoinAndMapOne', 'orderBy', 'skip', 'take', 'andWhere']) {
+      for (const key of [
+        'leftJoinAndMapOne',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+      ]) {
         qb[key].mockReturnValue(qb);
       }
       return qb;
@@ -662,8 +756,12 @@ describe('AdminService', () => {
     it('incluye technicalVerdict por análisis con una única consulta en lote (IN analysisId)', async () => {
       const rowA = buildAnalysisRow({ id: 'a1' });
       const rowB = buildAnalysisRow({ id: 'a2' });
-      analysisRepo.createQueryBuilder.mockReturnValue(buildQueryBuilder([rowA, rowB], 2));
-      analysisVerdictRepo.find.mockResolvedValue([buildVerdictRow({ analysisId: 'a1' })]);
+      analysisRepo.createQueryBuilder.mockReturnValue(
+        buildQueryBuilder([rowA, rowB], 2),
+      );
+      analysisVerdictRepo.find.mockResolvedValue([
+        buildVerdictRow({ analysisId: 'a1' }),
+      ]);
 
       const result = await service.listAnalysis({ page: 1, limit: 20 });
 
@@ -683,7 +781,9 @@ describe('AdminService', () => {
 
     it('expone generator/promptVersion/generatedAt/errorMessage — a diferencia del contrato público', async () => {
       const row = buildAnalysisRow({ id: 'a1' });
-      analysisRepo.createQueryBuilder.mockReturnValue(buildQueryBuilder([row], 1));
+      analysisRepo.createQueryBuilder.mockReturnValue(
+        buildQueryBuilder([row], 1),
+      );
       analysisVerdictRepo.find.mockResolvedValue([
         buildVerdictRow({
           analysisId: 'a1',
@@ -709,7 +809,9 @@ describe('AdminService', () => {
 
     it('technicalVerdict es null cuando no existe fila para ese análisis', async () => {
       const row = buildAnalysisRow({ id: 'a1' });
-      analysisRepo.createQueryBuilder.mockReturnValue(buildQueryBuilder([row], 1));
+      analysisRepo.createQueryBuilder.mockReturnValue(
+        buildQueryBuilder([row], 1),
+      );
       analysisVerdictRepo.find.mockResolvedValue([]);
 
       const result = await service.listAnalysis({ page: 1, limit: 20 });
@@ -792,7 +894,13 @@ describe('AdminService', () => {
         addOrderBy: jest.fn(),
         getMany: jest.fn().mockResolvedValue(items),
       };
-      for (const key of ['distinctOn', 'leftJoinAndSelect', 'where', 'orderBy', 'addOrderBy']) {
+      for (const key of [
+        'distinctOn',
+        'leftJoinAndSelect',
+        'where',
+        'orderBy',
+        'addOrderBy',
+      ]) {
         qb[key].mockReturnValue(qb);
       }
       return qb;
@@ -807,11 +915,19 @@ describe('AdminService', () => {
       );
       analysisVerdictRepo.find.mockResolvedValue([]);
 
-      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
 
-      expect(scheduledAnalysisRunRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(scheduledAnalysisRunRepo.createQueryBuilder).toHaveBeenCalledTimes(
+        1,
+      );
       expect(result.items[0].latestRun).toEqual(
-        expect.objectContaining({ analysisId: 'a1', analysisStatus: 'Finalizado' }),
+        expect.objectContaining({
+          analysisId: 'a1',
+          analysisStatus: 'Finalizado',
+        }),
       );
     });
 
@@ -844,9 +960,14 @@ describe('AdminService', () => {
         },
       ]);
 
-      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
 
-      expect(analysisVerdictRepo.find).toHaveBeenCalledWith({ where: { analysisId: In(['a1']) } });
+      expect(analysisVerdictRepo.find).toHaveBeenCalledWith({
+        where: { analysisId: In(['a1']) },
+      });
       expect(result.items[0].technicalVerdict).toEqual(
         expect.objectContaining({ status: 'generated', generator: 'claude' }),
       );
@@ -861,7 +982,10 @@ describe('AdminService', () => {
       );
       analysisVerdictRepo.find.mockResolvedValue([]);
 
-      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
 
       expect(result.items[0].technicalVerdict).toBeNull();
     });
@@ -877,9 +1001,14 @@ describe('AdminService', () => {
       );
       analysisVerdictRepo.find.mockResolvedValue([]);
 
-      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
 
-      expect(result.items[0].latestRun?.emailSentAt).toBe('2026-08-25T12:05:00.000Z');
+      expect(result.items[0].latestRun?.emailSentAt).toBe(
+        '2026-08-25T12:05:00.000Z',
+      );
     });
 
     it('resuelve fieldName/userEmail/userFullName desde el join de Field/User', async () => {
@@ -891,17 +1020,26 @@ describe('AdminService', () => {
                 id: 'field-1',
                 name: 'Campo San José',
                 userId: 'user-1',
-                user: { id: 'user-1', email: 'owner@x.com', fullName: 'Owner Test' },
+                user: {
+                  id: 'user-1',
+                  email: 'owner@x.com',
+                  fullName: 'Owner Test',
+                },
               },
             }),
           ],
           1,
         ),
       );
-      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(buildRunQueryBuilder([]));
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildRunQueryBuilder([]),
+      );
       analysisVerdictRepo.find.mockResolvedValue([]);
 
-      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
 
       expect(result.items[0]).toEqual(
         expect.objectContaining({
@@ -916,9 +1054,14 @@ describe('AdminService', () => {
       fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
         buildScheduleQueryBuilder([buildScheduleRow()], 1),
       );
-      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(buildRunQueryBuilder([]));
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildRunQueryBuilder([]),
+      );
 
-      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
 
       expect(result.items[0].latestRun).toBeNull();
       expect(result.items[0].technicalVerdict).toBeNull();
@@ -926,11 +1069,18 @@ describe('AdminService', () => {
     });
 
     it('con la página vacía, no consulta runs ni verdicts (evita un IN vacío)', async () => {
-      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(buildScheduleQueryBuilder([], 0));
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildScheduleQueryBuilder([], 0),
+      );
 
-      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
 
-      expect(scheduledAnalysisRunRepo.createQueryBuilder).not.toHaveBeenCalled();
+      expect(
+        scheduledAnalysisRunRepo.createQueryBuilder,
+      ).not.toHaveBeenCalled();
       expect(analysisVerdictRepo.find).not.toHaveBeenCalled();
       expect(result.items).toEqual([]);
       expect(result.total).toBe(0);
@@ -940,19 +1090,254 @@ describe('AdminService', () => {
       fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
         buildScheduleQueryBuilder([buildScheduleRow()], 37),
       );
-      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(buildRunQueryBuilder([]));
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildRunQueryBuilder([]),
+      );
 
-      const result = await service.listScheduledAnalysis({ page: 2, limit: 10 });
+      const result = await service.listScheduledAnalysis({
+        page: 2,
+        limit: 10,
+      });
 
       expect(result.page).toBe(2);
       expect(result.limit).toBe(10);
       expect(result.total).toBe(37);
     });
+
+    describe('weeklyTechnicalVerdict (PR 16D)', () => {
+      const buildWeeklyVerdictResponse = (
+        overrides: Partial<WeeklyTechnicalVerdictResponse> = {},
+      ): WeeklyTechnicalVerdictResponse => ({
+        status: 'generated',
+        verdict: 'attention',
+        trend: 'stable',
+        confidence: 'medium',
+        summary: 'Respecto del reporte anterior, el campo se mantiene estable.',
+        keyChanges: [],
+        areasToReview: [],
+        recommendations: [],
+        limitations: [],
+        previousSnapshotId: null,
+        generator: 'deterministic-v1',
+        promptVersion: null,
+        errorMessage: null,
+        generatedAt: '2026-08-24T12:00:00.000Z',
+        ...overrides,
+      });
+
+      it('devuelve weeklyTechnicalVerdict generated cuando existe para el scheduledRunId de latestRun', async () => {
+        fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+          buildScheduleQueryBuilder([buildScheduleRow()], 1),
+        );
+        scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+          buildRunQueryBuilder([buildRunRow({ id: 'run-1' })]),
+        );
+        analysisVerdictRepo.find.mockResolvedValue([]);
+        const weekly = buildWeeklyVerdictResponse();
+        weeklyTechnicalVerdictService.findResponsesByScheduledRunIds.mockResolvedValue(
+          new Map([['run-1', weekly]]),
+        );
+
+        const result = await service.listScheduledAnalysis({
+          page: 1,
+          limit: 20,
+        });
+
+        expect(
+          weeklyTechnicalVerdictService.findResponsesByScheduledRunIds,
+        ).toHaveBeenCalledWith(['run-1']);
+        expect(result.items[0].weeklyTechnicalVerdict).toEqual(weekly);
+      });
+
+      it('devuelve null cuando no hay diagnóstico semanal para ese scheduledRunId', async () => {
+        fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+          buildScheduleQueryBuilder([buildScheduleRow()], 1),
+        );
+        scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+          buildRunQueryBuilder([buildRunRow({ id: 'run-1' })]),
+        );
+        analysisVerdictRepo.find.mockResolvedValue([]);
+        weeklyTechnicalVerdictService.findResponsesByScheduledRunIds.mockResolvedValue(
+          new Map(),
+        );
+
+        const result = await service.listScheduledAnalysis({
+          page: 1,
+          limit: 20,
+        });
+
+        expect(result.items[0].weeklyTechnicalVerdict).toBeNull();
+      });
+
+      it('devuelve failed con errorMessage tal cual (admin sí lo ve)', async () => {
+        fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+          buildScheduleQueryBuilder([buildScheduleRow()], 1),
+        );
+        scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+          buildRunQueryBuilder([buildRunRow({ id: 'run-1' })]),
+        );
+        analysisVerdictRepo.find.mockResolvedValue([]);
+        const failed = buildWeeklyVerdictResponse({
+          status: 'failed',
+          verdict: 'insufficient_data',
+          trend: 'insufficient_data',
+          confidence: 'low',
+          errorMessage: 'No se pudo generar el diagnóstico semanal automático.',
+        });
+        weeklyTechnicalVerdictService.findResponsesByScheduledRunIds.mockResolvedValue(
+          new Map([['run-1', failed]]),
+        );
+
+        const result = await service.listScheduledAnalysis({
+          page: 1,
+          limit: 20,
+        });
+
+        expect(result.items[0].weeklyTechnicalVerdict).toEqual(
+          expect.objectContaining({
+            status: 'failed',
+            errorMessage:
+              'No se pudo generar el diagnóstico semanal automático.',
+          }),
+        );
+      });
+
+      it('incluye generator/promptVersion/errorMessage en la respuesta admin', async () => {
+        fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+          buildScheduleQueryBuilder([buildScheduleRow()], 1),
+        );
+        scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+          buildRunQueryBuilder([buildRunRow({ id: 'run-1' })]),
+        );
+        analysisVerdictRepo.find.mockResolvedValue([]);
+        weeklyTechnicalVerdictService.findResponsesByScheduledRunIds.mockResolvedValue(
+          new Map([
+            [
+              'run-1',
+              buildWeeklyVerdictResponse({
+                generator: 'claude',
+                promptVersion: 'weekly-technical-verdict-v1',
+                errorMessage: null,
+              }),
+            ],
+          ]),
+        );
+
+        const result = await service.listScheduledAnalysis({
+          page: 1,
+          limit: 20,
+        });
+
+        expect(result.items[0].weeklyTechnicalVerdict).toEqual(
+          expect.objectContaining({
+            generator: 'claude',
+            promptVersion: 'weekly-technical-verdict-v1',
+          }),
+        );
+      });
+
+      it('no hace N+1 — findResponsesByScheduledRunIds se llama una sola vez sin importar cuántos schedules haya en la página', async () => {
+        fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+          buildScheduleQueryBuilder(
+            [
+              buildScheduleRow({ id: 'schedule-1' }),
+              buildScheduleRow({ id: 'schedule-2' }),
+              buildScheduleRow({ id: 'schedule-3' }),
+            ],
+            3,
+          ),
+        );
+        scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+          buildRunQueryBuilder([
+            buildRunRow({ id: 'run-1', scheduleId: 'schedule-1' }),
+            buildRunRow({ id: 'run-2', scheduleId: 'schedule-2' }),
+            buildRunRow({ id: 'run-3', scheduleId: 'schedule-3' }),
+          ]),
+        );
+        analysisVerdictRepo.find.mockResolvedValue([]);
+
+        await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+        expect(
+          weeklyTechnicalVerdictService.findResponsesByScheduledRunIds,
+        ).toHaveBeenCalledTimes(1);
+        expect(
+          weeklyTechnicalVerdictService.findResponsesByScheduledRunIds,
+        ).toHaveBeenCalledWith(['run-1', 'run-2', 'run-3']);
+      });
+
+      it('no llama a generateAndPersist ni a Claude — el mock inyectado solo expone findResponsesByScheduledRunIds', async () => {
+        fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+          buildScheduleQueryBuilder([buildScheduleRow()], 1),
+        );
+        scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+          buildRunQueryBuilder([buildRunRow({ id: 'run-1' })]),
+        );
+        analysisVerdictRepo.find.mockResolvedValue([]);
+
+        await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+        expect(
+          (
+            weeklyTechnicalVerdictService as unknown as {
+              generateAndPersist?: unknown;
+            }
+          ).generateAndPersist,
+        ).toBeUndefined();
+      });
+
+      it('no rompe el shape existente de technicalVerdict individual — ambos conviven en el mismo item', async () => {
+        fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+          buildScheduleQueryBuilder([buildScheduleRow()], 1),
+        );
+        scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+          buildRunQueryBuilder([
+            buildRunRow({ id: 'run-1', analysisId: 'a1' }),
+          ]),
+        );
+        analysisVerdictRepo.find.mockResolvedValue([
+          {
+            id: 'verdict-1',
+            analysisId: 'a1',
+            status: 'generated',
+            verdict: 'favorable',
+            confidence: 'high',
+            summary: 'Resumen individual.',
+            keyFindings: [],
+            possibleCauses: [],
+            recommendations: [],
+            limitations: [],
+            inputSnapshot: {},
+            generator: 'claude',
+            promptVersion: 'technical-verdict-v1',
+            errorMessage: null,
+            generatedAt: new Date(),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        ]);
+        weeklyTechnicalVerdictService.findResponsesByScheduledRunIds.mockResolvedValue(
+          new Map([['run-1', buildWeeklyVerdictResponse()]]),
+        );
+
+        const result = await service.listScheduledAnalysis({
+          page: 1,
+          limit: 20,
+        });
+
+        expect(result.items[0].technicalVerdict).toEqual(
+          expect.objectContaining({ status: 'generated', generator: 'claude' }),
+        );
+        expect(result.items[0].weeklyTechnicalVerdict).toEqual(
+          expect.objectContaining({ status: 'generated', trend: 'stable' }),
+        );
+      });
+    });
   });
 
   describe('getSystemHealth', () => {
     it('devuelve la estructura esperada', async () => {
-      const fieldRepoManager = fieldRepo.manager as { query: jest.Mock };
+      const fieldRepoManager = fieldRepo.manager;
       fieldRepoManager.query.mockResolvedValue([{ '?column?': 1 }]);
       analysisRepo.findOne.mockResolvedValue(null);
       pythonWorkerService.checkHealth.mockResolvedValue({ status: 'ok' });
@@ -975,7 +1360,7 @@ describe('AdminService', () => {
     });
 
     it('reporta db.status=error si la query falla, sin tirar la request abajo', async () => {
-      const fieldRepoManager = fieldRepo.manager as { query: jest.Mock };
+      const fieldRepoManager = fieldRepo.manager;
       fieldRepoManager.query.mockRejectedValue(new Error('connection refused'));
       analysisRepo.findOne.mockResolvedValue(null);
 

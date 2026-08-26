@@ -13,7 +13,10 @@ import { In, LessThan, Repository } from 'typeorm';
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
 import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
-import { AuditActorContext, AuditLogService } from '../audit-log/audit-log.service';
+import {
+  AuditActorContext,
+  AuditLogService,
+} from '../audit-log/audit-log.service';
 import { AdminAuditLog } from '../audit-log/entities/admin-audit-log.entity';
 import { generateToken, hashToken } from '../auth/token.util';
 import { EmailSendResult, EmailService } from '../email/email.service';
@@ -27,6 +30,7 @@ import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
 import { UserRole } from '../users/user-role.enum';
 import { PublicUser, UsersService } from '../users/users.service';
+import { WeeklyTechnicalVerdictService } from '../weekly-technical-verdict/weekly-technical-verdict.service';
 import {
   AdminAnalysisTechnicalVerdict,
   toAdminAnalysisTechnicalVerdict,
@@ -64,9 +68,11 @@ type Paginated<T> = {
 // Field (ver comentarios en analysis.service.ts) — por eso el join acá es
 // manual (leftJoinAndMapOne) en vez de una relation declarada en la entidad.
 type AnalysisWithField = Analysis & {
-  field?: (Pick<Field, 'id' | 'name' | 'userId'> & {
-    user?: Pick<User, 'id' | 'email' | 'fullName'>;
-  }) | null;
+  field?:
+    | (Pick<Field, 'id' | 'name' | 'userId'> & {
+        user?: Pick<User, 'id' | 'email' | 'fullName'>;
+      })
+    | null;
 };
 
 type IssuedToken = {
@@ -100,6 +106,7 @@ export class AdminService {
     private readonly invitationRepository: Repository<UserInvitation>,
     @InjectRepository(PasswordResetToken)
     private readonly passwordResetRepository: Repository<PasswordResetToken>,
+    private readonly weeklyTechnicalVerdictService: WeeklyTechnicalVerdictService,
   ) {}
 
   // ── Métricas ────────────────────────────────────────────────────────
@@ -173,7 +180,9 @@ export class AdminService {
 
     const analysisFailureRateLast7Days =
       analysisCreatedLast7Days > 0
-        ? Math.round((failedAnalysisLast7Days / analysisCreatedLast7Days) * 10000) / 10000
+        ? Math.round(
+            (failedAnalysisLast7Days / analysisCreatedLast7Days) * 10000,
+          ) / 10000
         : 0;
 
     return {
@@ -203,7 +212,9 @@ export class AdminService {
     };
   }
 
-  private async getAverageAnalysisDurationMs(since?: Date): Promise<number | null> {
+  private async getAverageAnalysisDurationMs(
+    since?: Date,
+  ): Promise<number | null> {
     const qb = this.analysisRepository
       .createQueryBuilder('analysis')
       .select('AVG(analysis."durationMs")', 'avg')
@@ -218,7 +229,6 @@ export class AdminService {
     return raw?.avg ? Math.round(Number(raw.avg)) : null;
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async countSince(
     repository: Repository<any>,
     since: Date,
@@ -314,7 +324,10 @@ export class AdminService {
     };
   }
 
-  async createUser(dto: CreateAdminUserDto, actor: AuditActorContext): Promise<PublicUser> {
+  async createUser(
+    dto: CreateAdminUserDto,
+    actor: AuditActorContext,
+  ): Promise<PublicUser> {
     const email = dto.email.trim().toLowerCase();
 
     const existing = await this.usersService.findByEmail(email);
@@ -401,7 +414,9 @@ export class AdminService {
     }
 
     const otherFieldsChanged =
-      dto.fullName !== undefined || dto.email !== undefined || dto.isActive !== undefined;
+      dto.fullName !== undefined ||
+      dto.email !== undefined ||
+      dto.isActive !== undefined;
 
     if (otherFieldsChanged) {
       await this.auditLogService.record({
@@ -417,7 +432,10 @@ export class AdminService {
     return after;
   }
 
-  async deactivateUser(id: string, actor: AuditActorContext): Promise<PublicUser> {
+  async deactivateUser(
+    id: string,
+    actor: AuditActorContext,
+  ): Promise<PublicUser> {
     const target = await this.usersService.findById(id);
 
     if (!target) {
@@ -528,7 +546,10 @@ export class AdminService {
    * producción, se sigue devolviendo el token + URL completa — pensado para
    * desarrollo/QA manual, no para uso productivo.
    */
-  private buildIssuedTokenResponse(rawToken: string, path: string): IssuedToken | null {
+  private buildIssuedTokenResponse(
+    rawToken: string,
+    path: string,
+  ): IssuedToken | null {
     if (this.config.get<string>('NODE_ENV') === 'production') {
       return null;
     }
@@ -553,10 +574,13 @@ export class AdminService {
   ): Promise<EmailSendResult> {
     const invitationUrl = this.buildAppUrl('/accept-invitation', rawToken);
 
-    const result = await this.emailService.sendInvitationEmail(invitation.email, {
-      invitationUrl,
-      expiresAt: invitation.expiresAt,
-    });
+    const result = await this.emailService.sendInvitationEmail(
+      invitation.email,
+      {
+        invitationUrl,
+        expiresAt: invitation.expiresAt,
+      },
+    );
 
     await this.auditLogService.record({
       actor,
@@ -586,11 +610,22 @@ export class AdminService {
       action: 'admin.invitation.created',
       targetType: 'invitation',
       targetId: invitation.id,
-      after: { email: invitation.email, role: invitation.role, expiresAt: invitation.expiresAt },
+      after: {
+        email: invitation.email,
+        role: invitation.role,
+        expiresAt: invitation.expiresAt,
+      },
     });
 
-    const emailResult = await this.sendInvitationEmailAndAudit(invitation, rawToken, actor);
-    const issued = this.buildIssuedTokenResponse(rawToken, '/accept-invitation');
+    const emailResult = await this.sendInvitationEmailAndAudit(
+      invitation,
+      rawToken,
+      actor,
+    );
+    const issued = this.buildIssuedTokenResponse(
+      rawToken,
+      '/accept-invitation',
+    );
 
     return {
       id: invitation.id,
@@ -600,7 +635,9 @@ export class AdminService {
       emailSent: emailResult.sent,
       dryRun: emailResult.dryRun,
       provider: emailResult.provider,
-      ...(issued ? { invitationToken: issued.token, invitationUrl: issued.url } : {}),
+      ...(issued
+        ? { invitationToken: issued.token, invitationUrl: issued.url }
+        : {}),
     };
   }
 
@@ -632,10 +669,13 @@ export class AdminService {
     });
 
     const resetUrl = this.buildAppUrl('/reset-password', rawToken);
-    const emailResult = await this.emailService.sendPasswordResetEmail(user.email, {
-      resetUrl,
-      expiresAt,
-    });
+    const emailResult = await this.emailService.sendPasswordResetEmail(
+      user.email,
+      {
+        resetUrl,
+        expiresAt,
+      },
+    );
 
     await this.auditLogService.record({
       actor,
@@ -670,7 +710,9 @@ export class AdminService {
     dto: UpdateAccessRequestDto,
     actor: AuditActorContext,
   ): Promise<AccessRequest> {
-    const accessRequest = await this.accessRequestRepository.findOne({ where: { id } });
+    const accessRequest = await this.accessRequestRepository.findOne({
+      where: { id },
+    });
 
     if (!accessRequest) {
       throw new NotFoundException('Solicitud de acceso no encontrada.');
@@ -723,7 +765,9 @@ export class AdminService {
     dto: CreateUserFromAccessRequestDto,
     actor: AuditActorContext,
   ) {
-    const accessRequest = await this.accessRequestRepository.findOne({ where: { id } });
+    const accessRequest = await this.accessRequestRepository.findOne({
+      where: { id },
+    });
 
     if (!accessRequest) {
       throw new NotFoundException('Solicitud de acceso no encontrada.');
@@ -742,13 +786,18 @@ export class AdminService {
       action: 'admin.invitation.created',
       targetType: 'invitation',
       targetId: invitation.id,
-      after: { email: invitation.email, role: invitation.role, expiresAt: invitation.expiresAt },
+      after: {
+        email: invitation.email,
+        role: invitation.role,
+        expiresAt: invitation.expiresAt,
+      },
     });
 
     const before = { ...accessRequest };
     accessRequest.status = 'converted';
     accessRequest.convertedAt = accessRequest.convertedAt ?? new Date();
-    const savedAccessRequest = await this.accessRequestRepository.save(accessRequest);
+    const savedAccessRequest =
+      await this.accessRequestRepository.save(accessRequest);
 
     await this.auditLogService.record({
       actor,
@@ -759,8 +808,15 @@ export class AdminService {
       after: savedAccessRequest,
     });
 
-    const emailResult = await this.sendInvitationEmailAndAudit(invitation, rawToken, actor);
-    const issued = this.buildIssuedTokenResponse(rawToken, '/accept-invitation');
+    const emailResult = await this.sendInvitationEmailAndAudit(
+      invitation,
+      rawToken,
+      actor,
+    );
+    const issued = this.buildIssuedTokenResponse(
+      rawToken,
+      '/accept-invitation',
+    );
 
     return {
       accessRequest: savedAccessRequest,
@@ -772,7 +828,9 @@ export class AdminService {
         emailSent: emailResult.sent,
         dryRun: emailResult.dryRun,
         provider: emailResult.provider,
-        ...(issued ? { invitationToken: issued.token, invitationUrl: issued.url } : {}),
+        ...(issued
+          ? { invitationToken: issued.token, invitationUrl: issued.url }
+          : {}),
       },
     };
   }
@@ -879,9 +937,7 @@ export class AdminService {
 
   // ── Diagnósticos ────────────────────────────────────────────────────
 
-  async listAnalysis(
-    query: ListAnalysisQueryDto,
-  ): Promise<Paginated<unknown>> {
+  async listAnalysis(query: ListAnalysisQueryDto): Promise<Paginated<unknown>> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
@@ -995,12 +1051,14 @@ export class AdminService {
 
   /**
    * PR 13B: visibilidad operativa de solo lectura sobre el pipeline de Fase 4A/5/12A — nunca
-   * dispara una corrida, nunca reintenta un email, nunca regenera un veredicto. Tres consultas en
-   * lote (nunca una por fila, sin importar cuántos schedules haya en la página):
+   * dispara una corrida, nunca reintenta un email, nunca regenera un veredicto. Cuatro consultas
+   * en lote (nunca una por fila, sin importar cuántos schedules haya en la página):
    *   1. schedules paginados (con Field/User resueltos, mismo criterio que listAnalysis);
    *   2. la corrida MÁS RECIENTE de cada schedule en una sola query (DISTINCT ON, Postgres),
    *      con su Analysis ya resuelto por join — evita una segunda consulta para analysisStatus;
-   *   3. los technicalVerdict de esos analysisId, reusando getTechnicalVerdictsByAnalysisId.
+   *   3. los technicalVerdict de esos analysisId, reusando getTechnicalVerdictsByAnalysisId;
+   *   4. (PR 16D) los weeklyTechnicalVerdict de esos scheduledRunId (run.id), vía
+   *      WeeklyTechnicalVerdictService.findResponsesByScheduledRunIds.
    */
   async listScheduledAnalysis(
     query: PaginationQueryDto,
@@ -1026,9 +1084,11 @@ export class AdminService {
 
     const [schedules, total] = (await qb.getManyAndCount()) as [
       (FieldAnalysisSchedule & {
-        field?: (Pick<Field, 'id' | 'name' | 'userId'> & {
-          user?: Pick<User, 'id' | 'email' | 'fullName'>;
-        }) | null;
+        field?:
+          | (Pick<Field, 'id' | 'name' | 'userId'> & {
+              user?: Pick<User, 'id' | 'email' | 'fullName'>;
+            })
+          | null;
       })[],
       number,
     ];
@@ -1040,13 +1100,25 @@ export class AdminService {
     const analysisIds = Array.from(latestRunsByScheduleId.values())
       .map((run) => run.analysisId)
       .filter((id): id is string => Boolean(id));
-    const verdictsByAnalysisId = await this.getTechnicalVerdictsByAnalysisId(analysisIds);
+    const verdictsByAnalysisId =
+      await this.getTechnicalVerdictsByAnalysisId(analysisIds);
+
+    const scheduledRunIds = Array.from(latestRunsByScheduleId.values()).map(
+      (run) => run.id,
+    );
+    const weeklyVerdictsByRunId =
+      await this.weeklyTechnicalVerdictService.findResponsesByScheduledRunIds(
+        scheduledRunIds,
+      );
 
     return {
       items: schedules.map((schedule) => {
         const latestRun = latestRunsByScheduleId.get(schedule.id) ?? null;
         const technicalVerdict = latestRun?.analysisId
           ? (verdictsByAnalysisId.get(latestRun.analysisId) ?? null)
+          : null;
+        const weeklyTechnicalVerdict = latestRun
+          ? (weeklyVerdictsByRunId.get(latestRun.id) ?? null)
           : null;
 
         return {
@@ -1058,12 +1130,19 @@ export class AdminService {
           userFullName: schedule.field?.user?.fullName ?? null,
           enabled: schedule.enabled,
           frequency: schedule.frequency,
-          nextRunAt: schedule.nextRunAt ? schedule.nextRunAt.toISOString() : null,
-          lastRunAt: schedule.lastRunAt ? schedule.lastRunAt.toISOString() : null,
+          nextRunAt: schedule.nextRunAt
+            ? schedule.nextRunAt.toISOString()
+            : null,
+          lastRunAt: schedule.lastRunAt
+            ? schedule.lastRunAt.toISOString()
+            : null,
           lastStatus: schedule.lastStatus,
           lastErrorMessage: schedule.lastErrorMessage,
-          latestRun: latestRun ? this.toAdminScheduledAnalysisRun(latestRun) : null,
+          latestRun: latestRun
+            ? this.toAdminScheduledAnalysisRun(latestRun)
+            : null,
           technicalVerdict,
+          weeklyTechnicalVerdict,
         };
       }),
       total,
@@ -1116,7 +1195,10 @@ export class AdminService {
     };
   }
 
-  async markAnalysisReviewed(id: string, actor: AuditActorContext): Promise<Analysis> {
+  async markAnalysisReviewed(
+    id: string,
+    actor: AuditActorContext,
+  ): Promise<Analysis> {
     const analysis = await this.analysisRepository.findOne({ where: { id } });
 
     if (!analysis) {
@@ -1129,7 +1211,10 @@ export class AdminService {
       );
     }
 
-    const before = { reviewedAt: analysis.reviewedAt, reviewedByUserId: analysis.reviewedByUserId };
+    const before = {
+      reviewedAt: analysis.reviewedAt,
+      reviewedByUserId: analysis.reviewedByUserId,
+    };
 
     analysis.reviewedAt = new Date();
     analysis.reviewedByUserId = actor.actorUserId;
@@ -1142,7 +1227,10 @@ export class AdminService {
       targetType: 'analysis',
       targetId: id,
       before,
-      after: { reviewedAt: saved.reviewedAt, reviewedByUserId: saved.reviewedByUserId },
+      after: {
+        reviewedAt: saved.reviewedAt,
+        reviewedByUserId: saved.reviewedByUserId,
+      },
     });
 
     return saved;
@@ -1171,7 +1259,10 @@ export class AdminService {
       );
     }
 
-    const before = { retryCount: analysis.retryCount, lastRetriedAt: analysis.lastRetriedAt };
+    const before = {
+      retryCount: analysis.retryCount,
+      lastRetriedAt: analysis.lastRetriedAt,
+    };
 
     analysis.retryCount += 1;
     analysis.lastRetriedAt = new Date();
@@ -1184,7 +1275,10 @@ export class AdminService {
       targetType: 'analysis',
       targetId: id,
       before,
-      after: { retryCount: saved.retryCount, lastRetriedAt: saved.lastRetriedAt },
+      after: {
+        retryCount: saved.retryCount,
+        lastRetriedAt: saved.lastRetriedAt,
+      },
     });
 
     return saved;
@@ -1225,7 +1319,9 @@ export class AdminService {
   // Fix post-ADMIN-3: la lectura de audit logs vive en AuditLogService
   // (dueño del repositorio); AdminService solo pasa los filtros del query
   // DTO — ver AuditLogService.list().
-  async listAuditLogs(query: ListAuditLogsQueryDto): Promise<Paginated<AdminAuditLog>> {
+  async listAuditLogs(
+    query: ListAuditLogsQueryDto,
+  ): Promise<Paginated<AdminAuditLog>> {
     return this.auditLogService.list(query);
   }
 
@@ -1239,7 +1335,13 @@ export class AdminService {
         this.analysisRepository.findOne({
           where: { status: 'Finalizado' },
           order: { completedAt: 'DESC' },
-          select: { id: true, fieldId: true, lotName: true, completedAt: true, createdAt: true },
+          select: {
+            id: true,
+            fieldId: true,
+            lotName: true,
+            completedAt: true,
+            createdAt: true,
+          },
         }),
         this.analysisRepository.findOne({
           where: { status: 'Error' },
@@ -1274,7 +1376,10 @@ export class AdminService {
     };
   }
 
-  private async checkDbHealth(): Promise<{ status: 'ok' | 'error'; error?: string }> {
+  private async checkDbHealth(): Promise<{
+    status: 'ok' | 'error';
+    error?: string;
+  }> {
     try {
       await this.fieldRepository.manager.query('SELECT 1');
       return { status: 'ok' };
@@ -1287,7 +1392,9 @@ export class AdminService {
   }
 
   private getCurrentCommit(): string | null {
-    const envCommit = this.config.get<string>('GIT_COMMIT') || this.config.get<string>('SOURCE_COMMIT');
+    const envCommit =
+      this.config.get<string>('GIT_COMMIT') ||
+      this.config.get<string>('SOURCE_COMMIT');
 
     if (envCommit) {
       return envCommit;

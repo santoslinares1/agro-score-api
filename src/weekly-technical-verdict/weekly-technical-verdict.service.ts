@@ -206,4 +206,37 @@ export class WeeklyTechnicalVerdictService {
       ]),
     );
   }
+
+  /**
+   * PR 16D: admin Programados solo tiene a mano `scheduledRunId` (vía
+   * AdminService.getLatestRunsByScheduleId), no `snapshotId` — WeeklyTechnicalVerdict ya
+   * denormaliza scheduledRunId (mismo criterio que analysisId, ver la entidad), así que esto
+   * resuelve todo en una sola query `IN` sin tener que pasar por WeeklyAnalysisSnapshot primero.
+   * Mismo patrón batch que findResponsesBySnapshotIds.
+   */
+  async findResponsesByScheduledRunIds(
+    scheduledRunIds: string[],
+  ): Promise<Map<string, WeeklyTechnicalVerdictResponse>> {
+    if (!scheduledRunIds.length) {
+      return new Map();
+    }
+
+    const verdicts = await this.verdictRepository.find({
+      where: { scheduledRunId: In(scheduledRunIds) },
+    });
+
+    return new Map(
+      verdicts
+        .filter(
+          (
+            verdict,
+          ): verdict is WeeklyTechnicalVerdict & { scheduledRunId: string } =>
+            verdict.scheduledRunId !== null,
+        )
+        .map((verdict) => [
+          verdict.scheduledRunId,
+          toWeeklyTechnicalVerdictResponse(verdict),
+        ]),
+    );
+  }
 }

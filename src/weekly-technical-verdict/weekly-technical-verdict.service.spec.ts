@@ -1,6 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
+import { In } from 'typeorm';
 
 import { WeeklyAnalysisSnapshot } from '../scheduled-analysis/entities/weekly-analysis-snapshot.entity';
 import { WeeklyTechnicalVerdictService } from './weekly-technical-verdict.service';
@@ -432,6 +433,96 @@ describe('WeeklyTechnicalVerdictService', () => {
       expect(result.size).toBe(2);
       expect(result.get('snapshot-1')?.status).toBe('generated');
       expect(result.get('snapshot-2')?.errorMessage).toBe('boom');
+    });
+  });
+
+  describe('findResponsesByScheduledRunIds (batch, PR 16D)', () => {
+    it('con la lista vacía, no consulta la DB (evita un IN vacío)', async () => {
+      const result = await service.findResponsesByScheduledRunIds([]);
+
+      expect(result.size).toBe(0);
+      expect(verdictRepository.find).not.toHaveBeenCalled();
+    });
+
+    it('devuelve un Map<scheduledRunId, respuesta> con una sola query', async () => {
+      verdictRepository.find.mockResolvedValue([
+        {
+          snapshotId: 'snapshot-1',
+          scheduledRunId: 'run-1',
+          status: 'generated',
+          verdict: 'favorable',
+          trend: 'stable',
+          confidence: 'high',
+          summary: 'ok',
+          keyChanges: [],
+          areasToReview: [],
+          recommendations: [],
+          limitations: [],
+          previousSnapshotId: null,
+          generator: 'deterministic-v1',
+          promptVersion: null,
+          errorMessage: null,
+          generatedAt: null,
+        },
+        {
+          snapshotId: 'snapshot-2',
+          scheduledRunId: 'run-2',
+          status: 'failed',
+          verdict: 'insufficient_data',
+          trend: 'insufficient_data',
+          confidence: 'low',
+          summary: 'no',
+          keyChanges: [],
+          areasToReview: [],
+          recommendations: [],
+          limitations: [],
+          previousSnapshotId: null,
+          generator: 'claude',
+          promptVersion: WEEKLY_TECHNICAL_VERDICT_PROMPT_VERSION,
+          errorMessage: 'boom',
+          generatedAt: null,
+        },
+      ] as any);
+
+      const result = await service.findResponsesByScheduledRunIds([
+        'run-1',
+        'run-2',
+      ]);
+
+      expect(verdictRepository.find).toHaveBeenCalledTimes(1);
+      expect(verdictRepository.find).toHaveBeenCalledWith({
+        where: { scheduledRunId: In(['run-1', 'run-2']) },
+      });
+      expect(result.size).toBe(2);
+      expect(result.get('run-1')?.status).toBe('generated');
+      expect(result.get('run-2')?.errorMessage).toBe('boom');
+    });
+
+    it('nunca incluye una fila con scheduledRunId null (defensivo, no debería pasar en la práctica)', async () => {
+      verdictRepository.find.mockResolvedValue([
+        {
+          snapshotId: 'snapshot-1',
+          scheduledRunId: null,
+          status: 'generated',
+          verdict: 'favorable',
+          trend: 'stable',
+          confidence: 'high',
+          summary: 'ok',
+          keyChanges: [],
+          areasToReview: [],
+          recommendations: [],
+          limitations: [],
+          previousSnapshotId: null,
+          generator: 'deterministic-v1',
+          promptVersion: null,
+          errorMessage: null,
+          generatedAt: null,
+        },
+      ] as any);
+
+      const result = await service.findResponsesByScheduledRunIds(['run-1']);
+
+      expect(result.size).toBe(0);
     });
   });
 });
