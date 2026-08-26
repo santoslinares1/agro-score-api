@@ -17,6 +17,7 @@ import {
   resolveScheduledForDate,
 } from './schedule-time.util';
 import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.service';
+import { WeeklyTechnicalVerdictService } from '../weekly-technical-verdict/weekly-technical-verdict.service';
 
 const ERROR_MESSAGE_MAX_LENGTH = 500;
 
@@ -52,6 +53,7 @@ export class ScheduledAnalysisRunnerService {
     private readonly configService: ConfigService,
     private readonly weeklySnapshotService: WeeklyAnalysisSnapshotService,
     private readonly analysisVerdictService: AnalysisVerdictService,
+    private readonly weeklyTechnicalVerdictService: WeeklyTechnicalVerdictService,
   ) {}
 
   // --- Dispatcher: busca schedules vencidos y los dispara ------------------------------------
@@ -299,12 +301,50 @@ export class ScheduledAnalysisRunnerService {
         // Finalizado (incluso con datos parciales/insuficientes, ver classifyDataQuality), nunca
         // para un análisis que falló. Idempotente por unique(fieldId, weekStart, weekEnd), así
         // que un tick de reconciliación que se solape con otro no duplica el snapshot.
+        let snapshot: WeeklyAnalysisSnapshot | null = null;
         try {
-          await this.weeklySnapshotService.createFromAnalysis(run, analysis);
+          snapshot = await this.weeklySnapshotService.createFromAnalysis(
+            run,
+            analysis,
+          );
         } catch (error) {
           this.logger.error(
             `[scheduled-analysis] No se pudo crear el snapshot semanal (runId=${run.id}): ${this.describe(error)}`,
           );
+        }
+
+        // PR 16B: diagnóstico semanal (weeklyTechnicalVerdict) — best-effort, propio try/catch
+        // separado del snapshot de arriba: si el snapshot se creó bien pero esto falla, el
+        // snapshot ya se creó igual (no se revierte) y el flujo sigue hacia el envío del email más
+        // abajo, en el mismo tick (ver PR 16A, sección 8). Nunca depende de que el technicalVerdict
+        // individual exista o haya salido 'generated' — se lee best-effort como contexto opcional,
+        // nunca se espera a que termine (evita heredar la ventana de espera de 10 min que ya tiene
+        // el veredicto individual, ver isWithinVerdictWaitWindow más abajo).
+        if (snapshot) {
+          try {
+            const [field, individualVerdict] = await Promise.all([
+              this.fieldsService.findByIdOrFail(run.fieldId),
+              this.analysisVerdictService.findResponseByAnalysisId(analysis.id),
+            ]);
+
+            await this.weeklyTechnicalVerdictService.generateAndPersist(
+              snapshot,
+              {
+                fieldName: field.name,
+                individualVerdict: individualVerdict
+                  ? {
+                      verdict: individualVerdict.verdict,
+                      confidence: individualVerdict.confidence,
+                      summary: individualVerdict.summary,
+                    }
+                  : null,
+              },
+            );
+          } catch (error) {
+            this.logger.error(
+              `[scheduled-analysis] No se pudo generar el diagnóstico semanal (runId=${run.id}, snapshotId=${snapshot.id}): ${this.describe(error)}`,
+            );
+          }
         }
       } else if (analysis.status === 'Error') {
         run.status = 'failed';

@@ -12,6 +12,12 @@ fuente de verdad del estado actual):
 → `11D` (PDF) → `12A` (mail semanal) → `13A`/`13B` (admin) → `14A` (prompt
 conservador) → `15A` (este documento).
 
+> **Diagnóstico semanal (`weeklyTechnicalVerdict`)**: interpretación de la
+> *evolución* de un campo vs. su reporte semanal anterior — un concepto
+> relacionado pero deliberadamente separado de este (`technicalVerdict`
+> interpreta un análisis puntual, sin eje temporal). Ver
+> `docs/weekly-technical-verdict.md` (PR 16A/16B en adelante).
+
 ---
 
 ## 1. Resumen

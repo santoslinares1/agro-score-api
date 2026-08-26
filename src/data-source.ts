@@ -14,6 +14,7 @@ import { WeeklyAnalysisSnapshot } from './scheduled-analysis/entities/weekly-ana
 import { PasswordResetToken } from './users/entities/password-reset-token.entity';
 import { UserInvitation } from './users/entities/user-invitation.entity';
 import { User } from './users/user.entity';
+import { WeeklyTechnicalVerdict } from './weekly-technical-verdict/entities/weekly-technical-verdict.entity';
 import { WeeklyFieldReport } from './weekly-reports/entities/weekly-field-report.entity';
 import { WeeklyLotIndexObservation } from './weekly-reports/entities/weekly-lot-index-observation.entity';
 
@@ -53,6 +54,7 @@ export const AppDataSource = new DataSource({
     FieldAnalysisSchedule,
     ScheduledAnalysisRun,
     WeeklyAnalysisSnapshot,
+    WeeklyTechnicalVerdict,
   ],
   migrations: ['src/migrations/*.ts'],
   migrationsTableName: 'migrations',

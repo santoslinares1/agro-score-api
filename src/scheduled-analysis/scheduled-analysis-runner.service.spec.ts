@@ -19,6 +19,8 @@ import { WeeklyAnalysisSnapshot } from './entities/weekly-analysis-snapshot.enti
 import { computeScheduledAnalysisDateRange } from './scheduled-analysis-date-range.util';
 import { ScheduledAnalysisRunnerService } from './scheduled-analysis-runner.service';
 import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.service';
+import { WeeklyTechnicalVerdictService } from '../weekly-technical-verdict/weekly-technical-verdict.service';
+import { WeeklyTechnicalVerdict } from '../weekly-technical-verdict/entities/weekly-technical-verdict.entity';
 
 describe('ScheduledAnalysisRunnerService', () => {
   let service: ScheduledAnalysisRunnerService;
@@ -52,6 +54,9 @@ describe('ScheduledAnalysisRunnerService', () => {
   >;
   let analysisVerdictService: jest.Mocked<
     Pick<AnalysisVerdictService, 'findResponseByAnalysisId'>
+  >;
+  let weeklyTechnicalVerdictService: jest.Mocked<
+    Pick<WeeklyTechnicalVerdictService, 'generateAndPersist'>
   >;
 
   const buildField = (overrides: Partial<Field> = {}): Field =>
@@ -182,6 +187,29 @@ describe('ScheduledAnalysisRunnerService', () => {
       ...overrides,
     }) as WeeklyAnalysisSnapshot;
 
+  const buildWeeklyTechnicalVerdict = (
+    overrides: Partial<WeeklyTechnicalVerdict> = {},
+  ): WeeklyTechnicalVerdict =>
+    ({
+      id: 'weekly-verdict-1',
+      snapshotId: 'snapshot-1',
+      status: 'generated',
+      verdict: 'favorable',
+      trend: 'stable',
+      confidence: 'high',
+      summary: 'Diagnóstico semanal.',
+      keyChanges: [],
+      areasToReview: [],
+      recommendations: [],
+      limitations: [],
+      previousSnapshotId: null,
+      generator: 'deterministic-v1',
+      promptVersion: null,
+      errorMessage: null,
+      generatedAt: new Date('2026-08-24T12:00:00.000Z'),
+      ...overrides,
+    }) as WeeklyTechnicalVerdict;
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -244,6 +272,10 @@ describe('ScheduledAnalysisRunnerService', () => {
           provide: AnalysisVerdictService,
           useValue: { findResponseByAnalysisId: jest.fn() },
         },
+        {
+          provide: WeeklyTechnicalVerdictService,
+          useValue: { generateAndPersist: jest.fn() },
+        },
       ],
     }).compile();
 
@@ -257,6 +289,7 @@ describe('ScheduledAnalysisRunnerService', () => {
     configService = module.get(ConfigService);
     weeklySnapshotService = module.get(WeeklyAnalysisSnapshotService);
     analysisVerdictService = module.get(AnalysisVerdictService);
+    weeklyTechnicalVerdictService = module.get(WeeklyTechnicalVerdictService);
 
     // findByField: por defecto "sin otros análisis en curso" — el nuevo chequeo defensivo de
     // triggerRun (fix crítico de la auditoría) lo llama siempre antes de runFieldAnalysis.
@@ -279,6 +312,15 @@ describe('ScheduledAnalysisRunnerService', () => {
     // cada vez — mismo criterio ya usado acá para weeklySnapshotService.
     analysisVerdictService.findResponseByAnalysisId.mockResolvedValue(
       buildTechnicalVerdict(),
+    );
+
+    // PR 16B: mismo criterio — por defecto el campo resuelve y el diagnóstico semanal se genera
+    // bien, para que los tests preexistentes (que no son sobre weeklyTechnicalVerdict en sí) sigan
+    // pasando sin tener que mockear esto cada vez. Los tests dedicados de esta sección pisan estos
+    // mocks puntualmente.
+    fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+    weeklyTechnicalVerdictService.generateAndPersist.mockResolvedValue(
+      buildWeeklyTechnicalVerdict(),
     );
   });
 
@@ -649,6 +691,148 @@ describe('ScheduledAnalysisRunnerService', () => {
       await service.reconcilePendingRuns();
 
       expect(weeklySnapshotService.createFromAnalysis).not.toHaveBeenCalled();
+    });
+
+    describe('PR 16B: diagnóstico semanal (weeklyTechnicalVerdict)', () => {
+      it('genera el diagnóstico semanal después de crear el snapshot, con fieldName e individualVerdict como contexto', async () => {
+        const run = buildRun({
+          status: 'processing',
+          analysisId: 'analysis-1',
+        });
+        const analysis = buildAnalysis({ status: 'Finalizado' });
+        const snapshot = buildSnapshot({ id: 'snapshot-42' });
+        runRepository.find.mockResolvedValue([run]);
+        analysisService.findOne.mockResolvedValue(analysis);
+        weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+        fieldsService.findByIdOrFail.mockResolvedValue(
+          buildField({ name: 'Campo Norte' }),
+        );
+        analysisVerdictService.findResponseByAnalysisId.mockResolvedValue(
+          buildTechnicalVerdict({
+            verdict: 'attention',
+            confidence: 'medium',
+            summary: 'resumen individual',
+          }),
+        );
+        usersService.findById.mockResolvedValue(buildUser());
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await service.reconcilePendingRuns();
+
+        expect(
+          weeklyTechnicalVerdictService.generateAndPersist,
+        ).toHaveBeenCalledWith(snapshot, {
+          fieldName: 'Campo Norte',
+          individualVerdict: {
+            verdict: 'attention',
+            confidence: 'medium',
+            summary: 'resumen individual',
+          },
+        });
+      });
+
+      it('no genera el diagnóstico semanal si el snapshot no se pudo crear', async () => {
+        const run = buildRun({
+          status: 'processing',
+          analysisId: 'analysis-1',
+        });
+        const analysis = buildAnalysis({ status: 'Finalizado' });
+        runRepository.find.mockResolvedValue([run]);
+        analysisService.findOne.mockResolvedValue(analysis);
+        weeklySnapshotService.createFromAnalysis.mockRejectedValue(
+          new Error('DB caída'),
+        );
+
+        await service.reconcilePendingRuns();
+
+        expect(
+          weeklyTechnicalVerdictService.generateAndPersist,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('no depende de que el technicalVerdict individual exista — genera igual pasando individualVerdict=null', async () => {
+        const run = buildRun({
+          status: 'processing',
+          analysisId: 'analysis-1',
+        });
+        const analysis = buildAnalysis({ status: 'Finalizado' });
+        const snapshot = buildSnapshot();
+        runRepository.find.mockResolvedValue([run]);
+        analysisService.findOne.mockResolvedValue(analysis);
+        weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+        analysisVerdictService.findResponseByAnalysisId.mockResolvedValue(null);
+        usersService.findById.mockResolvedValue(buildUser());
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await service.reconcilePendingRuns();
+
+        expect(
+          weeklyTechnicalVerdictService.generateAndPersist,
+        ).toHaveBeenCalledWith(
+          snapshot,
+          expect.objectContaining({ individualVerdict: null }),
+        );
+      });
+
+      it('si generateAndPersist falla, no bloquea el run ni el envío del email (best-effort, propio try/catch)', async () => {
+        const run = buildRun({
+          status: 'processing',
+          analysisId: 'analysis-1',
+        });
+        const analysis = buildAnalysis({ status: 'Finalizado' });
+        const snapshot = buildSnapshot();
+        runRepository.find.mockResolvedValue([run]);
+        analysisService.findOne.mockResolvedValue(analysis);
+        weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+        weeklyTechnicalVerdictService.generateAndPersist.mockRejectedValue(
+          new Error('falló la generación'),
+        );
+        usersService.findById.mockResolvedValue(buildUser());
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await expect(service.reconcilePendingRuns()).resolves.toBeUndefined();
+
+        expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledTimes(
+          1,
+        );
+        expect(runRepository.save).toHaveBeenCalledWith(
+          expect.objectContaining({ status: 'completed' }),
+        );
+      });
+
+      it('no llama a Claude real — todo pasa por el mock de WeeklyTechnicalVerdictService', async () => {
+        const run = buildRun({
+          status: 'processing',
+          analysisId: 'analysis-1',
+        });
+        const analysis = buildAnalysis({ status: 'Finalizado' });
+        runRepository.find.mockResolvedValue([run]);
+        analysisService.findOne.mockResolvedValue(analysis);
+        usersService.findById.mockResolvedValue(buildUser());
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await service.reconcilePendingRuns();
+
+        expect(
+          weeklyTechnicalVerdictService.generateAndPersist,
+        ).toHaveBeenCalledTimes(1);
+      });
     });
 
     it('FASE 5: el email usa weekStart/weekEnd/summary/dataQualityStatus del snapshot, no una promesa fija', async () => {

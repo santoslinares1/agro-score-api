@@ -3,6 +3,10 @@ import {
   AnalysisVerdictLabel,
 } from '../entities/analysis-technical-verdict.entity';
 import { GeneratedVerdict } from '../analysis-verdict-generator.util';
+import {
+  containsForbiddenTerms,
+  containsUnhedgedCausalClaim,
+} from './claude-text-safety.util';
 
 /**
  * PR 11B: "no confiar ciegamente en Claude" — este módulo es la única puerta de entrada del
@@ -29,64 +33,6 @@ export const SUMMARY_MAX_LENGTH = 1200;
 export const ITEM_MAX_LENGTH = 300;
 export const ARRAY_MAX_ITEMS = 6;
 export const LIMITATIONS_MAX_ITEMS = 5;
-
-/**
- * Términos que el prompt le pide a Claude no usar (el veredicto es "AgroScore", no "IA"/"Claude").
- * `\bia\b` es la única forma de cazar "IA" como palabra suelta sin falsos positivos: la letra
- * "i" ASCII nunca aparece pegada a una "a" dentro de una palabra española sin que haya un límite
- * de palabra real antes (p.ej. "historia", "compañía", "vía" no matchean).
- */
-const FORBIDDEN_TERM_PATTERNS = [
-  /\bclaude\b/i,
-  /\banthropic\b/i,
-  /\bchatbot\b/i,
-  /\bia\b/i,
-  /inteligencia artificial/i,
-];
-
-function containsForbiddenTerms(value: string): boolean {
-  return FORBIDDEN_TERM_PATTERNS.some((pattern) => pattern.test(value));
-}
-
-/**
- * PR 14A: defensa en profundidad detrás de la regla de lenguaje hipotético del prompt (ver
- * buildSystemPrompt en technical-verdict-prompt.ts) — igual criterio que FORBIDDEN_TERM_PATTERNS
- * arriba: no confiar ciegamente en que el prompt alcance.
- *
- * Deliberadamente acotado a los patrones concretos pedidos por producto, no un detector de
- * hedging genérico (eso requeriría NLP real y generaría falsos positivos impredecibles). Mismo
- * criterio que \bia\b más abajo: prefiere dejar pasar un caso dudoso antes que rechazar un
- * veredicto por lo demás correcto.
- *
- * Sustantivos que solo se prohíben en afirmación directa ("hay X", "presenta X", "tiene X", o
- * "existe X" sin el condicional "si existe" antes) — en forma hedgeada ("podría estar asociado a
- * estrés hídrico", "validar si existe compactación") son exactamente el lenguaje que el prompt
- * pide usar, así que nunca se bloquean como mención bare.
- */
-const ASSERTIVE_CLAIM_NOUNS =
-  '(estrés\\s+hídrico|compactación|plagas?|enfermedad(es)?|deficiencias?\\s+nutricional(es)?|falta\\s+de\\s+nutrientes)';
-
-const UNHEDGED_CLAIM_PATTERNS = [
-  new RegExp(`\\b(hay|presenta|tiene)\\s+${ASSERTIVE_CLAIM_NOUNS}\\b`, 'i'),
-  new RegExp(`\\bexiste\\s+${ASSERTIVE_CLAIM_NOUNS}\\b`, 'i'),
-  // "déficit hídrico"/"déficit de humedad" se prohíben como mención bare (no solo en afirmación
-  // directa): el objetivo es que Claude use directamente vocabulario más prudente
-  // ("disponibilidad hídrica", "diferencias de humedad"), no que hedgee esa frase en particular.
-  /\bdéficit\s+(hídrico|de\s+humedad)\b/i,
-  /\bla\s+causa\s+es\b/i,
-  /\bel\s+problema\s+es\b/i,
-  /\bse\s+debe\s+a\b/i,
-];
-
-// Condicionales que vuelven prudente una afirmación que de otra forma matchearía arriba ("si
-// existe compactación", "si hay plaga") — se remueven del texto antes de chequear, para no
-// generar falsos positivos con el lenguaje hedgeado que el prompt pide.
-const HEDGE_LEAD_IN_PATTERN = /\bsi\s+(existe|hay|presenta|tiene)\b/gi;
-
-function containsUnhedgedCausalClaim(value: string): boolean {
-  const withoutHedges = value.replace(HEDGE_LEAD_IN_PATTERN, ' ');
-  return UNHEDGED_CLAIM_PATTERNS.some((pattern) => pattern.test(withoutHedges));
-}
 
 function clampString(value: string, maxLength: number): string {
   const trimmed = value.trim();
@@ -118,10 +64,10 @@ function clampStringArray(value: unknown, maxItems: number): string[] {
  * - no es un objeto;
  * - `verdict`/`confidence` no están en el enum permitido;
  * - `summary` falta, no es string, o queda vacío tras trim;
- * - el texto (summary o cualquier item de los arrays) menciona Claude/IA/Anthropic/chatbot —
- *   ver FORBIDDEN_TERM_PATTERNS.
- * - el texto afirma una causa agronómica como hecho en vez de como hipótesis (PR 14A) — ver
- *   UNHEDGED_CLAIM_PATTERNS / containsUnhedgedCausalClaim.
+ * - el texto (summary o cualquier item de los arrays) menciona Claude/IA/Anthropic/chatbot, o
+ * - afirma una causa agronómica como hecho en vez de como hipótesis (PR 14A) —
+ *   ver claude-text-safety.util.ts (PR 16B: extraído acá para compartirlo con el validator de
+ *   weeklyTechnicalVerdict, ver claude-weekly-output.validator.ts).
  * Los arrays (keyFindings/possibleCauses/recommendations/limitations) son más tolerantes: si
  * faltan, no son array, o traen items no-string, se normalizan a lo que sí sea válido en vez de
  * fallar — un array mal formado no es motivo para descartar un veredicto por lo demás válido.

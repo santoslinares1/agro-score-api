@@ -31,13 +31,19 @@ export interface ComparisonVsPrevious {
 }
 
 /** Umbrales heurísticos de producto (Fase 5) — NO son diagnóstico agronómico definitivo, solo
- * evitan que una variación mínima se lea como "mejora"/"baja" en el copy del email/UI. */
-const SCORE_STABLE_THRESHOLD = 5;
-const INDEX_STABLE_THRESHOLD = 0.03;
+ * evitan que una variación mínima se lea como "mejora"/"baja" en el copy del email/UI.
+ *
+ * PR 16B: exportados (antes privados de este archivo) para que
+ * weekly-technical-verdict-generator.util.ts (generador determinístico del diagnóstico semanal)
+ * derive su `trend` con los MISMOS umbrales que ya usa este comparador — evita que "estable" para
+ * comparisonVsPrevious.summary y "estable" para weeklyTechnicalVerdict.trend signifiquen cosas
+ * distintas por accidente. */
+export const SCORE_STABLE_THRESHOLD = 5;
+export const INDEX_STABLE_THRESHOLD = 0.03;
 
-type Trend = 'up' | 'down' | 'stable';
+export type DeltaTrend = 'up' | 'down' | 'stable';
 
-function classifyDelta(delta: number, threshold: number): Trend {
+export function classifyDelta(delta: number, threshold: number): DeltaTrend {
   if (delta >= threshold) return 'up';
   if (delta <= -threshold) return 'down';
   return 'stable';
@@ -48,7 +54,11 @@ function round(value: number, decimals: number): number {
   return Math.round(value * factor) / factor;
 }
 
-function delta(current: number | null, previous: number | null, decimals: number): number | null {
+function delta(
+  current: number | null,
+  previous: number | null,
+  decimals: number,
+): number | null {
   if (current === null || previous === null) {
     return null;
   }
@@ -71,7 +81,10 @@ function scoreSentence(scoreDelta: number | null): string | null {
   }
 }
 
-function indexSentence(label: string, indexDelta: number | null): string | null {
+function indexSentence(
+  label: string,
+  indexDelta: number | null,
+): string | null {
   if (indexDelta === null) {
     return null;
   }
@@ -86,7 +99,10 @@ function indexSentence(label: string, indexDelta: number | null): string | null 
   }
 }
 
-function dominantZoneSentence(current: string | null, previous: string | null): string | null {
+function dominantZoneSentence(
+  current: string | null,
+  previous: string | null,
+): string | null {
   if (!current || !previous) {
     return null;
   }
@@ -96,7 +112,12 @@ function dominantZoneSentence(current: string | null, previous: string | null): 
     : `La zona predominante cambió de ${previous} a ${current}.`;
 }
 
-function limitationSentence(current: Pick<SnapshotComparisonInput, 'hasRgbImage' | 'hasNdviImage' | 'hasNdmiImage'>): string | null {
+function limitationSentence(
+  current: Pick<
+    SnapshotComparisonInput,
+    'hasRgbImage' | 'hasNdviImage' | 'hasNdmiImage'
+  >,
+): string | null {
   const missing: string[] = [];
   if (!current.hasRgbImage) missing.push('RGB');
   if (!current.hasNdviImage) missing.push('NDVI');
@@ -154,11 +175,18 @@ export function compareWeeklySnapshots(
   const scoreDelta = delta(current.score, previous.score, 0);
   const ndviMeanDelta = delta(current.ndviMean, previous.ndviMean, 3);
   const ndmiMeanDelta = delta(current.ndmiMean, previous.ndmiMean, 3);
-  const analyzedAreaDeltaHa = delta(current.analyzedAreaHa, previous.analyzedAreaHa, 2);
-  const dominantZoneChanged = Boolean(
-    current.dominantZone && previous.dominantZone && current.dominantZone !== previous.dominantZone,
+  const analyzedAreaDeltaHa = delta(
+    current.analyzedAreaHa,
+    previous.analyzedAreaHa,
+    2,
   );
-  const dataQualityChanged = current.dataQualityStatus !== previous.dataQualityStatus;
+  const dominantZoneChanged = Boolean(
+    current.dominantZone &&
+    previous.dominantZone &&
+    current.dominantZone !== previous.dominantZone,
+  );
+  const dataQualityChanged =
+    current.dataQualityStatus !== previous.dataQualityStatus;
 
   const summary = [
     scoreSentence(scoreDelta),

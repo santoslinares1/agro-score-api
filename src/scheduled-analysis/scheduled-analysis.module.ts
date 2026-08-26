@@ -6,6 +6,7 @@ import { AnalysisVerdictModule } from '../analysis-verdict/analysis-verdict.modu
 import { EmailModule } from '../email/email.module';
 import { FieldsModule } from '../fields/fields.module';
 import { UsersModule } from '../users/users.module';
+import { WeeklyTechnicalVerdictModule } from '../weekly-technical-verdict/weekly-technical-verdict.module';
 import { FieldAnalysisSchedule } from './entities/field-analysis-schedule.entity';
 import { ScheduledAnalysisRun } from './entities/scheduled-analysis-run.entity';
 import { WeeklyAnalysisSnapshot } from './entities/weekly-analysis-snapshot.entity';
@@ -38,6 +39,7 @@ import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.servic
     AnalysisVerdictModule,
     UsersModule,
     EmailModule,
+    WeeklyTechnicalVerdictModule,
   ],
   controllers: [ScheduledAnalysisController, WeeklyAnalysisSnapshotController],
   providers: [
