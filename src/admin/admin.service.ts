@@ -8,10 +8,11 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcryptjs';
-import { LessThan, Repository } from 'typeorm';
+import { In, LessThan, Repository } from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
+import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
 import { AuditActorContext, AuditLogService } from '../audit-log/audit-log.service';
 import { AdminAuditLog } from '../audit-log/entities/admin-audit-log.entity';
 import { generateToken, hashToken } from '../auth/token.util';
@@ -24,6 +25,10 @@ import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
 import { UserRole } from '../users/user-role.enum';
 import { PublicUser, UsersService } from '../users/users.service';
+import {
+  AdminAnalysisTechnicalVerdict,
+  toAdminAnalysisTechnicalVerdict,
+} from './dto/admin-analysis-technical-verdict.dto';
 import { CreateAdminUserDto } from './dto/create-admin-user.dto';
 import { CreateInvitationDto } from './dto/create-invitation.dto';
 import { CreateUserFromAccessRequestDto } from './dto/create-user-from-access-request.dto';
@@ -77,6 +82,8 @@ export class AdminService {
     private readonly fieldLotRepository: Repository<FieldLot>,
     @InjectRepository(Analysis)
     private readonly analysisRepository: Repository<Analysis>,
+    @InjectRepository(AnalysisTechnicalVerdict)
+    private readonly analysisVerdictRepository: Repository<AnalysisTechnicalVerdict>,
     @InjectRepository(AccessRequest)
     private readonly accessRequestRepository: Repository<AccessRequest>,
     @InjectRepository(UserInvitation)
@@ -914,6 +921,15 @@ export class AdminService {
       number,
     ];
 
+    // PR 13A: una sola consulta en lote (IN analysisId) para toda la página, no una por fila —
+    // findResponseByAnalysisId (AnalysisVerdictService) está pensado para GET /analysis/:id, una
+    // sola fila, así que acá se lee el repositorio directo, mismo criterio que el resto de este
+    // método con Field/Analysis. Nunca genera ni regenera nada, solo lee lo que ya persiste
+    // AnalysisVerdictService.generateAndPersist.
+    const verdictsByAnalysisId = await this.getTechnicalVerdictsByAnalysisId(
+      items.map((analysis) => analysis.id),
+    );
+
     return {
       items: items.map((analysis) => ({
         id: analysis.id,
@@ -933,11 +949,36 @@ export class AdminService {
         retryCount: analysis.retryCount,
         lastRetriedAt: analysis.lastRetriedAt,
         createdAt: analysis.createdAt,
+        technicalVerdict: verdictsByAnalysisId.get(analysis.id) ?? null,
       })),
       total,
       page,
       limit,
     };
+  }
+
+  /**
+   * PR 13A: lectura en lote, solo lectura — nunca llama a AnalysisVerdictService.generateAndPersist
+   * ni a ningún generador. Con `ids` vacío evita un `IN ()` inválido (find() sin where devolvería
+   * todas las filas de la tabla, lo contrario de lo que se quiere acá).
+   */
+  private async getTechnicalVerdictsByAnalysisId(
+    ids: string[],
+  ): Promise<Map<string, AdminAnalysisTechnicalVerdict>> {
+    if (!ids.length) {
+      return new Map();
+    }
+
+    const verdicts = await this.analysisVerdictRepository.find({
+      where: { analysisId: In(ids) },
+    });
+
+    return new Map(
+      verdicts.map((verdict) => [
+        verdict.analysisId,
+        toAdminAnalysisTechnicalVerdict(verdict),
+      ]),
+    );
   }
 
   async markAnalysisReviewed(id: string, actor: AuditActorContext): Promise<Analysis> {

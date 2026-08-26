@@ -2,9 +2,11 @@ import { BadRequestException, ConflictException, NotFoundException } from '@nest
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import { In } from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
+import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
 import { AuditActorContext, AuditLogService } from '../audit-log/audit-log.service';
 import { AdminAuditLog } from '../audit-log/entities/admin-audit-log.entity';
 import { EmailService } from '../email/email.service';
@@ -79,6 +81,7 @@ describe('AdminService', () => {
   let passwordResetRepo: ReturnType<typeof noopRepo>;
   let fieldRepo: ReturnType<typeof noopRepo>;
   let analysisRepo: ReturnType<typeof noopRepo>;
+  let analysisVerdictRepo: ReturnType<typeof noopRepo>;
 
   beforeEach(async () => {
     accessRequestRepo = noopRepo();
@@ -86,6 +89,7 @@ describe('AdminService', () => {
     passwordResetRepo = noopRepo();
     fieldRepo = noopRepo();
     analysisRepo = noopRepo();
+    analysisVerdictRepo = noopRepo();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -134,6 +138,10 @@ describe('AdminService', () => {
         { provide: getRepositoryToken(Field), useValue: fieldRepo },
         { provide: getRepositoryToken(FieldLot), useValue: noopRepo() },
         { provide: getRepositoryToken(Analysis), useValue: analysisRepo },
+        {
+          provide: getRepositoryToken(AnalysisTechnicalVerdict),
+          useValue: analysisVerdictRepo,
+        },
         { provide: getRepositoryToken(AccessRequest), useValue: accessRequestRepo },
         { provide: getRepositoryToken(AdminAuditLog), useValue: noopRepo() },
         { provide: getRepositoryToken(UserInvitation), useValue: invitationRepo },
@@ -578,6 +586,130 @@ describe('AdminService', () => {
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'admin.analysis.retry_requested' }),
       );
+    });
+  });
+
+  describe('listAnalysis — technicalVerdict (PR 13A)', () => {
+    const buildAnalysisRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'a1',
+      fieldId: 'field-1',
+      lotName: null,
+      field: { id: 'field-1', name: 'Campo A', userId: 'user-1', user: { id: 'user-1', email: 'a@x.com', fullName: 'A' } },
+      status: 'Finalizado',
+      startedAt: new Date(),
+      completedAt: new Date(),
+      failedAt: null,
+      durationMs: 1000,
+      errorMessage: null,
+      reviewedAt: null,
+      reviewedByUserId: null,
+      retryCount: 0,
+      lastRetriedAt: null,
+      createdAt: new Date(),
+      ...overrides,
+    });
+
+    const buildQueryBuilder = (items: unknown[], total: number) => {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndMapOne: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([items, total]),
+      };
+      for (const key of ['leftJoinAndMapOne', 'orderBy', 'skip', 'take', 'andWhere']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    };
+
+    const buildVerdictRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'verdict-1',
+      analysisId: 'a1',
+      status: 'generated',
+      verdict: 'attention',
+      confidence: 'medium',
+      summary: 'El campo muestra variabilidad relevante entre zonas.',
+      keyFindings: ['Zona Alta concentra la mayor superficie.'],
+      possibleCauses: [],
+      recommendations: ['Revisar riego diferencial.'],
+      limitations: ['Cobertura satelital parcial.'],
+      inputSnapshot: {},
+      generator: 'claude',
+      promptVersion: 'technical-verdict-v1',
+      errorMessage: null,
+      generatedAt: new Date('2026-08-26T01:40:38.000Z'),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ...overrides,
+    });
+
+    it('incluye technicalVerdict por análisis con una única consulta en lote (IN analysisId)', async () => {
+      const rowA = buildAnalysisRow({ id: 'a1' });
+      const rowB = buildAnalysisRow({ id: 'a2' });
+      analysisRepo.createQueryBuilder.mockReturnValue(buildQueryBuilder([rowA, rowB], 2));
+      analysisVerdictRepo.find.mockResolvedValue([buildVerdictRow({ analysisId: 'a1' })]);
+
+      const result = await service.listAnalysis({ page: 1, limit: 20 });
+
+      expect(analysisVerdictRepo.find).toHaveBeenCalledTimes(1);
+      expect(analysisVerdictRepo.find).toHaveBeenCalledWith({
+        where: { analysisId: In(['a1', 'a2']) },
+      });
+      expect(result.items[0].technicalVerdict).toEqual(
+        expect.objectContaining({
+          status: 'generated',
+          verdict: 'attention',
+          confidence: 'medium',
+        }),
+      );
+      expect(result.items[1].technicalVerdict).toBeNull();
+    });
+
+    it('expone generator/promptVersion/generatedAt/errorMessage — a diferencia del contrato público', async () => {
+      const row = buildAnalysisRow({ id: 'a1' });
+      analysisRepo.createQueryBuilder.mockReturnValue(buildQueryBuilder([row], 1));
+      analysisVerdictRepo.find.mockResolvedValue([
+        buildVerdictRow({
+          analysisId: 'a1',
+          status: 'failed',
+          verdict: 'insufficient_data',
+          confidence: 'low',
+          errorMessage: 'Claude rechazó la API key configurada (401).',
+          generatedAt: null,
+        }),
+      ]);
+
+      const result = await service.listAnalysis({ page: 1, limit: 20 });
+
+      expect(result.items[0].technicalVerdict).toEqual(
+        expect.objectContaining({
+          status: 'failed',
+          generator: 'claude',
+          promptVersion: 'technical-verdict-v1',
+          errorMessage: 'Claude rechazó la API key configurada (401).',
+        }),
+      );
+    });
+
+    it('technicalVerdict es null cuando no existe fila para ese análisis', async () => {
+      const row = buildAnalysisRow({ id: 'a1' });
+      analysisRepo.createQueryBuilder.mockReturnValue(buildQueryBuilder([row], 1));
+      analysisVerdictRepo.find.mockResolvedValue([]);
+
+      const result = await service.listAnalysis({ page: 1, limit: 20 });
+
+      expect(result.items[0].technicalVerdict).toBeNull();
+    });
+
+    it('con la página vacía, no consulta analysis_technical_verdicts (evita un IN vacío)', async () => {
+      analysisRepo.createQueryBuilder.mockReturnValue(buildQueryBuilder([], 0));
+
+      const result = await service.listAnalysis({ page: 1, limit: 20 });
+
+      expect(analysisVerdictRepo.find).not.toHaveBeenCalled();
+      expect(result.items).toEqual([]);
     });
   });
 

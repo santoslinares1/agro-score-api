@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
+import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
 import { AuditLogModule } from '../audit-log/audit-log.module';
 import { EmailModule } from '../email/email.module';
 import { Field } from '../fields/entities/field.entity';
@@ -35,6 +36,13 @@ import { AdminService } from './admin.service';
  * diferencia de lo que decía el comentario viejo acá). AdminModule ya no lo
  * provee directo, solo lo importa. Suma también EmailModule para el envío
  * real de invitaciones/reset (ver src/email/email.module.ts).
+ *
+ * PR 13A: AnalysisTechnicalVerdict entra por el mismo criterio que
+ * Field/FieldLot/Analysis — repositorio directo, no AnalysisVerdictModule/
+ * AnalysisVerdictService. findResponseByAnalysisId no sirve acá igual (no
+ * expone errorMessage, ver admin-analysis-technical-verdict.dto.ts) y
+ * AdminService necesita una lectura en lote (IN analysisId) para el listado
+ * paginado, no una consulta por id como esa.
  */
 @Module({
   imports: [
@@ -46,6 +54,7 @@ import { AdminService } from './admin.service';
       Field,
       FieldLot,
       Analysis,
+      AnalysisTechnicalVerdict,
       AccessRequest,
       UserInvitation,
       PasswordResetToken,
