@@ -13,6 +13,8 @@ import { EmailService } from '../email/email.service';
 import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
+import { FieldAnalysisSchedule } from '../scheduled-analysis/entities/field-analysis-schedule.entity';
+import { ScheduledAnalysisRun } from '../scheduled-analysis/entities/scheduled-analysis-run.entity';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
@@ -82,6 +84,8 @@ describe('AdminService', () => {
   let fieldRepo: ReturnType<typeof noopRepo>;
   let analysisRepo: ReturnType<typeof noopRepo>;
   let analysisVerdictRepo: ReturnType<typeof noopRepo>;
+  let fieldAnalysisScheduleRepo: ReturnType<typeof noopRepo>;
+  let scheduledAnalysisRunRepo: ReturnType<typeof noopRepo>;
 
   beforeEach(async () => {
     accessRequestRepo = noopRepo();
@@ -90,6 +94,8 @@ describe('AdminService', () => {
     fieldRepo = noopRepo();
     analysisRepo = noopRepo();
     analysisVerdictRepo = noopRepo();
+    fieldAnalysisScheduleRepo = noopRepo();
+    scheduledAnalysisRunRepo = noopRepo();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -141,6 +147,14 @@ describe('AdminService', () => {
         {
           provide: getRepositoryToken(AnalysisTechnicalVerdict),
           useValue: analysisVerdictRepo,
+        },
+        {
+          provide: getRepositoryToken(FieldAnalysisSchedule),
+          useValue: fieldAnalysisScheduleRepo,
+        },
+        {
+          provide: getRepositoryToken(ScheduledAnalysisRun),
+          useValue: scheduledAnalysisRunRepo,
         },
         { provide: getRepositoryToken(AccessRequest), useValue: accessRequestRepo },
         { provide: getRepositoryToken(AdminAuditLog), useValue: noopRepo() },
@@ -710,6 +724,229 @@ describe('AdminService', () => {
 
       expect(analysisVerdictRepo.find).not.toHaveBeenCalled();
       expect(result.items).toEqual([]);
+    });
+  });
+
+  describe('listScheduledAnalysis (PR 13B)', () => {
+    const buildScheduleRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'schedule-1',
+      fieldId: 'field-1',
+      userId: 'user-1',
+      field: {
+        id: 'field-1',
+        name: 'Campo A',
+        userId: 'user-1',
+        user: { id: 'user-1', email: 'a@x.com', fullName: 'A' },
+      },
+      enabled: true,
+      frequency: 'weekly',
+      nextRunAt: new Date('2026-09-01T12:00:00Z'),
+      lastRunAt: new Date('2026-08-25T12:00:00Z'),
+      lastStatus: 'completed',
+      lastErrorMessage: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ...overrides,
+    });
+
+    const buildScheduleQueryBuilder = (items: unknown[], total: number) => {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndMapOne: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([items, total]),
+      };
+      for (const key of ['leftJoinAndMapOne', 'orderBy', 'skip', 'take']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    };
+
+    const buildRunRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'run-1',
+      scheduleId: 'schedule-1',
+      fieldId: 'field-1',
+      userId: 'user-1',
+      analysisId: 'a1',
+      analysis: { id: 'a1', status: 'Finalizado' },
+      status: 'completed',
+      scheduledFor: '2026-08-24',
+      startedAt: new Date(),
+      completedAt: new Date(),
+      failedAt: null,
+      emailSentAt: new Date('2026-08-25T12:05:00.000Z'),
+      errorMessage: null,
+      metadata: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ...overrides,
+    });
+
+    const buildRunQueryBuilder = (items: unknown[]) => {
+      const qb: Record<string, jest.Mock> = {
+        distinctOn: jest.fn(),
+        leftJoinAndSelect: jest.fn(),
+        where: jest.fn(),
+        orderBy: jest.fn(),
+        addOrderBy: jest.fn(),
+        getMany: jest.fn().mockResolvedValue(items),
+      };
+      for (const key of ['distinctOn', 'leftJoinAndSelect', 'where', 'orderBy', 'addOrderBy']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    };
+
+    it('arma latestRun con analysisStatus resuelto en la misma query (sin consulta aparte)', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildScheduleQueryBuilder([buildScheduleRow()], 1),
+      );
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildRunQueryBuilder([buildRunRow()]),
+      );
+      analysisVerdictRepo.find.mockResolvedValue([]);
+
+      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+      expect(scheduledAnalysisRunRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(result.items[0].latestRun).toEqual(
+        expect.objectContaining({ analysisId: 'a1', analysisStatus: 'Finalizado' }),
+      );
+    });
+
+    it('incluye technicalVerdict cuando existe para el analysisId de latestRun', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildScheduleQueryBuilder([buildScheduleRow()], 1),
+      );
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildRunQueryBuilder([buildRunRow()]),
+      );
+      analysisVerdictRepo.find.mockResolvedValue([
+        {
+          id: 'verdict-1',
+          analysisId: 'a1',
+          status: 'generated',
+          verdict: 'favorable',
+          confidence: 'high',
+          summary: 'Resumen.',
+          keyFindings: [],
+          possibleCauses: [],
+          recommendations: [],
+          limitations: [],
+          inputSnapshot: {},
+          generator: 'claude',
+          promptVersion: 'technical-verdict-v1',
+          errorMessage: null,
+          generatedAt: new Date(),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ]);
+
+      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+      expect(analysisVerdictRepo.find).toHaveBeenCalledWith({ where: { analysisId: In(['a1']) } });
+      expect(result.items[0].technicalVerdict).toEqual(
+        expect.objectContaining({ status: 'generated', generator: 'claude' }),
+      );
+    });
+
+    it('technicalVerdict es null cuando no existe fila para el analysisId de latestRun', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildScheduleQueryBuilder([buildScheduleRow()], 1),
+      );
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildRunQueryBuilder([buildRunRow()]),
+      );
+      analysisVerdictRepo.find.mockResolvedValue([]);
+
+      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+      expect(result.items[0].technicalVerdict).toBeNull();
+    });
+
+    it('incluye emailSentAt del latestRun', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildScheduleQueryBuilder([buildScheduleRow()], 1),
+      );
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildRunQueryBuilder([
+          buildRunRow({ emailSentAt: new Date('2026-08-25T12:05:00.000Z') }),
+        ]),
+      );
+      analysisVerdictRepo.find.mockResolvedValue([]);
+
+      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+      expect(result.items[0].latestRun?.emailSentAt).toBe('2026-08-25T12:05:00.000Z');
+    });
+
+    it('resuelve fieldName/userEmail/userFullName desde el join de Field/User', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildScheduleQueryBuilder(
+          [
+            buildScheduleRow({
+              field: {
+                id: 'field-1',
+                name: 'Campo San José',
+                userId: 'user-1',
+                user: { id: 'user-1', email: 'owner@x.com', fullName: 'Owner Test' },
+              },
+            }),
+          ],
+          1,
+        ),
+      );
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(buildRunQueryBuilder([]));
+      analysisVerdictRepo.find.mockResolvedValue([]);
+
+      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+      expect(result.items[0]).toEqual(
+        expect.objectContaining({
+          fieldName: 'Campo San José',
+          userEmail: 'owner@x.com',
+          userFullName: 'Owner Test',
+        }),
+      );
+    });
+
+    it('un schedule sin corridas tiene latestRun null y technicalVerdict null, sin consultar verdicts', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildScheduleQueryBuilder([buildScheduleRow()], 1),
+      );
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(buildRunQueryBuilder([]));
+
+      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+      expect(result.items[0].latestRun).toBeNull();
+      expect(result.items[0].technicalVerdict).toBeNull();
+      expect(analysisVerdictRepo.find).not.toHaveBeenCalled();
+    });
+
+    it('con la página vacía, no consulta runs ni verdicts (evita un IN vacío)', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(buildScheduleQueryBuilder([], 0));
+
+      const result = await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+      expect(scheduledAnalysisRunRepo.createQueryBuilder).not.toHaveBeenCalled();
+      expect(analysisVerdictRepo.find).not.toHaveBeenCalled();
+      expect(result.items).toEqual([]);
+      expect(result.total).toBe(0);
+    });
+
+    it('devuelve page/limit/total de la paginación', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildScheduleQueryBuilder([buildScheduleRow()], 37),
+      );
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(buildRunQueryBuilder([]));
+
+      const result = await service.listScheduledAnalysis({ page: 2, limit: 10 });
+
+      expect(result.page).toBe(2);
+      expect(result.limit).toBe(10);
+      expect(result.total).toBe(37);
     });
   });
 

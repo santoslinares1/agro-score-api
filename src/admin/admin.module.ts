@@ -9,6 +9,8 @@ import { EmailModule } from '../email/email.module';
 import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerModule } from '../python-worker/python-worker.module';
+import { FieldAnalysisSchedule } from '../scheduled-analysis/entities/field-analysis-schedule.entity';
+import { ScheduledAnalysisRun } from '../scheduled-analysis/entities/scheduled-analysis-run.entity';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { UsersModule } from '../users/users.module';
@@ -43,6 +45,11 @@ import { AdminService } from './admin.service';
  * expone errorMessage, ver admin-analysis-technical-verdict.dto.ts) y
  * AdminService necesita una lectura en lote (IN analysisId) para el listado
  * paginado, no una consulta por id como esa.
+ *
+ * PR 13B: mismo criterio para FieldAnalysisSchedule/ScheduledAnalysisRun —
+ * repositorio directo, no ScheduledAnalysisModule (que además arrastra
+ * EmailModule/PythonWorkerModule/etc. innecesarios solo para leer dos
+ * tablas de solo lectura).
  */
 @Module({
   imports: [
@@ -55,6 +62,8 @@ import { AdminService } from './admin.service';
       FieldLot,
       Analysis,
       AnalysisTechnicalVerdict,
+      FieldAnalysisSchedule,
+      ScheduledAnalysisRun,
       AccessRequest,
       UserInvitation,
       PasswordResetToken,

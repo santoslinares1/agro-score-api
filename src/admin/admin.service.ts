@@ -20,6 +20,8 @@ import { EmailSendResult, EmailService } from '../email/email.service';
 import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
+import { FieldAnalysisSchedule } from '../scheduled-analysis/entities/field-analysis-schedule.entity';
+import { ScheduledAnalysisRun } from '../scheduled-analysis/entities/scheduled-analysis-run.entity';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
@@ -29,6 +31,10 @@ import {
   AdminAnalysisTechnicalVerdict,
   toAdminAnalysisTechnicalVerdict,
 } from './dto/admin-analysis-technical-verdict.dto';
+import {
+  AdminScheduledAnalysisItem,
+  AdminScheduledAnalysisRun,
+} from './dto/admin-scheduled-analysis.dto';
 import { CreateAdminUserDto } from './dto/create-admin-user.dto';
 import { CreateInvitationDto } from './dto/create-invitation.dto';
 import { CreateUserFromAccessRequestDto } from './dto/create-user-from-access-request.dto';
@@ -84,6 +90,10 @@ export class AdminService {
     private readonly analysisRepository: Repository<Analysis>,
     @InjectRepository(AnalysisTechnicalVerdict)
     private readonly analysisVerdictRepository: Repository<AnalysisTechnicalVerdict>,
+    @InjectRepository(FieldAnalysisSchedule)
+    private readonly fieldAnalysisScheduleRepository: Repository<FieldAnalysisSchedule>,
+    @InjectRepository(ScheduledAnalysisRun)
+    private readonly scheduledAnalysisRunRepository: Repository<ScheduledAnalysisRun>,
     @InjectRepository(AccessRequest)
     private readonly accessRequestRepository: Repository<AccessRequest>,
     @InjectRepository(UserInvitation)
@@ -979,6 +989,128 @@ export class AdminService {
         toAdminAnalysisTechnicalVerdict(verdict),
       ]),
     );
+  }
+
+  // ── Análisis programados (PR 13B) ───────────────────────────────────
+
+  /**
+   * PR 13B: visibilidad operativa de solo lectura sobre el pipeline de Fase 4A/5/12A — nunca
+   * dispara una corrida, nunca reintenta un email, nunca regenera un veredicto. Tres consultas en
+   * lote (nunca una por fila, sin importar cuántos schedules haya en la página):
+   *   1. schedules paginados (con Field/User resueltos, mismo criterio que listAnalysis);
+   *   2. la corrida MÁS RECIENTE de cada schedule en una sola query (DISTINCT ON, Postgres),
+   *      con su Analysis ya resuelto por join — evita una segunda consulta para analysisStatus;
+   *   3. los technicalVerdict de esos analysisId, reusando getTechnicalVerdictsByAnalysisId.
+   */
+  async listScheduledAnalysis(
+    query: PaginationQueryDto,
+  ): Promise<Paginated<AdminScheduledAnalysisItem>> {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+
+    const qb = this.fieldAnalysisScheduleRepository
+      .createQueryBuilder('schedule')
+      .leftJoinAndMapOne(
+        'schedule.field',
+        Field,
+        'field',
+        'field.id::text = schedule."fieldId"',
+      )
+      .leftJoinAndMapOne('field.user', User, 'user', 'user.id = field."userId"')
+      .orderBy('schedule.createdAt', 'DESC')
+      .skip((page - 1) * limit)
+      .take(limit);
+
+    const [schedules, total] = (await qb.getManyAndCount()) as [
+      (FieldAnalysisSchedule & {
+        field?: (Pick<Field, 'id' | 'name' | 'userId'> & {
+          user?: Pick<User, 'id' | 'email' | 'fullName'>;
+        }) | null;
+      })[],
+      number,
+    ];
+
+    const latestRunsByScheduleId = await this.getLatestRunsByScheduleId(
+      schedules.map((schedule) => schedule.id),
+    );
+
+    const analysisIds = Array.from(latestRunsByScheduleId.values())
+      .map((run) => run.analysisId)
+      .filter((id): id is string => Boolean(id));
+    const verdictsByAnalysisId = await this.getTechnicalVerdictsByAnalysisId(analysisIds);
+
+    return {
+      items: schedules.map((schedule) => {
+        const latestRun = latestRunsByScheduleId.get(schedule.id) ?? null;
+        const technicalVerdict = latestRun?.analysisId
+          ? (verdictsByAnalysisId.get(latestRun.analysisId) ?? null)
+          : null;
+
+        return {
+          id: schedule.id,
+          fieldId: schedule.fieldId,
+          fieldName: schedule.field?.name ?? null,
+          userId: schedule.userId,
+          userEmail: schedule.field?.user?.email ?? null,
+          userFullName: schedule.field?.user?.fullName ?? null,
+          enabled: schedule.enabled,
+          frequency: schedule.frequency,
+          nextRunAt: schedule.nextRunAt ? schedule.nextRunAt.toISOString() : null,
+          lastRunAt: schedule.lastRunAt ? schedule.lastRunAt.toISOString() : null,
+          lastStatus: schedule.lastStatus,
+          lastErrorMessage: schedule.lastErrorMessage,
+          latestRun: latestRun ? this.toAdminScheduledAnalysisRun(latestRun) : null,
+          technicalVerdict,
+        };
+      }),
+      total,
+      page,
+      limit,
+    };
+  }
+
+  /**
+   * DISTINCT ON (Postgres): una fila por scheduleId, la de mayor createdAt — el ORDER BY tiene que
+   * empezar por la misma columna que distinctOn (constraint real de Postgres, no un detalle de
+   * TypeORM). leftJoinAndSelect('run.analysis', ...) resuelve analysisStatus en la misma consulta,
+   * sin una query aparte por cada run.
+   */
+  private async getLatestRunsByScheduleId(
+    scheduleIds: string[],
+  ): Promise<Map<string, ScheduledAnalysisRun>> {
+    if (!scheduleIds.length) {
+      return new Map();
+    }
+
+    const runs = await this.scheduledAnalysisRunRepository
+      .createQueryBuilder('run')
+      .distinctOn(['run.scheduleId'])
+      .leftJoinAndSelect('run.analysis', 'analysis')
+      .where('run.scheduleId IN (:...scheduleIds)', { scheduleIds })
+      .orderBy('run.scheduleId', 'ASC')
+      .addOrderBy('run.createdAt', 'DESC')
+      .getMany();
+
+    return new Map(runs.map((run) => [run.scheduleId, run]));
+  }
+
+  private toAdminScheduledAnalysisRun(
+    run: ScheduledAnalysisRun,
+  ): AdminScheduledAnalysisRun {
+    return {
+      id: run.id,
+      status: run.status,
+      scheduledFor: run.scheduledFor,
+      analysisId: run.analysisId,
+      analysisStatus: run.analysis?.status ?? null,
+      startedAt: run.startedAt ? run.startedAt.toISOString() : null,
+      completedAt: run.completedAt ? run.completedAt.toISOString() : null,
+      failedAt: run.failedAt ? run.failedAt.toISOString() : null,
+      emailSentAt: run.emailSentAt ? run.emailSentAt.toISOString() : null,
+      errorMessage: run.errorMessage,
+      createdAt: run.createdAt.toISOString(),
+      updatedAt: run.updatedAt.toISOString(),
+    };
   }
 
   async markAnalysisReviewed(id: string, actor: AuditActorContext): Promise<Analysis> {

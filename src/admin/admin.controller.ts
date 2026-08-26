@@ -137,6 +137,12 @@ export class AdminController {
     return this.adminService.retryAnalysis(id, this.buildActorContext(req));
   }
 
+  // PR 13B: solo lectura — nunca dispara una corrida, nunca reintenta un email.
+  @Get('scheduled-analysis')
+  listScheduledAnalysis(@Query() query: PaginationQueryDto) {
+    return this.adminService.listScheduledAnalysis(query);
+  }
+
   @Get('access-requests')
   listAccessRequests(@Query() query: ListAccessRequestsQueryDto) {
     return this.adminService.listAccessRequests(query);
