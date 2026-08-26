@@ -1,4 +1,8 @@
 import { FieldLot } from '../../fields/entities/field-lot.entity';
+import {
+  AnalysisVerdictConfidence,
+  AnalysisVerdictLabel,
+} from '../../analysis-verdict/entities/analysis-technical-verdict.entity';
 
 export type ZoneRow = {
   zone: number;
@@ -127,6 +131,55 @@ export function zoneTextColorHex(name: string): string {
   return normalized === 'baja' || normalized === 'muy baja'
     ? '#78350f'
     : '#ffffff';
+}
+
+/**
+ * PR 11D: mismos labels que analysis-result.component.ts (PR 11C) y
+ * technical-verdict-labels.ts (agro-score-web) — el veredicto técnico usa el mismo copy en
+ * pantalla y en el PDF, nunca un texto distinto por canal.
+ */
+const VERDICT_LABELS: Record<AnalysisVerdictLabel, string> = {
+  favorable: 'Favorable',
+  attention: 'Requiere atención',
+  critical: 'Crítico',
+  insufficient_data: 'Datos insuficientes',
+};
+
+const CONFIDENCE_LABELS: Record<AnalysisVerdictConfidence, string> = {
+  low: 'Baja',
+  medium: 'Media',
+  high: 'Alta',
+};
+
+/** Mismo criterio semántico que VERDICT_BADGE_CLASSES en analysis-result.component.ts
+ * (favorable=verde, attention=ámbar, critical=rojo, insufficient_data=gris), en hex para pdfmake. */
+const VERDICT_BADGE_COLORS: Record<
+  AnalysisVerdictLabel,
+  { background: string; color: string }
+> = {
+  favorable: { background: '#f0fdf4', color: '#15803d' },
+  attention: { background: '#fffbeb', color: '#b45309' },
+  critical: { background: '#fef2f2', color: '#b91c1c' },
+  insufficient_data: { background: '#f1f5f9', color: '#475569' },
+};
+
+export function verdictLabel(verdict: AnalysisVerdictLabel | null): string {
+  return verdict ? VERDICT_LABELS[verdict] : 'No disponible';
+}
+
+export function confidenceLabel(
+  confidence: AnalysisVerdictConfidence | null,
+): string {
+  return confidence ? CONFIDENCE_LABELS[confidence] : '';
+}
+
+export function verdictBadgeStyle(verdict: AnalysisVerdictLabel | null): {
+  background: string;
+  color: string;
+} {
+  return verdict
+    ? VERDICT_BADGE_COLORS[verdict]
+    : VERDICT_BADGE_COLORS.insufficient_data;
 }
 
 function zoneNameFromNumber(zone: number): string {

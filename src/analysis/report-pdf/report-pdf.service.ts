@@ -3,9 +3,11 @@ import pdfMake from 'pdfmake';
 
 import { Analysis } from '../entities/analysis.entity';
 import { Field } from '../../fields/entities/field.entity';
+import { AnalysisTechnicalVerdictResponse } from '../../analysis-verdict/dto/analysis-technical-verdict.dto';
 import {
   buildNdviEvolutionChartSvg,
   buildPdfFilename,
+  confidenceLabel,
   fieldLocationLabel,
   formatDateDMY,
   formatHa,
@@ -34,6 +36,8 @@ import {
   isSoilClimateAvailable,
   safeText,
   scoreInterpretation,
+  verdictBadgeStyle,
+  verdictLabel,
   zoneColorHex,
   zoneTextColorHex,
 } from './report-pdf.helpers';
@@ -113,6 +117,7 @@ export class ReportPdfService {
   async build(
     analysis: Analysis,
     field: Field,
+    technicalVerdict: AnalysisTechnicalVerdictResponse | null = null,
   ): Promise<{
     stream: NodeJS.ReadableStream & { end(): void };
     filename: string;
@@ -134,7 +139,11 @@ export class ReportPdfService {
       );
     }
 
-    const docDefinition = this.buildDocDefinition(analysis, field);
+    const docDefinition = this.buildDocDefinition(
+      analysis,
+      field,
+      technicalVerdict,
+    );
     const pdf = pdfMake.createPdf(docDefinition);
     const stream = (await pdf.getStream()) as NodeJS.ReadableStream & {
       end(): void;
@@ -147,6 +156,7 @@ export class ReportPdfService {
   private buildDocDefinition(
     analysis: Analysis,
     field: Field,
+    technicalVerdict: AnalysisTechnicalVerdictResponse | null = null,
   ): TDocumentDefinitions {
     const resultJson: any = analysis.resultJson;
 
@@ -170,6 +180,7 @@ export class ReportPdfService {
         ...this.buildMetodologia(analysis, resultJson),
         ...this.buildCampoYLotes(resultJson, field),
         ...this.buildImagenes(resultJson),
+        ...this.buildVeredictoTecnico(technicalVerdict),
         ...this.buildClasificacionProductiva(resultJson),
         ...this.buildEvolucionTemporal(resultJson),
         ...this.buildLecturaPorLote(resultJson),
@@ -1006,6 +1017,122 @@ export class ReportPdfService {
     return content;
   }
 
+  /**
+   * PR 11D: el veredicto técnico ya viene generado por AnalysisVerdictService (PR 11A/11B) —
+   * nunca se regenera ni se llama a ningún proveedor acá, solo se lee lo que ya persiste
+   * AnalysisTechnicalVerdict. Mismos estados y copy que analysis-result.component.ts (PR 11C):
+   * 'generated' arma la sección completa, 'failed' un aviso no bloqueante, y null/'pending'
+   * omiten la sección entera. El PDF solo se genera para análisis 'Finalizado' (ver build()), así
+   * que 'pending' no debería ocurrir en la práctica — se omite igual en vez de mostrar un estado
+   * transitorio en un documento ya cerrado.
+   */
+  private buildVeredictoTecnico(
+    technicalVerdict: AnalysisTechnicalVerdictResponse | null,
+  ): Content[] {
+    if (!technicalVerdict || technicalVerdict.status === 'pending') {
+      return [];
+    }
+
+    if (technicalVerdict.status === 'failed') {
+      return [
+        {
+          ...this.glued(
+            this.sectionTitle('05. Veredicto técnico'),
+            this.emptyNote(
+              'El análisis satelital finalizó correctamente, pero no se pudo generar el veredicto técnico automático.',
+            ),
+          ),
+          pageBreak: 'before',
+        },
+      ];
+    }
+
+    if (technicalVerdict.status !== 'generated') {
+      return [];
+    }
+
+    const confidence = confidenceLabel(technicalVerdict.confidence);
+    const badges: Content = {
+      columns: [
+        {
+          width: 'auto',
+          ...this.badge(
+            verdictLabel(technicalVerdict.verdict),
+            verdictBadgeStyle(technicalVerdict.verdict),
+          ),
+        },
+        ...(confidence
+          ? [
+              {
+                width: 'auto',
+                ...this.badge(`Confianza: ${confidence}`, {
+                  background: COLORS.panel,
+                  color: COLORS.muted,
+                }),
+              },
+            ]
+          : []),
+        { width: '*', text: '' },
+      ],
+      columnGap: 8,
+    };
+
+    const content: Content[] = [
+      {
+        ...this.glued(this.sectionTitle('05. Veredicto técnico'), badges),
+        pageBreak: 'before',
+      },
+    ];
+
+    if (technicalVerdict.summary) {
+      content.push({
+        text: technicalVerdict.summary,
+        lineHeight: 1.3,
+        margin: [0, 10, 0, 0],
+      });
+    }
+
+    content.push(
+      ...this.buildVerdictList(
+        'Hallazgos principales',
+        technicalVerdict.keyFindings,
+      ),
+      ...this.buildVerdictList(
+        'Posibles causas',
+        technicalVerdict.possibleCauses,
+      ),
+      ...this.buildVerdictList(
+        'Recomendaciones',
+        technicalVerdict.recommendations,
+      ),
+      ...this.buildVerdictList('Limitaciones', technicalVerdict.limitations),
+      {
+        text:
+          'Veredicto técnico generado automáticamente a partir del análisis satelital. Debe ' +
+          'validarse con observación en campo.',
+        style: 'muted',
+        margin: [0, 10, 0, 0],
+      },
+    );
+
+    return content;
+  }
+
+  /**
+   * Subsección de lista del veredicto (hallazgos/causas/recomendaciones/limitaciones) — nunca
+   * renderiza el subtítulo si el array viene vacío, para no dejar un título sin bullets.
+   */
+  private buildVerdictList(title: string, items: string[]): Content[] {
+    if (!items.length) {
+      return [];
+    }
+
+    return [
+      { text: title, bold: true, fontSize: 10, margin: [0, 10, 0, 3] },
+      { ul: items, lineHeight: 1.25 },
+    ];
+  }
+
   private buildClasificacionProductiva(resultJson: any): Content[] {
     const zones = getFieldZoneTotals(resultJson);
 
@@ -1014,7 +1141,7 @@ export class ReportPdfService {
         {
           // Regla 4: Clasificación productiva siempre arranca en página nueva después de NDMI.
           ...this.glued(
-            this.sectionTitle('05. Clasificación productiva'),
+            this.sectionTitle('06. Clasificación productiva'),
             this.emptyNote(
               'Todavía no hay datos consolidados de clasificación productiva para este campo.',
             ),
@@ -1040,7 +1167,7 @@ export class ReportPdfService {
     return [
       {
         // Regla 4: Clasificación productiva siempre arranca en página nueva después de NDMI.
-        ...this.glued(this.sectionTitle('05. Clasificación productiva'), {
+        ...this.glued(this.sectionTitle('06. Clasificación productiva'), {
           text:
             'Las zonas productivas representan diferencias relativas dentro del campo según la respuesta ' +
             'satelital. No representa un rendimiento medido.',
@@ -1120,7 +1247,7 @@ export class ReportPdfService {
         {
           // Regla 5: arranca en página nueva para separarla con claridad de Clasificación productiva.
           ...this.glued(
-            this.sectionTitle('06. Gráficos de evolución NDVI'),
+            this.sectionTitle('07. Gráficos de evolución NDVI'),
             this.emptyNote(
               'No hay datos suficientes para graficar la evolución temporal.',
             ),
@@ -1133,7 +1260,7 @@ export class ReportPdfService {
     const content: Content[] = [
       {
         ...this.glued(
-          this.sectionTitle('06. Gráficos de evolución NDVI'),
+          this.sectionTitle('07. Gráficos de evolución NDVI'),
           this.mutedText(
             'Los siguientes gráficos representan la evolución del índice NDVI para las campañas ' +
               'estudiadas. El eje X indica la fecha de observación satelital y el eje Y el valor de ' +
@@ -1210,7 +1337,7 @@ export class ReportPdfService {
           // Regla 6: Lectura por lote siempre arranca en página nueva (antes esta rama sin
           // datos no forzaba el salto, a diferencia de la rama con datos).
           ...this.glued(
-            this.sectionTitle('07. Lectura por lote'),
+            this.sectionTitle('08. Lectura por lote'),
             this.emptyNote(
               'Todavía no hay lectura por lote interno para este campo.',
             ),
@@ -1223,7 +1350,7 @@ export class ReportPdfService {
     const content: Content[] = [
       {
         ...this.glued(
-          this.sectionTitle('07. Lectura por lote'),
+          this.sectionTitle('08. Lectura por lote'),
           this.mutedText(
             'Superficie, zona predominante y clasificación productiva de cada lote analizado.',
             [0, 0, 0, 10],
@@ -1322,7 +1449,7 @@ export class ReportPdfService {
     );
 
     return [
-      this.glued(this.sectionTitle('08. Conclusión técnica preliminar'), {
+      this.glued(this.sectionTitle('09. Conclusión técnica preliminar'), {
         ul: bullets,
         margin: [0, 0, 0, 10],
       }),
@@ -1363,7 +1490,7 @@ export class ReportPdfService {
     }
 
     return [
-      this.glued(this.sectionTitle('09. Limitaciones metodológicas'), {
+      this.glued(this.sectionTitle('10. Limitaciones metodológicas'), {
         ul: items,
         lineHeight: 1.3,
       }),

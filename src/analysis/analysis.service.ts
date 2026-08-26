@@ -149,10 +149,10 @@ export class AnalysisService {
 
   /**
    * PR 11A: versión de findOneOwned para GET /analysis/:id que además adjunta el veredicto
-   * técnico (technicalVerdict) — la única ruta que lo necesita (ver AnalysisVerdictService y el
-   * diagnóstico del PR: la pantalla de resultado hace un único fetch acá una vez que
-   * /analysis/:id/status reporta 'Finalizado'). Las rutas de reporte (HTML/PDF) siguen usando
-   * findOneOwned "pelado" para no pagar esta consulta extra cuando no la necesitan.
+   * técnico (technicalVerdict) — la pantalla de resultado hace un único fetch acá una vez que
+   * /analysis/:id/status reporta 'Finalizado'. Las rutas de reporte HTML siguen usando
+   * findOneOwned "pelado" para no pagar esta consulta extra cuando no la necesitan; el PDF
+   * (PR 11D) la resuelve por separado dentro de buildReportPdf, ver más abajo.
    *
    * technicalVerdict es null si todavía no existe fila (análisis 'Procesando', o 'Error' — nunca
    * se genera veredicto para un análisis que no terminó bien, ver AnalysisService.
@@ -288,6 +288,11 @@ export class AnalysisService {
    * ningún proceso llegó a generar nunca). Recibe el analysis ya validado por ownership
    * (findOneOwned) y vuelve a resolver+validar el Field dueño acá — mismo gate AUTH-4 que el
    * resto de las rutas de reporte, nunca genera el PDF antes de confirmar ownership.
+   *
+   * PR 11D: además resuelve el technicalVerdict ya persistido (nunca lo regenera) para que
+   * ReportPdfService pueda incluir la sección "Veredicto técnico" — consulta separada en vez de
+   * usar findOneOwnedWithVerdict, porque acá ya se parte de un `analysis` que el caller resolvió
+   * de otra forma (ver AnalysisController.downloadPdfReport).
    */
   async buildReportPdf(
     analysis: Analysis,
@@ -303,8 +308,10 @@ export class AnalysisService {
     }
 
     const field = await this.fieldsService.findOne(fieldId, userId);
+    const technicalVerdict =
+      await this.analysisVerdictService.findResponseByAnalysisId(analysis.id);
 
-    return this.reportPdfService.build(analysis, field);
+    return this.reportPdfService.build(analysis, field, technicalVerdict);
   }
 
   async runFieldAnalysis(

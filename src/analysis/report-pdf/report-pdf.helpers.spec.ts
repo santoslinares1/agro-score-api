@@ -19,13 +19,49 @@ import {
   getLotsOverview,
   getNdviEvolutionByCampaign,
   getTopZoneByHectares,
+  confidenceLabel,
   safeText,
   scoreInterpretation,
   slugify,
+  verdictBadgeStyle,
+  verdictLabel,
   zoneColorHex,
 } from './report-pdf.helpers';
 
 describe('report-pdf.helpers', () => {
+  describe('verdictLabel / confidenceLabel / verdictBadgeStyle (PR 11D)', () => {
+    it('mapea cada verdict al mismo label que analysis-result.component.ts', () => {
+      expect(verdictLabel('favorable')).toBe('Favorable');
+      expect(verdictLabel('attention')).toBe('Requiere atención');
+      expect(verdictLabel('critical')).toBe('Crítico');
+      expect(verdictLabel('insufficient_data')).toBe('Datos insuficientes');
+      expect(verdictLabel(null)).toBe('No disponible');
+    });
+
+    it('mapea cada confidence al mismo label que analysis-result.component.ts', () => {
+      expect(confidenceLabel('low')).toBe('Baja');
+      expect(confidenceLabel('medium')).toBe('Media');
+      expect(confidenceLabel('high')).toBe('Alta');
+      expect(confidenceLabel(null)).toBe('');
+    });
+
+    it('da un color distinto por verdict y cae a gris si verdict es null', () => {
+      const favorable = verdictBadgeStyle('favorable');
+      const attention = verdictBadgeStyle('attention');
+      const critical = verdictBadgeStyle('critical');
+      const nullVerdict = verdictBadgeStyle(null);
+
+      expect(
+        new Set([
+          favorable.background,
+          attention.background,
+          critical.background,
+        ]).size,
+      ).toBe(3);
+      expect(nullVerdict).toEqual(verdictBadgeStyle('insufficient_data'));
+    });
+  });
+
   describe('zoneColorHex', () => {
     // Fase 8E.1: "Alta" y "Muy Alta" deben tener colores distintos, y rojo queda reservado
     // para error/sin datos, nunca para "Baja".

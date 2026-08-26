@@ -473,8 +473,53 @@ describe('AnalysisService', () => {
       const result = await service.buildReportPdf(analysis, 'user-A');
 
       expect(fieldsService.findOne).toHaveBeenCalledWith('field-1', 'user-A');
-      expect(reportPdfService.build).toHaveBeenCalledWith(analysis, field);
+      expect(
+        analysisVerdictService.findResponseByAnalysisId,
+      ).toHaveBeenCalledWith('analysis-1');
+      expect(reportPdfService.build).toHaveBeenCalledWith(
+        analysis,
+        field,
+        null,
+      );
       expect(result).toBe(built);
+    });
+
+    // PR 11D: el PDF nunca regenera el veredicto — solo lee lo que ya persiste
+    // AnalysisVerdictService y lo pasa tal cual a ReportPdfService.build.
+    it('pasa el technicalVerdict ya persistido a ReportPdfService.build sin regenerarlo', async () => {
+      const analysis = buildAnalysis({ scope: 'field', fieldId: 'field-1' });
+      const field = buildField();
+      const technicalVerdict = {
+        status: 'generated' as const,
+        verdict: 'favorable' as const,
+        confidence: 'high' as const,
+        summary: 'Resumen.',
+        keyFindings: [],
+        possibleCauses: [],
+        recommendations: [],
+        limitations: [],
+        generatedAt: '2026-01-01T00:00:00.000Z',
+        generator: 'deterministic-v1',
+        promptVersion: null,
+      };
+
+      fieldsService.findOne.mockResolvedValue(field);
+      analysisVerdictService.findResponseByAnalysisId.mockResolvedValue(
+        technicalVerdict,
+      );
+      reportPdfService.build.mockResolvedValue({
+        stream: {} as any,
+        filename: 'x.pdf',
+      });
+
+      await service.buildReportPdf(analysis, 'user-A');
+
+      expect(reportPdfService.build).toHaveBeenCalledWith(
+        analysis,
+        field,
+        technicalVerdict,
+      );
+      expect(analysisVerdictService.generateAndPersist).not.toHaveBeenCalled();
     });
 
     it('resuelve el Field por scope=null legacy (fieldId guardado en lotId)', async () => {

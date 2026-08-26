@@ -2,10 +2,28 @@ import { NotFoundException } from '@nestjs/common';
 
 import { Field } from '../../fields/entities/field.entity';
 import { Analysis } from '../entities/analysis.entity';
+import { AnalysisTechnicalVerdictResponse } from '../../analysis-verdict/dto/analysis-technical-verdict.dto';
 import { ReportPdfService } from './report-pdf.service';
 
 describe('ReportPdfService', () => {
   let service: ReportPdfService;
+
+  const buildTechnicalVerdict = (
+    overrides: Partial<AnalysisTechnicalVerdictResponse> = {},
+  ): AnalysisTechnicalVerdictResponse => ({
+    status: 'generated',
+    verdict: 'attention',
+    confidence: 'medium',
+    summary: 'El campo muestra variabilidad relevante entre zonas.',
+    keyFindings: ['Hallazgo uno', 'Hallazgo dos'],
+    possibleCauses: [],
+    recommendations: ['Revisar riego en sector sur.'],
+    limitations: ['Cobertura satelital parcial en el período.'],
+    generatedAt: '2026-01-15T00:00:00.000Z',
+    generator: 'claude-technical-verdict',
+    promptVersion: 'technical-verdict-v1',
+    ...overrides,
+  });
 
   const buildAnalysis = (overrides: Partial<Analysis> = {}): Analysis => ({
     id: 'analysis-1',
@@ -205,6 +223,184 @@ describe('ReportPdfService', () => {
     });
   });
 
+  describe('Veredicto técnico (PR 11D)', () => {
+    it('status generated: incluye la sección con verdict/confidence mapeados, resumen y listas no vacías', () => {
+      const analysis = buildAnalysis();
+      const field = buildField();
+      const technicalVerdict = buildTechnicalVerdict();
+      const docDefinition = (service as any).buildDocDefinition(
+        analysis,
+        field,
+        technicalVerdict,
+      );
+      const serialized = JSON.stringify(docDefinition.content);
+
+      expect(serialized).toContain('Veredicto técnico');
+      expect(serialized).toContain('Requiere atención');
+      expect(serialized).toContain('Confianza: Media');
+      expect(serialized).toContain(
+        'El campo muestra variabilidad relevante entre zonas.',
+      );
+      expect(serialized).toContain('Hallazgo uno');
+      expect(serialized).toContain('Recomendaciones');
+      expect(serialized).toContain('Revisar riego en sector sur.');
+      expect(serialized).toContain('Limitaciones');
+      expect(serialized).toContain(
+        'Cobertura satelital parcial en el período.',
+      );
+      expect(serialized).toContain(
+        'Veredicto técnico generado automáticamente a partir del análisis satelital.',
+      );
+    });
+
+    it('no renderiza el subtítulo "Posibles causas" cuando el array viene vacío, ni "undefined"/"null"', () => {
+      const analysis = buildAnalysis();
+      const field = buildField();
+      const technicalVerdict = buildTechnicalVerdict({ possibleCauses: [] });
+      const docDefinition = (service as any).buildDocDefinition(
+        analysis,
+        field,
+        technicalVerdict,
+      );
+      const serialized = JSON.stringify(docDefinition.content);
+
+      expect(serialized).not.toContain('Posibles causas');
+      expect(serialized).not.toContain('undefined');
+      expect(serialized.toLowerCase()).not.toContain('"null"');
+    });
+
+    it('nunca expone generator/promptVersion/generatedAt en el contenido renderizado', () => {
+      const analysis = buildAnalysis();
+      const field = buildField();
+      const technicalVerdict = buildTechnicalVerdict();
+      const docDefinition = (service as any).buildDocDefinition(
+        analysis,
+        field,
+        technicalVerdict,
+      );
+      const serialized = JSON.stringify(docDefinition.content);
+
+      expect(serialized).not.toContain('claude-technical-verdict');
+      expect(serialized).not.toContain('technical-verdict-v1');
+      expect(serialized).not.toContain('2026-01-15T00:00:00.000Z');
+    });
+
+    it('nunca menciona Claude/Anthropic/IA/chatbot en ningún estado del veredicto', () => {
+      const analysis = buildAnalysis();
+      const field = buildField();
+
+      for (const technicalVerdict of [
+        buildTechnicalVerdict({ status: 'generated' }),
+        buildTechnicalVerdict({
+          status: 'failed',
+          verdict: null,
+          confidence: null,
+          summary: null,
+          keyFindings: [],
+          possibleCauses: [],
+          recommendations: [],
+          limitations: [],
+        }),
+      ]) {
+        const docDefinition = (service as any).buildDocDefinition(
+          analysis,
+          field,
+          technicalVerdict,
+        );
+        const serialized = JSON.stringify(docDefinition.content);
+
+        for (const forbidden of ['claude', 'anthropic', 'chatbot']) {
+          expect(serialized.toLowerCase()).not.toContain(forbidden);
+        }
+        expect(/\bia\b/i.test(serialized)).toBe(false);
+      }
+    });
+
+    it('status failed: muestra el aviso no bloqueante y no renderiza ninguna lista', () => {
+      const analysis = buildAnalysis();
+      const field = buildField();
+      const technicalVerdict = buildTechnicalVerdict({
+        status: 'failed',
+        verdict: null,
+        confidence: null,
+        summary: null,
+        keyFindings: [],
+        possibleCauses: [],
+        recommendations: [],
+        limitations: [],
+      });
+      const docDefinition = (service as any).buildDocDefinition(
+        analysis,
+        field,
+        technicalVerdict,
+      );
+      const serialized = JSON.stringify(docDefinition.content);
+
+      expect(serialized).toContain('Veredicto técnico');
+      expect(serialized).toContain(
+        'El análisis satelital finalizó correctamente, pero no se pudo generar el veredicto técnico automático.',
+      );
+      expect(serialized).not.toContain('Hallazgos principales');
+      expect(serialized).not.toContain('Recomendaciones');
+    });
+
+    it('technicalVerdict null u omitido: la sección se omite por completo y el resto del PDF sigue intacto', () => {
+      const analysis = buildAnalysis();
+      const field = buildField();
+
+      const withNull = JSON.stringify(
+        (service as any).buildDocDefinition(analysis, field, null).content,
+      );
+      const withoutArg = JSON.stringify(
+        (service as any).buildDocDefinition(analysis, field).content,
+      );
+
+      for (const serialized of [withNull, withoutArg]) {
+        expect(serialized).not.toContain('Veredicto técnico');
+        // El resto del reporte (resumen, imágenes, clasificación) sigue presente sin el veredicto.
+        expect(serialized).toContain('Resumen ejecutivo');
+        expect(serialized).toContain('Clasificación productiva');
+      }
+    });
+
+    it('status pending: se omite igual que null (el PDF solo se genera para análisis Finalizado)', () => {
+      const analysis = buildAnalysis();
+      const field = buildField();
+      const technicalVerdict = buildTechnicalVerdict({ status: 'pending' });
+      const serialized = JSON.stringify(
+        (service as any).buildDocDefinition(analysis, field, technicalVerdict)
+          .content,
+      );
+
+      expect(serialized).not.toContain('Veredicto técnico');
+    });
+
+    it('build() end-to-end con technicalVerdict generated sigue produciendo un PDF real válido', async () => {
+      const analysis = buildAnalysis();
+      const field = buildField();
+      const technicalVerdict = buildTechnicalVerdict();
+
+      const { stream, filename } = await service.build(
+        analysis,
+        field,
+        technicalVerdict,
+      );
+
+      expect(filename).toBe('agroscore-reporte-campo-san-jose-2026-01-15.pdf');
+
+      const chunks: Buffer[] = [];
+      stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+      const ended = new Promise<void>((resolve) =>
+        stream.on('end', () => resolve()),
+      );
+      stream.end();
+      await ended;
+
+      const buffer = Buffer.concat(chunks);
+      expect(buffer.subarray(0, 4).toString('ascii')).toBe('%PDF');
+    });
+  });
+
   describe('gráficos de evolución NDVI por campaña y por lote (REPORT-NDVI-EVOL-1)', () => {
     it('inserta un nodo svg real por lote cuando hay al menos 2 observaciones NDVI en una campaña', () => {
       const analysis = buildAnalysis({
@@ -237,7 +433,7 @@ describe('ReportPdfService', () => {
       // fecha real de la observación (2024-02-01), no un promedio de campaña.
       expect(serialized).toContain('01/02');
       expect(serialized).toContain('Campaña 2023/24');
-      expect(serialized).toContain('06. Gráficos de evolución NDVI');
+      expect(serialized).toContain('07. Gráficos de evolución NDVI');
       expect(serialized).toContain(
         'El eje X indica la fecha de observación satelital y el eje Y el valor de',
       );
