@@ -6,7 +6,7 @@ import {
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { In } from 'typeorm';
+import { In, IsNull } from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
@@ -1332,6 +1332,157 @@ describe('AdminService', () => {
           expect.objectContaining({ status: 'generated', trend: 'stable' }),
         );
       });
+    });
+  });
+
+  describe('getMetrics — alertas operativas (Admin PR 1)', () => {
+    // Builder combinado: getMetrics() usa createQueryBuilder sobre analysisRepo tanto para
+    // getAverageAnalysisDurationMs (select/where/andWhere/getRawOne) como para countSince
+    // (where/andWhere/getCount) — un solo mock encadenable cubre ambos usos.
+    function buildAnalysisQueryBuilder() {
+      const qb: Record<string, jest.Mock> = {
+        select: jest.fn(),
+        where: jest.fn(),
+        andWhere: jest.fn(),
+        getRawOne: jest.fn().mockResolvedValue({ avg: null }),
+        getCount: jest.fn().mockResolvedValue(0),
+      };
+      for (const key of ['select', 'where', 'andWhere']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    function buildAccessRequestStatusQueryBuilder() {
+      const qb: Record<string, jest.Mock> = {
+        select: jest.fn(),
+        addSelect: jest.fn(),
+        groupBy: jest.fn(),
+        getRawMany: jest.fn().mockResolvedValue([]),
+      };
+      for (const key of ['select', 'addSelect', 'groupBy']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    beforeEach(() => {
+      usersService.count.mockResolvedValue(10);
+      usersService.countActive.mockResolvedValue(8);
+      usersService.countCreatedSince.mockResolvedValue(0);
+      fieldRepo.count.mockResolvedValue(78);
+      fieldRepo.manager.query.mockResolvedValue([{ count: 0 }]);
+      // countSince() también se llama con this.fieldRepository (fieldsCreatedLast7/30Days).
+      fieldRepo.createQueryBuilder.mockImplementation(() =>
+        buildAnalysisQueryBuilder(),
+      );
+      analysisRepo.count.mockResolvedValue(0);
+      analysisRepo.find.mockResolvedValue([]);
+      analysisRepo.createQueryBuilder.mockImplementation(() =>
+        buildAnalysisQueryBuilder(),
+      );
+      accessRequestRepo.find.mockResolvedValue([]);
+      accessRequestRepo.createQueryBuilder.mockReturnValue(
+        buildAccessRequestStatusQueryBuilder(),
+      );
+      fieldAnalysisScheduleRepo.count.mockResolvedValue(0);
+    });
+
+    it('incluye activeSchedulesWithoutRuns contando schedules enabled=true con lastRunAt IS NULL', async () => {
+      fieldAnalysisScheduleRepo.count.mockResolvedValue(2);
+
+      const metrics = await service.getMetrics();
+
+      expect(fieldAnalysisScheduleRepo.count).toHaveBeenCalledWith({
+        where: { enabled: true, lastRunAt: IsNull() },
+      });
+      expect(metrics.activeSchedulesWithoutRuns).toBe(2);
+    });
+
+    it('incluye unreviewedFailedAnalysisOlderThan7Days contando solo status=Error sin reviewedAt', async () => {
+      analysisRepo.count.mockResolvedValue(4);
+
+      const metrics = await service.getMetrics();
+
+      expect(analysisRepo.count).toHaveBeenCalledWith({
+        where: {
+          status: 'Error',
+          reviewedAt: IsNull(),
+          createdAt: expect.anything(),
+        },
+      });
+      expect(metrics.unreviewedFailedAnalysisOlderThan7Days).toBe(4);
+    });
+
+    it('no rompe el shape existente del Dashboard (totalUsers/totalFields/etc. siguen presentes)', async () => {
+      const metrics = await service.getMetrics();
+
+      expect(metrics).toEqual(
+        expect.objectContaining({
+          totalUsers: 10,
+          activeUsers: 8,
+          totalFields: 78,
+          fieldsWithNoAnalysis: expect.any(Number),
+          activeSchedulesWithoutRuns: expect.any(Number),
+          unreviewedFailedAnalysisOlderThan7Days: expect.any(Number),
+        }),
+      );
+    });
+  });
+
+  describe('listFields — filtro hasAnalysis (Admin PR 1)', () => {
+    function buildFieldsQueryBuilder(items: unknown[], total: number) {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndSelect: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([items, total]),
+      };
+      for (const key of [
+        'leftJoinAndSelect',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+      ]) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    it('agrega un NOT EXISTS cuando hasAnalysis=false, para "campos sin diagnóstico"', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listFields({ page: 1, limit: 20, hasAnalysis: false });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(sqlCalls.some((sql) => sql.includes('NOT EXISTS'))).toBe(true);
+    });
+
+    it('agrega un EXISTS (sin NOT) cuando hasAnalysis=true', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listFields({ page: 1, limit: 20, hasAnalysis: true });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(
+        sqlCalls.some(
+          (sql) => sql.includes('EXISTS') && !sql.includes('NOT EXISTS'),
+        ),
+      ).toBe(true);
+    });
+
+    it('no agrega ningún filtro de análisis cuando hasAnalysis no viene en el query', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listFields({ page: 1, limit: 20 });
+
+      expect(qb.andWhere).not.toHaveBeenCalled();
     });
   });
 

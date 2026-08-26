@@ -26,6 +26,7 @@ import { CreateUserFromAccessRequestDto } from './dto/create-user-from-access-re
 import { ListAccessRequestsQueryDto } from './dto/list-access-requests-query.dto';
 import { ListAnalysisQueryDto } from './dto/list-analysis-query.dto';
 import { ListAuditLogsQueryDto } from './dto/list-audit-logs-query.dto';
+import { ListFieldsQueryDto } from './dto/list-fields-query.dto';
 import { PaginationQueryDto } from './dto/pagination-query.dto';
 import { UpdateAccessRequestDto } from './dto/update-access-request.dto';
 import { UpdateAdminUserDto } from './dto/update-admin-user.dto';
@@ -75,7 +76,10 @@ export class AdminController {
   }
 
   @Post('users')
-  createUser(@Body() dto: CreateAdminUserDto, @Req() req: AuthenticatedRequest) {
+  createUser(
+    @Body() dto: CreateAdminUserDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
     return this.adminService.createUser(dto, this.buildActorContext(req));
   }
 
@@ -92,7 +96,10 @@ export class AdminController {
   // solo pone isActive=false. Coherente con la consigna de no eliminar
   // usuarios que tengan fields/analysis asociados.
   @Delete('users/:id')
-  deactivateUser(@Param('id', ParseUUIDPipe) id: string, @Req() req: AuthenticatedRequest) {
+  deactivateUser(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
     return this.adminService.deactivateUser(id, this.buildActorContext(req));
   }
 
@@ -101,16 +108,22 @@ export class AdminController {
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.adminService.createPasswordResetToken(id, this.buildActorContext(req));
+    return this.adminService.createPasswordResetToken(
+      id,
+      this.buildActorContext(req),
+    );
   }
 
   @Post('invitations')
-  createInvitation(@Body() dto: CreateInvitationDto, @Req() req: AuthenticatedRequest) {
+  createInvitation(
+    @Body() dto: CreateInvitationDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
     return this.adminService.createInvitation(dto, this.buildActorContext(req));
   }
 
   @Get('fields')
-  listFields(@Query() query: PaginationQueryDto) {
+  listFields(@Query() query: ListFieldsQueryDto) {
     return this.adminService.listFields(query);
   }
 
@@ -129,11 +142,17 @@ export class AdminController {
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.adminService.markAnalysisReviewed(id, this.buildActorContext(req));
+    return this.adminService.markAnalysisReviewed(
+      id,
+      this.buildActorContext(req),
+    );
   }
 
   @Post('analysis/:id/retry')
-  retryAnalysis(@Param('id', ParseUUIDPipe) id: string, @Req() req: AuthenticatedRequest) {
+  retryAnalysis(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
     return this.adminService.retryAnalysis(id, this.buildActorContext(req));
   }
 
@@ -154,7 +173,11 @@ export class AdminController {
     @Body() dto: UpdateAccessRequestDto,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.adminService.updateAccessRequest(id, dto, this.buildActorContext(req));
+    return this.adminService.updateAccessRequest(
+      id,
+      dto,
+      this.buildActorContext(req),
+    );
   }
 
   @Post('access-requests/:id/create-user')

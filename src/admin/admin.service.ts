@@ -8,7 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcryptjs';
-import { In, LessThan, Repository } from 'typeorm';
+import { In, IsNull, LessThan, Repository } from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
@@ -45,6 +45,7 @@ import { CreateUserFromAccessRequestDto } from './dto/create-user-from-access-re
 import { ListAccessRequestsQueryDto } from './dto/list-access-requests-query.dto';
 import { ListAnalysisQueryDto } from './dto/list-analysis-query.dto';
 import { ListAuditLogsQueryDto } from './dto/list-audit-logs-query.dto';
+import { ListFieldsQueryDto } from './dto/list-fields-query.dto';
 import { PaginationQueryDto } from './dto/pagination-query.dto';
 import { UpdateAccessRequestDto } from './dto/update-access-request.dto';
 import { UpdateAdminUserDto } from './dto/update-admin-user.dto';
@@ -139,6 +140,8 @@ export class AdminService {
       fieldsWithNoAnalysis,
       accessRequestsByStatus,
       averageAnalysisDurationMsLast7Days,
+      activeSchedulesWithoutRuns,
+      unreviewedFailedAnalysisOlderThan7Days,
     ] = await Promise.all([
       this.usersService.count(),
       this.usersService.countActive(),
@@ -176,6 +179,8 @@ export class AdminService {
       this.countFieldsWithNoAnalysis(),
       this.getAccessRequestsByStatus(),
       this.getAverageAnalysisDurationMs(cutoff7),
+      this.countActiveSchedulesWithoutRuns(),
+      this.countUnreviewedFailedAnalysisOlderThan(cutoff7),
     ]);
 
     const analysisFailureRateLast7Days =
@@ -209,6 +214,11 @@ export class AdminService {
       accessRequestsByStatus,
       analysisFailureRateLast7Days,
       averageAnalysisDurationMsLast7Days,
+      // Admin PR 1: stats crudas para las alertas operativas del Dashboard — el frontend arma el
+      // texto/severidad/link (ver operational-alerts.util.ts en agro-score-admin), acá solo se
+      // agregan los dos números que no existían todavía.
+      activeSchedulesWithoutRuns,
+      unreviewedFailedAnalysisOlderThan7Days,
     };
   }
 
@@ -279,6 +289,38 @@ export class AdminService {
     `);
 
     return Number(rows?.[0]?.count ?? 0);
+  }
+
+  /**
+   * Admin PR 1: schedules semanales activos que todavía no registraron ninguna corrida
+   * (enabled=true AND lastRunAt IS NULL) — la auditoría del admin lo marcó P0: sin esto no hay
+   * forma de confirmar que el pipeline semanal (Fase 4A/5/12A) funcione end-to-end. lastRunAt solo
+   * lo escribe ScheduledAnalysisRunnerService al completar una corrida real, así que este conteo
+   * nunca dispara ni simula una ejecución, solo lee el estado ya persistido.
+   */
+  private async countActiveSchedulesWithoutRuns(): Promise<number> {
+    return this.fieldAnalysisScheduleRepository.count({
+      where: { enabled: true, lastRunAt: IsNull() },
+    });
+  }
+
+  /**
+   * Admin PR 1: diagnósticos con status Error que nadie marcó como revisado (reviewedAt IS NULL —
+   * ver AdminService.markAnalysisReviewed, el único setter de esa columna) y con más de `cutoff` de
+   * antigüedad. Solo los análisis en Error son "revisables" (markAnalysisReviewed rechaza cualquier
+   * otro status), así que a propósito no se filtra por status='Finalizado'/'Procesando' — esos
+   * nunca tienen reviewedAt seteado y no deberían contar como "pendientes de revisión".
+   */
+  private async countUnreviewedFailedAnalysisOlderThan(
+    cutoff: Date,
+  ): Promise<number> {
+    return this.analysisRepository.count({
+      where: {
+        status: 'Error',
+        reviewedAt: IsNull(),
+        createdAt: LessThan(cutoff),
+      },
+    });
   }
 
   private async getAccessRequestsByStatus(): Promise<Record<string, number>> {
@@ -837,7 +879,7 @@ export class AdminService {
 
   // ── Campos / lotes ──────────────────────────────────────────────────
 
-  async listFields(query: PaginationQueryDto): Promise<Paginated<unknown>> {
+  async listFields(query: ListFieldsQueryDto): Promise<Paginated<unknown>> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
@@ -850,6 +892,23 @@ export class AdminService {
 
     if (query.search) {
       qb.andWhere('field.name ILIKE :search', { search: `%${query.search}%` });
+    }
+
+    // Admin PR 1: mismo criterio (NOT) EXISTS que countFieldsWithNoAnalysis() más abajo — soporta
+    // la alerta "Campos sin diagnóstico" del Dashboard, que necesita un link que filtre de verdad
+    // en vez de mandar a la lista completa de campos.
+    if (query.hasAnalysis === false) {
+      qb.andWhere(`NOT EXISTS (
+        SELECT 1 FROM analysis a
+        WHERE (a.scope = 'field' AND a."fieldId" = field.id::text) OR
+              (a.scope IS NULL AND a."lotId" = field.id::text)
+      )`);
+    } else if (query.hasAnalysis === true) {
+      qb.andWhere(`EXISTS (
+        SELECT 1 FROM analysis a
+        WHERE (a.scope = 'field' AND a."fieldId" = field.id::text) OR
+              (a.scope IS NULL AND a."lotId" = field.id::text)
+      )`);
     }
 
     const [items, total] = await qb.getManyAndCount();
