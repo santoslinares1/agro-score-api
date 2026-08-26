@@ -2,15 +2,16 @@
 
 PR 16B — backend de persistencia y generación del **diagnóstico semanal**
 (`weeklyTechnicalVerdict`). PR 16C lo muestra en el mail semanal. PR 16D lo
-muestra en Admin Programados. Ver `docs/technical-verdict-claude.md` para
-el veredicto individual (`technicalVerdict`) — son dos features
-relacionadas pero deliberadamente separadas (ver PR 16A, la
-auditoría/diseño que precede a este PR).
+muestra en Admin Programados. PR 17C lo expone público y lo muestra en la
+web (agro-score-web). Ver `docs/technical-verdict-claude.md` para el
+veredicto individual (`technicalVerdict`) — son dos features relacionadas
+pero deliberadamente separadas (ver PR 16A, la auditoría/diseño que
+precede a este PR).
 
-**Estado actual: backend + mail semanal + admin Programados.** El
-diagnóstico semanal ya se ve en el mail (PR 16C) y en
-Admin → Programados (PR 16D, agro-score-admin). Todavía no hay nada en la
-web pública — eso es PR 16E, opcional.
+**Estado actual: backend + mail semanal + admin Programados + web
+pública.** El diagnóstico semanal ya se ve en el mail (PR 16C), en
+Admin → Programados (PR 16D, agro-score-admin) y en el detalle de campo →
+Monitoreo semanal de la web (PR 17C, agro-score-web).
 
 ## Diferencia con `technicalVerdict`
 
@@ -250,16 +251,38 @@ en `scheduled-analysis.model.ts` reusa los enums de `AnalysisTechnicalVerdict`
 (mismo criterio que el propio modelo ya hacía con `technicalVerdict`, a
 diferencia del backend que sí duplica esos tipos entre módulos).
 
-## Qué NO hace este PR (16B/16C/16D)
+## PR 17C — superficie pública (`GET /fields/:fieldId/weekly-analysis-snapshots*`)
 
-- No hay nada visible en la web pública todavía (PR 16E, si aplica).
+`WeeklyAnalysisSnapshotService` (`scheduled-analysis/weekly-analysis-snapshot.service.ts`) ahora
+inyecta `WeeklyTechnicalVerdictService` y adjunta `weeklyTechnicalVerdict` a cada snapshot que
+devuelve — mismo patrón que `AnalysisWithTechnicalVerdict` (`analysis/analysis.service.ts`):
+spread de la entidad + campo extra, sin tocar el controller (los métodos no anotan tipo de
+retorno). `findByField` (lista) usa `findResponsesBySnapshotIds` — un solo `IN` query para toda la
+página, no N+1; `findLatest`/`findOne` (single) usan `findResponseBySnapshotId`. Ambos ya
+existían, son de solo lectura, y ninguno de los dos llama `generateAndPersist` ni a Claude.
+
+**Nuevo shape público** (`weekly-technical-verdict/dto/weekly-technical-verdict-public.dto.ts`,
+`PublicWeeklyTechnicalVerdictDto`) — el split público/admin que este mismo documento pedía
+aplicar cuando existiera superficie pública, mirror exacto de `AnalysisTechnicalVerdictResponse`:
+nunca expone `generator`, `promptVersion`, `errorMessage`, `inputSnapshot`, `analysisId` ni
+`scheduledRunId`. **Decisión: `status: 'failed'` se mapea a `null`** — mismo criterio que ya usa
+el mail (que omite la sección entera en `failed`); evita que la web pública tenga que distinguir
+"todavía no hay dato" de "hubo un error técnico", y evita cualquier necesidad de exponer
+`errorMessage`. En la práctica, `status` en el shape público siempre llega `'generated'`.
+
+Ownership: sin cambios — `fieldsService.findOne(fieldId, userId)` sigue siendo lo primero que
+corre en los 3 métodos; si un campo no es del usuario, ni el repo de snapshots ni
+`weeklyTechnicalVerdictService` llegan a llamarse. No se creó ningún endpoint nuevo.
+
+## Qué NO hace este PR (16B/16C/16D/17C)
+
 - No hay endpoint manual para disparar/regenerar un diagnóstico semanal.
-- No hay botón de ningún tipo, ni en el mail ni en admin.
+- No hay botón de ningún tipo, ni en el mail, ni en admin, ni en la web.
 - No se regeneran diagnósticos semanales existentes — un cambio de
   provider/prompt solo afecta a los que se generen después del cambio.
-- Ni el mail ni admin llaman a `generateAndPersist` ni a Claude — ambos
-  solo leen lo ya persistido por el tick de `reconcileRun` que generó el
-  snapshot.
+- Ni el mail, ni admin, ni la web pública llaman a `generateAndPersist` ni
+  a Claude — los tres solo leen lo ya persistido por el tick de
+  `reconcileRun` que generó el snapshot.
 
 ## Archivos clave
 
@@ -293,6 +316,12 @@ src/admin/dto/admin-scheduled-analysis.dto.ts  — AdminScheduledAnalysisItem.we
 agro-score-admin/src/app/core/models/scheduled-analysis.model.ts       — AdminWeeklyTechnicalVerdict (PR 16D)
 agro-score-admin/src/app/shared/utils/technical-verdict-labels.ts      — trendLabel/trendTone (PR 16D)
 agro-score-admin/src/app/features/scheduled-analysis/scheduled-analysis.component.{ts,html}  — sección "Diagnóstico semanal" (PR 16D)
+
+src/weekly-technical-verdict/dto/weekly-technical-verdict-public.dto.ts  — PublicWeeklyTechnicalVerdictDto, split público/admin (PR 17C)
+src/scheduled-analysis/weekly-analysis-snapshot.service.ts  — findByField/findLatest/findOne suman weeklyTechnicalVerdict (PR 17C)
+
+agro-score-web/src/app/core/model/weekly-analysis-snapshot.model.ts  — WeeklyTechnicalVerdict (PR 17C)
+agro-score-web/src/app/features/app/field-detail/weekly-analysis-history/weekly-analysis-history.component.{ts,html}  — sección "Diagnóstico semanal" (PR 17C)
 
 .env.example — WEEKLY_TECHNICAL_VERDICT_PROVIDER
 docs/weekly-technical-verdict.md — este documento
