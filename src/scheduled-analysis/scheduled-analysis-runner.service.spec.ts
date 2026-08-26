@@ -21,6 +21,7 @@ import { ScheduledAnalysisRunnerService } from './scheduled-analysis-runner.serv
 import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.service';
 import { WeeklyTechnicalVerdictService } from '../weekly-technical-verdict/weekly-technical-verdict.service';
 import { WeeklyTechnicalVerdict } from '../weekly-technical-verdict/entities/weekly-technical-verdict.entity';
+import { WeeklyTechnicalVerdictResponse } from '../weekly-technical-verdict/dto/weekly-technical-verdict.dto';
 
 describe('ScheduledAnalysisRunnerService', () => {
   let service: ScheduledAnalysisRunnerService;
@@ -56,7 +57,10 @@ describe('ScheduledAnalysisRunnerService', () => {
     Pick<AnalysisVerdictService, 'findResponseByAnalysisId'>
   >;
   let weeklyTechnicalVerdictService: jest.Mocked<
-    Pick<WeeklyTechnicalVerdictService, 'generateAndPersist'>
+    Pick<
+      WeeklyTechnicalVerdictService,
+      'generateAndPersist' | 'findResponseBySnapshotId'
+    >
   >;
 
   const buildField = (overrides: Partial<Field> = {}): Field =>
@@ -210,6 +214,29 @@ describe('ScheduledAnalysisRunnerService', () => {
       ...overrides,
     }) as WeeklyTechnicalVerdict;
 
+  // PR 16C: shape que devuelve WeeklyTechnicalVerdictService.findResponseBySnapshotId (DTO,
+  // generatedAt como ISO string) — distinto de buildWeeklyTechnicalVerdict (la entidad, con
+  // generatedAt como Date), que ya usaban los tests de PR 16B para generateAndPersist.
+  const buildWeeklyTechnicalVerdictResponse = (
+    overrides: Partial<WeeklyTechnicalVerdictResponse> = {},
+  ): WeeklyTechnicalVerdictResponse => ({
+    status: 'generated',
+    verdict: 'favorable',
+    trend: 'stable',
+    confidence: 'high',
+    summary: 'Respecto del reporte anterior, el campo se mantiene estable.',
+    keyChanges: [],
+    areasToReview: [],
+    recommendations: [],
+    limitations: [],
+    previousSnapshotId: null,
+    generator: 'deterministic-v1',
+    promptVersion: null,
+    errorMessage: null,
+    generatedAt: '2026-08-24T12:00:00.000Z',
+    ...overrides,
+  });
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -274,7 +301,10 @@ describe('ScheduledAnalysisRunnerService', () => {
         },
         {
           provide: WeeklyTechnicalVerdictService,
-          useValue: { generateAndPersist: jest.fn() },
+          useValue: {
+            generateAndPersist: jest.fn(),
+            findResponseBySnapshotId: jest.fn(),
+          },
         },
       ],
     }).compile();
@@ -321,6 +351,12 @@ describe('ScheduledAnalysisRunnerService', () => {
     fieldsService.findByIdOrFail.mockResolvedValue(buildField());
     weeklyTechnicalVerdictService.generateAndPersist.mockResolvedValue(
       buildWeeklyTechnicalVerdict(),
+    );
+
+    // PR 16C: mismo criterio — por defecto ya hay un diagnóstico semanal 'generated' persistido,
+    // para que los tests preexistentes (envío de email) sigan pasando sin mockear esto cada vez.
+    weeklyTechnicalVerdictService.findResponseBySnapshotId.mockResolvedValue(
+      buildWeeklyTechnicalVerdictResponse(),
     );
   });
 
@@ -832,6 +868,138 @@ describe('ScheduledAnalysisRunnerService', () => {
         expect(
           weeklyTechnicalVerdictService.generateAndPersist,
         ).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('PR 16C: Diagnóstico semanal en el mail (lee, nunca regenera)', () => {
+      it('sendCompletionEmail lee WeeklyTechnicalVerdictService.findResponseBySnapshotId(snapshot.id)', async () => {
+        const run = buildRun({
+          status: 'completed',
+          analysisId: 'analysis-1',
+          emailSentAt: null,
+        });
+        const snapshot = buildSnapshot({ id: 'snapshot-77' });
+        runRepository.find.mockResolvedValue([run]);
+        weeklySnapshotService.findByScheduledRunId.mockResolvedValue(snapshot);
+        fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+        usersService.findById.mockResolvedValue(buildUser());
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await service.reconcilePendingRuns();
+
+        expect(
+          weeklyTechnicalVerdictService.findResponseBySnapshotId,
+        ).toHaveBeenCalledWith('snapshot-77');
+      });
+
+      it('si existe generated, lo pasa tal cual al EmailService', async () => {
+        const run = buildRun({
+          status: 'completed',
+          analysisId: 'analysis-1',
+          emailSentAt: null,
+        });
+        const weeklyVerdict = buildWeeklyTechnicalVerdictResponse({
+          trend: 'worsening',
+          summary: 'El campo retrocedió respecto de la semana anterior.',
+        });
+        runRepository.find.mockResolvedValue([run]);
+        fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+        usersService.findById.mockResolvedValue(buildUser());
+        weeklyTechnicalVerdictService.findResponseBySnapshotId.mockResolvedValue(
+          weeklyVerdict,
+        );
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await service.reconcilePendingRuns();
+
+        expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledWith(
+          'user@example.com',
+          expect.objectContaining({ weeklyTechnicalVerdict: weeklyVerdict }),
+        );
+      });
+
+      it('si no existe (null), pasa null y el mail sigue saliendo con normalidad', async () => {
+        const run = buildRun({
+          status: 'completed',
+          analysisId: 'analysis-1',
+          emailSentAt: null,
+        });
+        runRepository.find.mockResolvedValue([run]);
+        fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+        usersService.findById.mockResolvedValue(buildUser());
+        weeklyTechnicalVerdictService.findResponseBySnapshotId.mockResolvedValue(
+          null,
+        );
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await service.reconcilePendingRuns();
+
+        expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledWith(
+          'user@example.com',
+          expect.objectContaining({ weeklyTechnicalVerdict: null }),
+        );
+        expect(runRepository.save).toHaveBeenCalledWith(
+          expect.objectContaining({ emailSentAt: expect.any(Date) }),
+        );
+      });
+
+      it('nunca llama a WeeklyTechnicalVerdictService.generateAndPersist desde sendCompletionEmail', async () => {
+        const run = buildRun({
+          status: 'completed',
+          analysisId: 'analysis-1',
+          emailSentAt: null,
+        });
+        runRepository.find.mockResolvedValue([run]);
+        fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+        usersService.findById.mockResolvedValue(buildUser());
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await service.reconcilePendingRuns();
+
+        expect(
+          weeklyTechnicalVerdictService.generateAndPersist,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('no bloquea emailSentAt — el email se manda y se marca igual sin importar el diagnóstico semanal', async () => {
+        const run = buildRun({
+          status: 'completed',
+          analysisId: 'analysis-1',
+          emailSentAt: null,
+        });
+        runRepository.find.mockResolvedValue([run]);
+        fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+        usersService.findById.mockResolvedValue(buildUser());
+        weeklyTechnicalVerdictService.findResponseBySnapshotId.mockResolvedValue(
+          buildWeeklyTechnicalVerdictResponse({ status: 'failed' }),
+        );
+        emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+          sent: true,
+          provider: 'resend',
+          dryRun: false,
+        });
+
+        await service.reconcilePendingRuns();
+
+        expect(runRepository.save).toHaveBeenCalledWith(
+          expect.objectContaining({ emailSentAt: expect.any(Date) }),
+        );
       });
     });
 

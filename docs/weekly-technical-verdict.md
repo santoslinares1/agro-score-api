@@ -1,15 +1,14 @@
 # Weekly Technical Verdict / Diagnóstico semanal
 
 PR 16B — backend de persistencia y generación del **diagnóstico semanal**
-(`weeklyTechnicalVerdict`). Ver `docs/technical-verdict-claude.md` para el
-veredicto individual (`technicalVerdict`) — son dos features relacionadas
-pero deliberadamente separadas (ver PR 16A, la auditoría/diseño que precede
-a este PR).
+(`weeklyTechnicalVerdict`). PR 16C lo muestra en el mail semanal. Ver
+`docs/technical-verdict-claude.md` para el veredicto individual
+(`technicalVerdict`) — son dos features relacionadas pero deliberadamente
+separadas (ver PR 16A, la auditoría/diseño que precede a este PR).
 
-**Estado de este PR: solo backend.** No hay ningún endpoint, mail, pantalla
-admin ni web que muestre esto todavía — se genera y persiste, nada más. Eso
-es PR 16C (mail semanal), PR 16D (admin Programados) y, opcionalmente, PR
-16E (web).
+**Estado actual: backend + mail semanal.** El diagnóstico semanal ya se ve
+en el mail (PR 16C). Todavía no hay nada en admin Programados ni en la web
+pública — eso es PR 16D y, opcionalmente, PR 16E.
 
 ## Diferencia con `technicalVerdict`
 
@@ -168,15 +167,54 @@ queda listo (batch, una sola query `IN`, `Map<snapshotId, respuesta>`) para
 que PR 16D (admin Programados) lo use sin reinventar el patrón ya probado
 en `AdminService.getTechnicalVerdictsByAnalysisId`.
 
-## Qué NO hace este PR
+## Mail semanal (PR 16C)
 
-- No hay mail semanal con "Diagnóstico semanal" todavía (PR 16C).
+`ScheduledAnalysisRunnerService.sendCompletionEmail` lee (nunca genera)
+`weeklyTechnicalVerdictService.findResponseBySnapshotId(snapshot.id)` y lo
+pasa al template (`scheduled-analysis-report.template.ts`) como
+`weeklyTechnicalVerdict`, junto al ya existente `technicalVerdict`
+individual. Sección nueva "Diagnóstico semanal", separada y debajo de
+"Veredicto técnico" — nunca lo reemplaza.
+
+- **`status='generated'`**: se renderiza completo — tendencia/estado/
+  confianza, summary, y las 4 listas (`keyChanges`→"Cambios relevantes",
+  `areasToReview`→"Áreas a revisar", `recommendations`, `limitations`),
+  ocultando las que vengan vacías. `generator`/`promptVersion`/
+  `generatedAt`/`errorMessage` nunca se renderizan, aunque estén en el
+  objeto recibido (mismo criterio defensivo que `technicalVerdict`).
+- **`trend='insufficient_data'`** (primer reporte o datos insuficientes)
+  **no es un caso especial en el template** — se renderiza por el mismo
+  camino que cualquier otro `trend`: el `summary` ya persistido (PR 16B)
+  explica la falta de base histórica sin que el template tenga que
+  duplicar esa decisión de copy.
+- **`status='failed'`**: se omite la sección entera (decisión de
+  producto — el mail ya tiene "Veredicto técnico" con su propio aviso de
+  error si corresponde; no hace falta un segundo aviso).
+- **`null`/`undefined`**: se omite la sección entera.
+- **Sin ventana de espera propia**: a diferencia del veredicto individual
+  (que corre en background, con `VERDICT_WAIT_WINDOW_MS`), el diagnóstico
+  semanal ya se generó de forma síncrona en el mismo tick de
+  `reconcileRun`, antes de llegar a `sendCompletionEmail` (ver PR 16B) —
+  si no existe acá es porque falló (best-effort) o porque el snapshot no
+  llegó a crearse, nunca por una carrera.
+
+Labels: `verdictLabel`/`confidenceLabel`/`trendLabel`
+(`src/weekly-technical-verdict/weekly-technical-verdict-labels.ts`) —
+mismos valores que `analysis-verdict-labels.ts` para verdict/confidence,
+duplicados a propósito (mismo criterio de no acoplar módulos hermanos ya
+usado en todo `weekly-technical-verdict`); `trendLabel` es nuevo, sin
+equivalente en el veredicto individual.
+
+## Qué NO hace este PR (16B/16C)
+
 - No hay pantalla admin con esto todavía (PR 16D).
 - No hay nada visible en la web pública (PR 16E, si aplica).
 - No hay endpoint manual para disparar/regenerar un diagnóstico semanal.
 - No hay botón de ningún tipo.
 - No se regeneran diagnósticos semanales existentes — un cambio de
   provider/prompt solo afecta a los que se generen después del cambio.
+- El mail nunca llama a `generateAndPersist` ni a Claude — solo lee lo ya
+  persistido por el tick de `reconcileRun` que generó el snapshot.
 
 ## Archivos clave
 
@@ -187,6 +225,7 @@ src/weekly-technical-verdict/
   weekly-technical-verdict-generator.util.ts   — generador determinístico (función pura)
   weekly-technical-verdict-input.util.ts       — snapshot → input del generador
   weekly-technical-verdict.service.ts          — orquestador (resolveGenerator + generateAndPersist)
+  weekly-technical-verdict-labels.ts           — verdictLabel/confidenceLabel/trendLabel (PR 16C)
   weekly-technical-verdict.module.ts
   generators/
     weekly-technical-verdict-generator.interface.ts
@@ -197,8 +236,10 @@ src/weekly-technical-verdict/
 
 src/analysis-verdict/generators/claude-text-safety.util.ts  — compartido con el validator individual
 
-src/scheduled-analysis/scheduled-analysis-runner.service.ts  — enganche en reconcileRun
+src/scheduled-analysis/scheduled-analysis-runner.service.ts  — enganche en reconcileRun + lectura en sendCompletionEmail (PR 16C)
 src/scheduled-analysis/weekly-analysis-snapshot-comparison.util.ts  — SCORE_STABLE_THRESHOLD/INDEX_STABLE_THRESHOLD exportados
+
+src/email/templates/scheduled-analysis-report.template.ts  — sección "Diagnóstico semanal" (PR 16C)
 
 .env.example — WEEKLY_TECHNICAL_VERDICT_PROVIDER
 docs/weekly-technical-verdict.md — este documento

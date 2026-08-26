@@ -423,6 +423,17 @@ export class ScheduledAnalysisRunnerService {
       return;
     }
 
+    // PR 16C: solo LEE lo que WeeklyTechnicalVerdictService ya generó y persistió en este mismo
+    // tick de reconcileRun, justo después de crear el snapshot (ver PR 16B) — nunca llama a
+    // generateAndPersist ni a Claude desde acá. Sin ventana de espera propia: a diferencia del
+    // veredicto individual (que corre en background dentro de otro proceso async), este ya se
+    // generó de forma síncrona antes de llegar acá en el mismo reconcileRun — si no existe, es
+    // porque falló (best-effort, PR 16B) o el snapshot no tiene id, nunca por una carrera.
+    const weeklyTechnicalVerdict =
+      await this.weeklyTechnicalVerdictService.findResponseBySnapshotId(
+        snapshot.id,
+      );
+
     const [field, user] = await Promise.all([
       this.fieldsService.findByIdOrFail(run.fieldId),
       this.usersService.findById(run.userId),
@@ -479,6 +490,7 @@ export class ScheduledAnalysisRunnerService {
         hasImageSeries: snapshot.hasImageSeries,
         summary: comparison,
         technicalVerdict,
+        weeklyTechnicalVerdict,
       },
     );
 

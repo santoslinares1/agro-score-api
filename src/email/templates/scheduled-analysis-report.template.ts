@@ -5,6 +5,12 @@ import {
   verdictLabel,
 } from '../../analysis-verdict/analysis-verdict-labels';
 import type { AnalysisTechnicalVerdictResponse } from '../../analysis-verdict/dto/analysis-technical-verdict.dto';
+import {
+  confidenceLabel as weeklyConfidenceLabel,
+  trendLabel as weeklyTrendLabel,
+  verdictLabel as weeklyVerdictLabel,
+} from '../../weekly-technical-verdict/weekly-technical-verdict-labels';
+import type { WeeklyTechnicalVerdictResponse } from '../../weekly-technical-verdict/dto/weekly-technical-verdict.dto';
 import type { EmailContent } from './invitation.template';
 
 export interface ScheduledAnalysisEmailParams {
@@ -27,6 +33,17 @@ export interface ScheduledAnalysisEmailParams {
    * en el objeto — ver buildTechnicalVerdictHtml/buildTechnicalVerdictText.
    */
   technicalVerdict?: AnalysisTechnicalVerdictResponse | null;
+  /**
+   * PR 16C: diagnóstico semanal ya persistido por PR 16B (nunca se regenera ni se llama a Claude
+   * acá — ver ScheduledAnalysisRunnerService.sendCompletionEmail). undefined/null Y
+   * status='failed' omiten la sección por completo (decisión de producto: el mail ya tiene
+   * Veredicto técnico individual, no hace falta un segundo aviso de error al usuario final).
+   * trend='insufficient_data' (primer reporte o datos insuficientes) NO es un error — se renderiza
+   * como cualquier otro estado 'generated', el summary ya persistido explica la situación.
+   * generator/promptVersion/generatedAt/errorMessage nunca se renderizan — ver
+   * buildWeeklyTechnicalVerdictHtml/buildWeeklyTechnicalVerdictText.
+   */
+  weeklyTechnicalVerdict?: WeeklyTechnicalVerdictResponse | null;
 }
 
 const VERDICT_DISCLAIMER =
@@ -34,6 +51,9 @@ const VERDICT_DISCLAIMER =
 
 const VERDICT_FAILED_NOTICE =
   'El análisis satelital finalizó correctamente, pero no se pudo generar el veredicto técnico automático.';
+
+const WEEKLY_VERDICT_DISCLAIMER =
+  'Diagnóstico semanal generado automáticamente a partir de la comparación entre reportes. Debe validarse con observación en campo.';
 
 function htmlList(title: string, items: string[]): string {
   if (!items.length) {
@@ -147,6 +167,81 @@ function buildTechnicalVerdictText(
   return lines;
 }
 
+/**
+ * PR 16C: mismo criterio defensivo que buildTechnicalVerdictHtml — 'failed' se trata igual que
+ * null/undefined (se omite la sección entera, decisión de producto: no hace falta un segundo
+ * aviso de error si ya existe el de Veredicto técnico). trend='insufficient_data' NO es un caso
+ * especial acá: se renderiza por el mismo camino que cualquier otro trend — el summary ya
+ * persistido (weekly-technical-verdict-generator.util.ts) explica la falta de base histórica sin
+ * que el template tenga que duplicar esa decisión de copy.
+ */
+function buildWeeklyTechnicalVerdictHtml(
+  weeklyTechnicalVerdict: WeeklyTechnicalVerdictResponse | null | undefined,
+): string {
+  if (
+    !weeklyTechnicalVerdict ||
+    weeklyTechnicalVerdict.status !== 'generated'
+  ) {
+    return '';
+  }
+
+  const confidence = weeklyConfidenceLabel(weeklyTechnicalVerdict.confidence);
+  const summaryHtml = weeklyTechnicalVerdict.summary
+    ? `<p style="margin: 0 0 4px; color: #374151;">${escapeHtml(weeklyTechnicalVerdict.summary)}</p>`
+    : '';
+
+  return `
+    <p style="font-weight: bold; margin-bottom: 4px;">Diagnóstico semanal</p>
+    <p style="font-size: 13px; color: #374151; margin: 0 0 8px;">
+      Tendencia: <strong>${escapeHtml(weeklyTrendLabel(weeklyTechnicalVerdict.trend))}</strong>
+      &middot; Estado: <strong>${escapeHtml(weeklyVerdictLabel(weeklyTechnicalVerdict.verdict))}</strong>${
+        confidence
+          ? ` &middot; Confianza: <strong>${escapeHtml(confidence)}</strong>`
+          : ''
+      }
+    </p>
+    ${summaryHtml}
+    ${htmlList('Cambios relevantes', weeklyTechnicalVerdict.keyChanges)}
+    ${htmlList('Áreas a revisar', weeklyTechnicalVerdict.areasToReview)}
+    ${htmlList('Recomendaciones', weeklyTechnicalVerdict.recommendations)}
+    ${htmlList('Limitaciones', weeklyTechnicalVerdict.limitations)}
+    <p style="font-size: 12px; color: #6b7280; margin: 12px 0 20px;">${escapeHtml(WEEKLY_VERDICT_DISCLAIMER)}</p>
+  `;
+}
+
+function buildWeeklyTechnicalVerdictText(
+  weeklyTechnicalVerdict: WeeklyTechnicalVerdictResponse | null | undefined,
+): string[] {
+  if (
+    !weeklyTechnicalVerdict ||
+    weeklyTechnicalVerdict.status !== 'generated'
+  ) {
+    return [];
+  }
+
+  const confidence = weeklyConfidenceLabel(weeklyTechnicalVerdict.confidence);
+  const lines = [
+    '',
+    'Diagnóstico semanal:',
+    `Tendencia: ${weeklyTrendLabel(weeklyTechnicalVerdict.trend)} · Estado: ${weeklyVerdictLabel(weeklyTechnicalVerdict.verdict)}${confidence ? ` · Confianza: ${confidence}` : ''}`,
+  ];
+
+  if (weeklyTechnicalVerdict.summary) {
+    lines.push('', weeklyTechnicalVerdict.summary);
+  }
+
+  lines.push(
+    ...textList('Cambios relevantes', weeklyTechnicalVerdict.keyChanges),
+    ...textList('Áreas a revisar', weeklyTechnicalVerdict.areasToReview),
+    ...textList('Recomendaciones', weeklyTechnicalVerdict.recommendations),
+    ...textList('Limitaciones', weeklyTechnicalVerdict.limitations),
+    '',
+    WEEKLY_VERDICT_DISCLAIMER,
+  );
+
+  return lines;
+}
+
 const DATA_QUALITY_LABEL: Record<WeeklySnapshotDataQuality, string> = {
   sufficient: 'Suficiente',
   partial: 'Parcial',
@@ -190,6 +285,7 @@ export function buildScheduledAnalysisEmail(
     hasImageSeries,
     summary,
     technicalVerdict,
+    weeklyTechnicalVerdict,
   } = params;
   const greetingName = userName?.trim() ? userName.trim() : null;
 
@@ -210,6 +306,12 @@ export function buildScheduledAnalysisEmail(
     .join('');
   const technicalVerdictHtml = buildTechnicalVerdictHtml(technicalVerdict);
   const technicalVerdictTextLines = buildTechnicalVerdictText(technicalVerdict);
+  const weeklyTechnicalVerdictHtml = buildWeeklyTechnicalVerdictHtml(
+    weeklyTechnicalVerdict,
+  );
+  const weeklyTechnicalVerdictTextLines = buildWeeklyTechnicalVerdictText(
+    weeklyTechnicalVerdict,
+  );
 
   const html = `
     <div style="font-family: Arial, Helvetica, sans-serif; color: #1f2937; line-height: 1.6; max-width: 480px;">
@@ -221,6 +323,8 @@ export function buildScheduledAnalysisEmail(
       <ul style="padding-left: 20px; margin: 0 0 20px;">${summaryHtml}</ul>
 
       ${technicalVerdictHtml}
+
+      ${weeklyTechnicalVerdictHtml}
 
       <p style="font-weight: bold; margin-bottom: 4px;">Disponibilidad de datos</p>
       <ul style="padding-left: 20px; margin: 0 0 20px; color: #374151;">
@@ -260,6 +364,7 @@ export function buildScheduledAnalysisEmail(
     'Resumen:',
     ...summary.map((line) => `- ${line}`),
     ...technicalVerdictTextLines,
+    ...weeklyTechnicalVerdictTextLines,
     '',
     'Disponibilidad de datos:',
     `- RGB: ${availabilityLabel(hasRgbImage)}`,
