@@ -1,4 +1,8 @@
-import { CanActivate, ExecutionContext, INestApplication } from '@nestjs/common';
+import {
+  CanActivate,
+  ExecutionContext,
+  INestApplication,
+} from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 
@@ -41,8 +45,25 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
           provide: AdminService,
           useValue: {
             getMetrics: jest.fn().mockResolvedValue({ totalUsers: 0 }),
-            getSystemHealth: jest.fn().mockResolvedValue({ api: { status: 'ok' } }),
-            listAuditLogs: jest.fn().mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
+            getSystemHealth: jest
+              .fn()
+              .mockResolvedValue({ api: { status: 'ok' } }),
+            listAuditLogs: jest
+              .fn()
+              .mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
+            getProductAnalytics: jest.fn().mockResolvedValue({
+              generatedAt: new Date().toISOString(),
+              funnel: [],
+              insights: [],
+              weeklyMonitoring: {
+                totalFields: 0,
+                activeSchedules: 0,
+                activeSchedulesWithoutRuns: 0,
+                schedulesWithRuns: 0,
+                sentEmails: 0,
+              },
+              topAnalysisErrorsLast30Days: [],
+            }),
           },
         },
       ],
@@ -107,6 +128,19 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
 
     await request(app.getHttpServer())
       .get('/admin/audit-logs')
+      .set('x-test-role', UserRole.ADMIN)
+      .expect(200);
+  });
+
+  // Admin PR 4: mismo endpoint nuevo, misma composición de guards a nivel controller.
+  it('GET /admin/product-analytics — role "user" no entra, "admin" sí', async () => {
+    await request(app.getHttpServer())
+      .get('/admin/product-analytics')
+      .set('x-test-role', UserRole.USER)
+      .expect(403);
+
+    await request(app.getHttpServer())
+      .get('/admin/product-analytics')
       .set('x-test-role', UserRole.ADMIN)
       .expect(200);
   });

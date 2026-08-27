@@ -8,7 +8,14 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcryptjs';
-import { In, IsNull, LessThan, MoreThanOrEqual, Repository } from 'typeorm';
+import {
+  In,
+  IsNull,
+  LessThan,
+  MoreThanOrEqual,
+  Not,
+  Repository,
+} from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
@@ -38,6 +45,12 @@ import {
   AdminAnalysisTechnicalVerdict,
   toAdminAnalysisTechnicalVerdict,
 } from './dto/admin-analysis-technical-verdict.dto';
+import {
+  AdminAnalysisErrorBucket,
+  AdminProductAnalyticsDto,
+  AdminProductAnalyticsFunnelStage,
+  AdminProductAnalyticsInsight,
+} from './dto/admin-product-analytics.dto';
 import {
   AdminScheduledAnalysisItem,
   AdminScheduledAnalysisRun,
@@ -350,6 +363,298 @@ export class AdminService {
     }
 
     return base;
+  }
+
+  /**
+   * Admin PR 4: Product Analytics básico — GET /admin/product-analytics. Funnel de 9 etapas sobre
+   * entidades ACTUALES, no cohortes por fecha de alta (por eso nunca se llama "conversión real" en
+   * el copy). Todas las queries son COUNT/EXISTS agregados sobre columnas indexadas, ninguna es
+   * por fila ni N+1 — 12 consultas en paralelo, ninguna pesada.
+   */
+  async getProductAnalytics(): Promise<AdminProductAnalyticsDto> {
+    const now = new Date();
+    const cutoff30 = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    const [
+      totalUsers,
+      usersWithFieldRow,
+      totalFields,
+      fieldsWithLotRow,
+      fieldsWithFinalizedAnalysisRows,
+      fieldsWithVerdictRows,
+      activeSchedules,
+      activeSchedulesWithoutRuns,
+      fieldsWithRunRow,
+      fieldsWithMailSentRow,
+      sentEmails,
+      fieldsWithNoAnalysis,
+      failedAnalysisLast30Days,
+      scheduleSummary,
+      topErrorsRows,
+    ] = await Promise.all([
+      this.usersService.count(),
+      this.fieldRepository
+        .createQueryBuilder('field')
+        .select('COUNT(DISTINCT field."userId")', 'count')
+        .getRawOne<{ count: string }>(),
+      this.fieldRepository.count(),
+      this.fieldLotRepository
+        .createQueryBuilder('lot')
+        .select('COUNT(DISTINCT lot."fieldId")', 'count')
+        .getRawOne<{ count: string }>(),
+      // Mismo join manual scope-based que countFieldsWithNoAnalysis (Analysis.fieldId/lotId son
+      // texto libre histórico, sin FK real hacia Field).
+      this.fieldRepository.manager.query<{ count: string }[]>(`
+        SELECT COUNT(DISTINCT f.id)::int AS count
+        FROM fields f
+        INNER JOIN analysis a ON (
+          (a.scope = 'field' AND a."fieldId" = f.id::text) OR
+          (a.scope IS NULL AND a."lotId" = f.id::text)
+        )
+        WHERE a.status = 'Finalizado'
+      `),
+      this.fieldRepository.manager.query<{ count: string }[]>(`
+        SELECT COUNT(DISTINCT f.id)::int AS count
+        FROM fields f
+        INNER JOIN analysis a ON (
+          (a.scope = 'field' AND a."fieldId" = f.id::text) OR
+          (a.scope IS NULL AND a."lotId" = f.id::text)
+        )
+        INNER JOIN analysis_technical_verdicts v ON v."analysisId" = a.id
+        WHERE v.status = 'generated'
+      `),
+      this.fieldAnalysisScheduleRepository.count({ where: { enabled: true } }),
+      // A propósito NO reusa countActiveSchedulesWithoutRuns() (lastRunAt IS NULL, PR1) — este
+      // bloque usa el criterio real de PR3 (EXISTS/NOT EXISTS), ver comentario en el DTO.
+      this.fieldAnalysisScheduleRepository
+        .createQueryBuilder('schedule')
+        .where('schedule.enabled = true')
+        .andWhere(
+          `NOT EXISTS (SELECT 1 FROM scheduled_analysis_runs r WHERE r."scheduleId" = schedule.id)`,
+        )
+        .getCount(),
+      // ScheduledAnalysisRun.fieldId es columna directa (no hace falta pasar por schedule).
+      this.scheduledAnalysisRunRepository
+        .createQueryBuilder('run')
+        .select('COUNT(DISTINCT run."fieldId")', 'count')
+        .getRawOne<{ count: string }>(),
+      this.scheduledAnalysisRunRepository
+        .createQueryBuilder('run')
+        .select('COUNT(DISTINCT run."fieldId")', 'count')
+        .where('run."emailSentAt" IS NOT NULL')
+        .getRawOne<{ count: string }>(),
+      this.scheduledAnalysisRunRepository.count({
+        where: { emailSentAt: Not(IsNull()) },
+      }),
+      this.countFieldsWithNoAnalysis(),
+      this.countSince(this.analysisRepository, cutoff30, { status: 'Error' }),
+      this.getScheduledAnalysisSummary(),
+      this.fieldRepository.manager.query<{ message: string; count: string }[]>(
+        `
+        SELECT "errorMessage" AS message, COUNT(*)::int AS count
+        FROM analysis
+        WHERE status = 'Error'
+          AND "createdAt" >= $1
+          AND "errorMessage" IS NOT NULL
+        GROUP BY "errorMessage"
+        ORDER BY COUNT(*) DESC
+        LIMIT 3
+      `,
+        [cutoff30],
+      ),
+    ]);
+
+    const usersWithField = Number(usersWithFieldRow?.count ?? 0);
+    const fieldsWithLot = Number(fieldsWithLotRow?.count ?? 0);
+    const fieldsWithFinalizedAnalysis = Number(
+      fieldsWithFinalizedAnalysisRows?.[0]?.count ?? 0,
+    );
+    const fieldsWithVerdict = Number(fieldsWithVerdictRows?.[0]?.count ?? 0);
+    const fieldsWithRun = Number(fieldsWithRunRow?.count ?? 0);
+    const fieldsWithMailSent = Number(fieldsWithMailSentRow?.count ?? 0);
+    const schedulesWithRuns = activeSchedules - activeSchedulesWithoutRuns;
+
+    const funnel: AdminProductAnalyticsFunnelStage[] = [];
+    const pushStage = (
+      stage: Omit<
+        AdminProductAnalyticsFunnelStage,
+        'previousCount' | 'conversionFromPrevious' | 'dropoffFromPrevious'
+      >,
+    ) => {
+      funnel.push(this.buildFunnelStage(stage, funnel.at(-1)?.count));
+    };
+
+    pushStage({
+      id: 'total-users',
+      label: 'Usuarios totales',
+      count: totalUsers,
+      description: 'Todos los usuarios registrados en la plataforma.',
+      route: '/users',
+    });
+    pushStage({
+      id: 'users-with-field',
+      label: 'Usuarios con al menos un campo',
+      count: usersWithField,
+      description:
+        'No existe todavía un filtro dedicado en Usuarios para esta pregunta.',
+    });
+    pushStage({
+      id: 'total-fields',
+      label: 'Campos totales',
+      count: totalFields,
+      description: 'Todos los campos creados, de cualquier usuario.',
+      route: '/fields',
+    });
+    pushStage({
+      id: 'fields-with-lot',
+      label: 'Campos con al menos un lote',
+      count: fieldsWithLot,
+      description:
+        'No existe todavía un filtro dedicado en Campos para esta pregunta.',
+    });
+    pushStage({
+      id: 'fields-with-finalized-analysis',
+      label: 'Campos con al menos un análisis finalizado',
+      count: fieldsWithFinalizedAnalysis,
+      description:
+        '/fields?hasAnalysis=true existe pero incluye cualquier estado (también Procesando/Error), así que no se linkea acá para no insinuar más precisión de la que tiene.',
+    });
+    pushStage({
+      id: 'fields-with-verdict',
+      label: 'Campos con veredicto técnico generado',
+      count: fieldsWithVerdict,
+      description: 'No existe todavía un filtro dedicado para esta pregunta.',
+    });
+    pushStage({
+      id: 'fields-with-active-schedule',
+      label: 'Campos con monitoreo semanal activo',
+      count: activeSchedules,
+      description:
+        'FieldAnalysisSchedule.fieldId es único por campo, así que este número ya es "campos", no "schedules".',
+      route: '/scheduled-analysis',
+      queryParams: { enabled: true },
+    });
+    pushStage({
+      id: 'fields-with-run',
+      label: 'Campos con al menos una corrida semanal',
+      count: fieldsWithRun,
+      description:
+        'Existencia real de ScheduledAnalysisRun (mismo criterio que el filtro hasRuns de Programados, PR3).',
+      route: '/scheduled-analysis',
+      queryParams: { enabled: true, hasRuns: true },
+    });
+    pushStage({
+      id: 'fields-with-mail-sent',
+      label: 'Campos con mail semanal enviado',
+      count: fieldsWithMailSent,
+      description:
+        'No existe todavía un filtro por mailStatus en el listado de Programados (deuda documentada en PR3).',
+    });
+
+    const insights: AdminProductAnalyticsInsight[] = [];
+
+    if (fieldsWithNoAnalysis > 0) {
+      insights.push({
+        id: 'fields-without-analysis',
+        severity: 'warning',
+        title: `${fieldsWithNoAnalysis} de ${totalFields} ${this.pluralize(totalFields, 'campo todavía no tiene', 'campos todavía no tienen')} ningún diagnóstico`,
+        description:
+          'Principal punto de pérdida: activación del primer análisis.',
+        route: '/fields',
+        queryParams: { hasAnalysis: false },
+      });
+    }
+
+    if (totalFields > 0 && activeSchedules / totalFields < 0.5) {
+      insights.push({
+        id: 'weekly-monitoring-adoption',
+        severity: 'opportunity',
+        title: `${activeSchedules} de ${totalFields} campos tienen monitoreo semanal activo`,
+        description: 'La adopción del monitoreo semanal todavía es baja.',
+        route: '/scheduled-analysis',
+        queryParams: { enabled: true },
+      });
+    }
+
+    if (activeSchedulesWithoutRuns > 0) {
+      insights.push({
+        id: 'active-schedules-without-runs',
+        severity: 'critical',
+        title: `${activeSchedulesWithoutRuns} de ${activeSchedules} monitoreos semanales activos todavía no registran ninguna corrida`,
+        description:
+          'Revisar el pipeline semanal antes de seguir empujando adopción de monitoreo.',
+        route: '/scheduled-analysis',
+        queryParams: { enabled: true, hasRuns: false },
+      });
+    }
+
+    if (failedAnalysisLast30Days > 0) {
+      insights.push({
+        id: 'failed-analysis-30d',
+        severity: 'critical',
+        title: `${failedAnalysisLast30Days} ${this.pluralize(failedAnalysisLast30Days, 'diagnóstico fallido', 'diagnósticos fallidos')} en los últimos 30 días`,
+        description:
+          'Revisar estabilidad del worker/API antes de escalar el volumen de análisis.',
+        route: '/analysis',
+        queryParams: { status: 'Error' },
+      });
+    }
+
+    if (scheduleSummary.mailPendingOrFailed > 0) {
+      insights.push({
+        id: 'mail-pending-or-failed',
+        severity: 'warning',
+        title: `${scheduleSummary.mailPendingOrFailed} ${this.pluralize(scheduleSummary.mailPendingOrFailed, 'monitoreo semanal todavía no envió', 'monitoreos semanales todavía no enviaron')} el mail de su corrida más reciente`,
+        description:
+          'Puede ser un envío pendiente del próximo ciclo o un mail que se omitió — ver detalle en Programados.',
+        route: '/scheduled-analysis',
+        queryParams: { enabled: true },
+      });
+    }
+
+    const topAnalysisErrorsLast30Days: AdminAnalysisErrorBucket[] =
+      topErrorsRows.map((row) => ({
+        message: row.message,
+        count: Number(row.count),
+      }));
+
+    return {
+      generatedAt: now.toISOString(),
+      funnel,
+      insights,
+      weeklyMonitoring: {
+        totalFields,
+        activeSchedules,
+        activeSchedulesWithoutRuns,
+        schedulesWithRuns,
+        sentEmails,
+      },
+      topAnalysisErrorsLast30Days,
+    };
+  }
+
+  private buildFunnelStage(
+    stage: Omit<
+      AdminProductAnalyticsFunnelStage,
+      'previousCount' | 'conversionFromPrevious' | 'dropoffFromPrevious'
+    >,
+    previousCount: number | undefined,
+  ): AdminProductAnalyticsFunnelStage {
+    if (previousCount === undefined) {
+      return stage;
+    }
+
+    return {
+      ...stage,
+      previousCount,
+      conversionFromPrevious:
+        previousCount > 0 ? stage.count / previousCount : undefined,
+      dropoffFromPrevious: previousCount - stage.count,
+    };
+  }
+
+  private pluralize(count: number, singular: string, plural: string): string {
+    return count === 1 ? singular : plural;
   }
 
   // ── Usuarios ────────────────────────────────────────────────────────

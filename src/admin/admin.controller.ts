@@ -62,6 +62,14 @@ export class AdminController {
     return this.adminService.getMetrics();
   }
 
+  // Admin PR 4: Product Analytics básico — funnel + insights + monitoreo semanal + top errores.
+  // Endpoint separado de /admin/metrics a propósito (ver AdminService.getProductAnalytics):
+  // responde una pregunta distinta ("dónde se pierde valor") y /admin/metrics ya es grande.
+  @Get('product-analytics')
+  getProductAnalytics() {
+    return this.adminService.getProductAnalytics();
+  }
+
   @Get('system/health')
   getSystemHealth() {
     return this.adminService.getSystemHealth();

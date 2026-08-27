@@ -1955,6 +1955,313 @@ describe('AdminService', () => {
     });
   });
 
+  describe('getProductAnalytics (Admin PR 4)', () => {
+    function buildRawOneQueryBuilder(...values: (number | null)[]) {
+      const qb: Record<string, jest.Mock> = {
+        select: jest.fn(),
+        where: jest.fn(),
+        andWhere: jest.fn(),
+        getRawOne: jest.fn(),
+        getCount: jest.fn().mockResolvedValue(0),
+      };
+      for (const key of ['select', 'where', 'andWhere']) {
+        qb[key].mockReturnValue(qb);
+      }
+      for (const value of values) {
+        qb.getRawOne.mockResolvedValueOnce(
+          value === null ? null : { count: String(value) },
+        );
+      }
+      return qb;
+    }
+
+    type Fixture = Partial<{
+      totalUsers: number;
+      usersWithField: number;
+      totalFields: number;
+      fieldsWithLot: number;
+      fieldsWithFinalizedAnalysis: number;
+      fieldsWithVerdict: number;
+      activeSchedules: number;
+      activeSchedulesWithoutRuns: number;
+      fieldsWithRun: number;
+      fieldsWithMailSent: number;
+      sentEmails: number;
+      fieldsWithNoAnalysis: number;
+      failedAnalysisLast30Days: number;
+      latestRunRows: {
+        status: string;
+        failedAt: Date | null;
+        emailSentAt: Date | null;
+      }[];
+      topErrors: { message: string; count: number }[];
+    }>;
+
+    // Arma los ~15 mocks que getProductAnalytics() dispara en paralelo. El orden de cada
+    // mockResolvedValueOnce importa: Promise.all evalúa los elementos del array de forma
+    // sincrónica en el orden en que aparecen (aunque cada uno sea una llamada async), así que el
+    // orden de las llamadas a un mismo mock coincide con el orden del array en el service.
+    function setup(fixture: Fixture = {}) {
+      const f = {
+        totalUsers: 0,
+        usersWithField: 0,
+        totalFields: 0,
+        fieldsWithLot: 0,
+        fieldsWithFinalizedAnalysis: 0,
+        fieldsWithVerdict: 0,
+        activeSchedules: 0,
+        activeSchedulesWithoutRuns: 0,
+        fieldsWithRun: 0,
+        fieldsWithMailSent: 0,
+        sentEmails: 0,
+        fieldsWithNoAnalysis: 0,
+        failedAnalysisLast30Days: 0,
+        latestRunRows: [] as {
+          status: string;
+          failedAt: Date | null;
+          emailSentAt: Date | null;
+        }[],
+        topErrors: [] as { message: string; count: number }[],
+        ...fixture,
+      };
+
+      usersService.count.mockResolvedValue(f.totalUsers);
+
+      fieldRepo.createQueryBuilder.mockReturnValue(
+        buildRawOneQueryBuilder(f.usersWithField),
+      );
+      fieldRepo.count.mockResolvedValue(f.totalFields);
+      fieldLotRepo.createQueryBuilder.mockReturnValue(
+        buildRawOneQueryBuilder(f.fieldsWithLot),
+      );
+
+      // fieldRepo.manager.query: finalized-analysis, verdict, countFieldsWithNoAnalysis
+      // (interno), topErrors — en ese orden.
+      fieldRepo.manager.query
+        .mockResolvedValueOnce([{ count: f.fieldsWithFinalizedAnalysis }])
+        .mockResolvedValueOnce([{ count: f.fieldsWithVerdict }])
+        .mockResolvedValueOnce([{ count: f.fieldsWithNoAnalysis }])
+        .mockResolvedValueOnce(
+          f.topErrors.map((e) => ({ message: e.message, count: e.count })),
+        );
+
+      // activeSchedules (propio) + total/active/inactive (dentro de getScheduledAnalysisSummary,
+      // reusado tal cual — valores irrelevantes para este describe, solo deben resolver).
+      fieldAnalysisScheduleRepo.count
+        .mockResolvedValueOnce(f.activeSchedules)
+        .mockResolvedValueOnce(0)
+        .mockResolvedValueOnce(0)
+        .mockResolvedValueOnce(0);
+
+      // activeSchedulesWithoutRuns (propio) + withoutRuns (dentro del summary, no se usa acá).
+      const scheduleQb: Record<string, jest.Mock> = {
+        where: jest.fn(),
+        andWhere: jest.fn(),
+        getCount: jest
+          .fn()
+          .mockResolvedValueOnce(f.activeSchedulesWithoutRuns)
+          .mockResolvedValueOnce(f.activeSchedulesWithoutRuns),
+      };
+      scheduleQb['where'].mockReturnValue(scheduleQb);
+      scheduleQb['andWhere'].mockReturnValue(scheduleQb);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(scheduleQb);
+      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue(
+        f.latestRunRows,
+      );
+
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildRawOneQueryBuilder(f.fieldsWithRun, f.fieldsWithMailSent),
+      );
+      scheduledAnalysisRunRepo.count
+        .mockResolvedValueOnce(f.sentEmails) // propio
+        .mockResolvedValueOnce(0) // mailSentLast7Days (summary)
+        .mockResolvedValueOnce(0); // mailSentLast30Days (summary)
+
+      analysisRepo.createQueryBuilder.mockReturnValue(
+        (() => {
+          const qb: Record<string, jest.Mock> = {
+            where: jest.fn(),
+            andWhere: jest.fn(),
+            getCount: jest.fn().mockResolvedValue(f.failedAnalysisLast30Days),
+          };
+          qb['where'].mockReturnValue(qb);
+          qb['andWhere'].mockReturnValue(qb);
+          return qb;
+        })(),
+      );
+
+      return f;
+    }
+
+    it('devuelve generatedAt', async () => {
+      setup();
+      const result = await service.getProductAnalytics();
+      expect(typeof result.generatedAt).toBe('string');
+      expect(new Date(result.generatedAt).toString()).not.toBe('Invalid Date');
+    });
+
+    it('devuelve el funnel con las 9 etapas, en orden', async () => {
+      setup();
+      const result = await service.getProductAnalytics();
+      expect(result.funnel.map((stage) => stage.id)).toEqual([
+        'total-users',
+        'users-with-field',
+        'total-fields',
+        'fields-with-lot',
+        'fields-with-finalized-analysis',
+        'fields-with-verdict',
+        'fields-with-active-schedule',
+        'fields-with-run',
+        'fields-with-mail-sent',
+      ]);
+    });
+
+    it('calcula usuarios con campo (COUNT DISTINCT userId)', async () => {
+      setup({ totalUsers: 10, usersWithField: 4 });
+      const result = await service.getProductAnalytics();
+      const stage = result.funnel.find((s) => s.id === 'users-with-field');
+      expect(stage?.count).toBe(4);
+      expect(stage?.previousCount).toBe(10);
+    });
+
+    it('calcula campos con lote (COUNT DISTINCT fieldId)', async () => {
+      setup({ totalFields: 78, fieldsWithLot: 78 });
+      const result = await service.getProductAnalytics();
+      const stage = result.funnel.find((s) => s.id === 'fields-with-lot');
+      expect(stage?.count).toBe(78);
+    });
+
+    it('calcula campos con análisis finalizado', async () => {
+      setup({ totalFields: 78, fieldsWithFinalizedAnalysis: 19 });
+      const result = await service.getProductAnalytics();
+      const stage = result.funnel.find(
+        (s) => s.id === 'fields-with-finalized-analysis',
+      );
+      expect(stage?.count).toBe(19);
+    });
+
+    it('calcula campos con veredicto técnico generado', async () => {
+      setup({ fieldsWithVerdict: 12 });
+      const result = await service.getProductAnalytics();
+      const stage = result.funnel.find((s) => s.id === 'fields-with-verdict');
+      expect(stage?.count).toBe(12);
+    });
+
+    it('calcula campos con schedule activo', async () => {
+      setup({ activeSchedules: 2 });
+      const result = await service.getProductAnalytics();
+      const stage = result.funnel.find(
+        (s) => s.id === 'fields-with-active-schedule',
+      );
+      expect(stage?.count).toBe(2);
+      expect(stage?.route).toBe('/scheduled-analysis');
+      expect(stage?.queryParams).toEqual({ enabled: true });
+    });
+
+    it('calcula campos con al menos una corrida', async () => {
+      setup({ fieldsWithRun: 3 });
+      const result = await service.getProductAnalytics();
+      const stage = result.funnel.find((s) => s.id === 'fields-with-run');
+      expect(stage?.count).toBe(3);
+      expect(stage?.queryParams).toEqual({ enabled: true, hasRuns: true });
+    });
+
+    it('calcula campos con mail enviado', async () => {
+      setup({ fieldsWithMailSent: 1 });
+      const result = await service.getProductAnalytics();
+      const stage = result.funnel.find((s) => s.id === 'fields-with-mail-sent');
+      expect(stage?.count).toBe(1);
+      // Sin filtro exacto en Programados todavía (deuda documentada en PR3) — no hay route.
+      expect(stage?.route).toBeUndefined();
+    });
+
+    it('conversionFromPrevious/dropoffFromPrevious no explotan cuando previousCount=0', async () => {
+      setup({ totalUsers: 0, usersWithField: 0, totalFields: 5 });
+      const result = await service.getProductAnalytics();
+
+      const usersWithFieldStage = result.funnel.find(
+        (s) => s.id === 'users-with-field',
+      );
+      expect(usersWithFieldStage?.conversionFromPrevious).toBeUndefined();
+      expect(usersWithFieldStage?.dropoffFromPrevious).toBe(0);
+
+      // totalFields (5) creció respecto de usersWithField (0) — dropoff negativo, no lanza NaN.
+      const totalFieldsStage = result.funnel.find(
+        (s) => s.id === 'total-fields',
+      );
+      expect(totalFieldsStage?.dropoffFromPrevious).toBe(-5);
+      expect(Number.isNaN(totalFieldsStage?.dropoffFromPrevious)).toBe(false);
+    });
+
+    it('devuelve el top de errores de los últimos 30 días agrupados', async () => {
+      setup({
+        topErrors: [
+          { message: 'Timeout worker', count: 12 },
+          { message: 'Nubosidad excesiva', count: 5 },
+        ],
+      });
+      const result = await service.getProductAnalytics();
+      expect(result.topAnalysisErrorsLast30Days).toEqual([
+        { message: 'Timeout worker', count: 12 },
+        { message: 'Nubosidad excesiva', count: 5 },
+      ]);
+    });
+
+    it('no crea insight de schedules sin corridas cuando activeSchedulesWithoutRuns es 0', async () => {
+      setup({ activeSchedulesWithoutRuns: 0 });
+      const result = await service.getProductAnalytics();
+      expect(
+        result.insights.find((i) => i.id === 'active-schedules-without-runs'),
+      ).toBeUndefined();
+    });
+
+    it('crea insight de schedules sin corridas cuando activeSchedulesWithoutRuns > 0, con link real', async () => {
+      setup({ activeSchedules: 2, activeSchedulesWithoutRuns: 2 });
+      const result = await service.getProductAnalytics();
+      const insight = result.insights.find(
+        (i) => i.id === 'active-schedules-without-runs',
+      );
+      expect(insight).toEqual(
+        expect.objectContaining({
+          severity: 'critical',
+          route: '/scheduled-analysis',
+          queryParams: { enabled: true, hasRuns: false },
+        }),
+      );
+    });
+
+    it('crea insight de mail pendiente/fallido a partir del resumen de Programados (PR3)', async () => {
+      setup({
+        latestRunRows: [
+          { status: 'completed', failedAt: null, emailSentAt: null },
+        ],
+      });
+      const result = await service.getProductAnalytics();
+      const insight = result.insights.find(
+        (i) => i.id === 'mail-pending-or-failed',
+      );
+      expect(insight?.title).toContain('1');
+    });
+
+    it('weeklyMonitoring resta activeSchedulesWithoutRuns de activeSchedules para schedulesWithRuns', async () => {
+      setup({ activeSchedules: 10, activeSchedulesWithoutRuns: 3 });
+      const result = await service.getProductAnalytics();
+      expect(result.weeklyMonitoring).toEqual(
+        expect.objectContaining({
+          activeSchedules: 10,
+          activeSchedulesWithoutRuns: 3,
+          schedulesWithRuns: 7,
+        }),
+      );
+    });
+
+    it('no genera ninguna migración (solo lectura, sin cambios de esquema)', () => {
+      // Cubierto a nivel repo por `npm run migration:show` en la validación del PR, no acá — este
+      // test documenta la intención: getProductAnalytics() nunca llama a save/insert/update.
+      expect(typeof service.getProductAnalytics).toBe('function');
+    });
+  });
+
   describe('getSystemHealth', () => {
     it('devuelve la estructura esperada', async () => {
       const fieldRepoManager = fieldRepo.manager;
