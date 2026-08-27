@@ -97,6 +97,7 @@ describe('AdminService', () => {
   let invitationRepo: ReturnType<typeof noopRepo>;
   let passwordResetRepo: ReturnType<typeof noopRepo>;
   let fieldRepo: ReturnType<typeof noopRepo>;
+  let fieldLotRepo: ReturnType<typeof noopRepo>;
   let analysisRepo: ReturnType<typeof noopRepo>;
   let analysisVerdictRepo: ReturnType<typeof noopRepo>;
   let fieldAnalysisScheduleRepo: ReturnType<typeof noopRepo>;
@@ -110,6 +111,7 @@ describe('AdminService', () => {
     invitationRepo = noopRepo();
     passwordResetRepo = noopRepo();
     fieldRepo = noopRepo();
+    fieldLotRepo = noopRepo();
     analysisRepo = noopRepo();
     analysisVerdictRepo = noopRepo();
     fieldAnalysisScheduleRepo = noopRepo();
@@ -166,7 +168,7 @@ describe('AdminService', () => {
           useValue: { get: jest.fn().mockReturnValue(undefined) },
         },
         { provide: getRepositoryToken(Field), useValue: fieldRepo },
-        { provide: getRepositoryToken(FieldLot), useValue: noopRepo() },
+        { provide: getRepositoryToken(FieldLot), useValue: fieldLotRepo },
         { provide: getRepositoryToken(Analysis), useValue: analysisRepo },
         {
           provide: getRepositoryToken(AnalysisTechnicalVerdict),
@@ -271,6 +273,26 @@ describe('AdminService', () => {
       result.items.forEach((item) => {
         expect(item).not.toHaveProperty('passwordHash');
       });
+    });
+
+    it('Admin PR 2: reenvía userId a UsersService.findAllPaginated para trazabilidad', async () => {
+      usersService.findAllPaginated.mockResolvedValue({ items: [], total: 0 });
+
+      await service.listUsers({ page: 1, limit: 20, userId: 'user-1' });
+
+      expect(usersService.findAllPaginated).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-1' }),
+      );
+    });
+
+    it('Admin PR 2: no rompe si userId no viene (comportamiento normal)', async () => {
+      usersService.findAllPaginated.mockResolvedValue({ items: [], total: 0 });
+
+      await service.listUsers({ page: 1, limit: 20 });
+
+      expect(usersService.findAllPaginated).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: undefined }),
+      );
     });
   });
 
@@ -1481,6 +1503,232 @@ describe('AdminService', () => {
       fieldRepo.createQueryBuilder.mockReturnValue(qb);
 
       await service.listFields({ page: 1, limit: 20 });
+
+      expect(qb.andWhere).not.toHaveBeenCalled();
+    });
+
+    it('Admin PR 2: filtra por userId ("ver campos de este usuario")', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listFields({ page: 1, limit: 20, userId: 'user-1' });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('field."userId" = :userId', {
+        userId: 'user-1',
+      });
+    });
+
+    it('Admin PR 2: filtra por fieldId ("saltar a este campo puntual")', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listFields({ page: 1, limit: 20, fieldId: 'field-1' });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('field.id = :fieldId', {
+        fieldId: 'field-1',
+      });
+    });
+  });
+
+  describe('listLots — filtros de trazabilidad (Admin PR 2)', () => {
+    function buildLotsQueryBuilder(items: unknown[], total: number) {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndSelect: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([items, total]),
+      };
+      for (const key of [
+        'leftJoinAndSelect',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+      ]) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    it('filtra por fieldId ("ver lotes de este campo")', async () => {
+      const qb = buildLotsQueryBuilder([], 0);
+      fieldLotRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listLots({ page: 1, limit: 20, fieldId: 'field-1' });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('lot."fieldId" = :fieldId', {
+        fieldId: 'field-1',
+      });
+    });
+
+    it('filtra por userId ("ver lotes de este usuario", vía el join a field)', async () => {
+      const qb = buildLotsQueryBuilder([], 0);
+      fieldLotRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listLots({ page: 1, limit: 20, userId: 'user-1' });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('field."userId" = :userId', {
+        userId: 'user-1',
+      });
+    });
+
+    it('no agrega ningún filtro cuando ni fieldId ni userId vienen en el query', async () => {
+      const qb = buildLotsQueryBuilder([], 0);
+      fieldLotRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listLots({ page: 1, limit: 20 });
+
+      expect(qb.andWhere).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listAnalysis — filtro analysisId (Admin PR 2)', () => {
+    function buildAnalysisQueryBuilderForFilters(
+      items: unknown[],
+      total: number,
+    ) {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndMapOne: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([items, total]),
+      };
+      for (const key of [
+        'leftJoinAndMapOne',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+      ]) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    it('filtra por analysisId ("foco directo en un análisis puntual" desde Programados)', async () => {
+      const qb = buildAnalysisQueryBuilderForFilters([], 0);
+      analysisRepo.createQueryBuilder.mockReturnValue(qb);
+      analysisVerdictRepo.find.mockResolvedValue([]);
+
+      await service.listAnalysis({
+        page: 1,
+        limit: 20,
+        analysisId: 'analysis-1',
+      });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('analysis.id = :analysisId', {
+        analysisId: 'analysis-1',
+      });
+    });
+
+    it('no agrega filtro de analysisId cuando no viene en el query', async () => {
+      const qb = buildAnalysisQueryBuilderForFilters([], 0);
+      analysisRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listAnalysis({ page: 1, limit: 20 });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(sqlCalls.some((sql) => sql.includes('analysis.id ='))).toBe(false);
+    });
+  });
+
+  describe('listScheduledAnalysis — filtros de trazabilidad (Admin PR 2)', () => {
+    function buildScheduleQueryBuilderForFilters(
+      items: unknown[],
+      total: number,
+    ) {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndMapOne: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([items, total]),
+      };
+      for (const key of [
+        'leftJoinAndMapOne',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+      ]) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    it('filtra por fieldId ("ver programados de este campo")', async () => {
+      const qb = buildScheduleQueryBuilderForFilters([], 0);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+        fieldId: 'field-1',
+      });
+
+      expect(qb.andWhere).toHaveBeenCalledWith(
+        'schedule."fieldId" = :fieldId',
+        {
+          fieldId: 'field-1',
+        },
+      );
+    });
+
+    it('filtra por userId ("ver programados de este usuario")', async () => {
+      const qb = buildScheduleQueryBuilderForFilters([], 0);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+        userId: 'user-1',
+      });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('schedule."userId" = :userId', {
+        userId: 'user-1',
+      });
+    });
+
+    it('filtra por enabled=true', async () => {
+      const qb = buildScheduleQueryBuilderForFilters([], 0);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+        enabled: true,
+      });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('schedule.enabled = :enabled', {
+        enabled: true,
+      });
+    });
+
+    it('filtra por enabled=false (no se confunde con "no vino en el query")', async () => {
+      const qb = buildScheduleQueryBuilderForFilters([], 0);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+        enabled: false,
+      });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('schedule.enabled = :enabled', {
+        enabled: false,
+      });
+    });
+
+    it('no agrega ningún filtro cuando ninguno viene en el query', async () => {
+      const qb = buildScheduleQueryBuilderForFilters([], 0);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listScheduledAnalysis({ page: 1, limit: 20 });
 
       expect(qb.andWhere).not.toHaveBeenCalled();
     });

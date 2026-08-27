@@ -1,5 +1,5 @@
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsOptional } from 'class-validator';
+import { IsBoolean, IsOptional, IsUUID } from 'class-validator';
 
 import { PaginationQueryDto } from './pagination-query.dto';
 
@@ -22,4 +22,16 @@ export class ListFieldsQueryDto extends PaginationQueryDto {
   @Transform(toBoolean)
   @IsBoolean()
   hasAnalysis?: boolean;
+
+  // Admin PR 2: trazabilidad — "ver campos de este usuario" desde Usuarios/Diagnósticos/
+  // Programados (/fields?userId=<uuid>).
+  @IsOptional()
+  @IsUUID()
+  userId?: string;
+
+  // Admin PR 2: "saltar al campo" desde Diagnósticos/Programados sin una vista de detalle
+  // dedicada — muestra la lista de Campos acotada a un único id (/fields?fieldId=<uuid>).
+  @IsOptional()
+  @IsUUID()
+  fieldId?: string;
 }

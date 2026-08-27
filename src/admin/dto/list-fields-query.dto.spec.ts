@@ -56,3 +56,36 @@ describe('ListFieldsQueryDto — hasAnalysis (Admin PR 1)', () => {
     expect(errors).toHaveLength(0);
   });
 });
+
+describe('ListFieldsQueryDto — userId/fieldId (Admin PR 2)', () => {
+  it('acepta userId y fieldId como UUID', async () => {
+    const instance = plainToInstance(ListFieldsQueryDto, {
+      userId: '11111111-1111-4111-8111-111111111111',
+      fieldId: '22222222-2222-4222-8222-222222222222',
+    });
+    const errors = await validate(instance);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('rechaza userId que no es UUID', async () => {
+    const instance = plainToInstance(ListFieldsQueryDto, {
+      userId: 'no-es-uuid',
+    });
+    const errors = await validate(instance);
+    expect(errors.some((error) => error.property === 'userId')).toBe(true);
+  });
+
+  it('rechaza fieldId que no es UUID', async () => {
+    const instance = plainToInstance(ListFieldsQueryDto, {
+      fieldId: 'no-es-uuid',
+    });
+    const errors = await validate(instance);
+    expect(errors.some((error) => error.property === 'fieldId')).toBe(true);
+  });
+
+  it('acepta userId/fieldId ausentes', async () => {
+    const instance = plainToInstance(ListFieldsQueryDto, { search: 'campo' });
+    const errors = await validate(instance);
+    expect(errors).toHaveLength(0);
+  });
+});

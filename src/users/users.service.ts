@@ -11,6 +11,9 @@ export type ListUsersParams = {
   page: number;
   limit: number;
   search?: string;
+  // Admin PR 2: trazabilidad — "saltar al usuario" desde otras pantallas admin sin depender del
+  // buscador de texto (ver AdminService.listUsers / ListUsersQueryDto).
+  userId?: string;
 };
 
 export type UpdateUserFields = Partial<
@@ -61,7 +64,7 @@ export class UsersService {
   async findAllPaginated(
     params: ListUsersParams,
   ): Promise<{ items: User[]; total: number }> {
-    const { page, limit, search } = params;
+    const { page, limit, search, userId } = params;
 
     const query = this.usersRepository
       .createQueryBuilder('user')
@@ -69,10 +72,20 @@ export class UsersService {
       .skip((page - 1) * limit)
       .take(limit);
 
+    // andWhere en vez de where para las dos: TypeORM trata el primer andWhere() como el WHERE
+    // inicial cuando todavía no se llamó a where(), así que da igual el orden en el que estas dos
+    // condiciones (opcionales, independientes) terminen apareciendo.
+    if (userId) {
+      query.andWhere('user.id = :userId', { userId });
+    }
+
     if (search) {
-      query.where('user.email ILIKE :search OR user.fullName ILIKE :search', {
-        search: `%${search}%`,
-      });
+      query.andWhere(
+        '(user.email ILIKE :search OR user.fullName ILIKE :search)',
+        {
+          search: `%${search}%`,
+        },
+      );
     }
 
     const [items, total] = await query.getManyAndCount();

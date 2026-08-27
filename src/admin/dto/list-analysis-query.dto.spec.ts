@@ -28,7 +28,9 @@ describe('ListAnalysisQueryDto — filtros ADMIN-2', () => {
   });
 
   it('interpreta onlyFailed=false como boolean false, no truthy', async () => {
-    const instance = plainToInstance(ListAnalysisQueryDto, { onlyFailed: 'false' });
+    const instance = plainToInstance(ListAnalysisQueryDto, {
+      onlyFailed: 'false',
+    });
     const errors = await validate(instance);
 
     expect(errors).toHaveLength(0);
@@ -36,20 +38,55 @@ describe('ListAnalysisQueryDto — filtros ADMIN-2', () => {
   });
 
   it('rechaza fieldId que no es UUID', async () => {
-    const instance = plainToInstance(ListAnalysisQueryDto, { fieldId: 'no-es-uuid' });
+    const instance = plainToInstance(ListAnalysisQueryDto, {
+      fieldId: 'no-es-uuid',
+    });
     const errors = await validate(instance);
     expect(errors.some((error) => error.property === 'fieldId')).toBe(true);
   });
 
   it('rechaza from que no es una fecha válida', async () => {
-    const instance = plainToInstance(ListAnalysisQueryDto, { from: 'no-es-fecha' });
+    const instance = plainToInstance(ListAnalysisQueryDto, {
+      from: 'no-es-fecha',
+    });
     const errors = await validate(instance);
     expect(errors.some((error) => error.property === 'from')).toBe(true);
   });
 
   it('rechaza status fuera del union conocido', async () => {
-    const instance = plainToInstance(ListAnalysisQueryDto, { status: 'Pendiente' });
+    const instance = plainToInstance(ListAnalysisQueryDto, {
+      status: 'Pendiente',
+    });
     const errors = await validate(instance);
     expect(errors.some((error) => error.property === 'status')).toBe(true);
+  });
+});
+
+describe('ListAnalysisQueryDto — analysisId (Admin PR 2)', () => {
+  it('acepta analysisId como UUID', async () => {
+    const instance = plainToInstance(ListAnalysisQueryDto, {
+      analysisId: '11111111-1111-4111-8111-111111111111',
+    });
+    const errors = await validate(instance);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('rechaza analysisId que no es UUID', async () => {
+    const instance = plainToInstance(ListAnalysisQueryDto, {
+      analysisId: 'no-es-uuid',
+    });
+    const errors = await validate(instance);
+    expect(errors.some((error) => error.property === 'analysisId')).toBe(true);
+  });
+
+  it('acepta analysisId combinado con status/fieldId/userId', async () => {
+    const instance = plainToInstance(ListAnalysisQueryDto, {
+      analysisId: '11111111-1111-4111-8111-111111111111',
+      status: 'Error',
+      fieldId: '22222222-2222-4222-8222-222222222222',
+      userId: '33333333-3333-4333-8333-333333333333',
+    });
+    const errors = await validate(instance);
+    expect(errors).toHaveLength(0);
   });
 });

@@ -1,5 +1,11 @@
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsDateString, IsIn, IsOptional, IsUUID } from 'class-validator';
+import {
+  IsBoolean,
+  IsDateString,
+  IsIn,
+  IsOptional,
+  IsUUID,
+} from 'class-validator';
 
 // class-transformer's `@Type(() => Boolean)` uses the Boolean() constructor,
 // which treats any non-empty string ('false' included) as true — clásico
@@ -15,12 +21,22 @@ const toBoolean = ({ value }: { value: unknown }) => {
 import type { AnalysisStatus } from '../../analysis/entities/analysis.entity';
 import { PaginationQueryDto } from './pagination-query.dto';
 
-const ANALYSIS_STATUSES: AnalysisStatus[] = ['Procesando', 'Finalizado', 'Error'];
+const ANALYSIS_STATUSES: AnalysisStatus[] = [
+  'Procesando',
+  'Finalizado',
+  'Error',
+];
 
 export class ListAnalysisQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsIn(ANALYSIS_STATUSES)
   status?: AnalysisStatus;
+
+  // Admin PR 2: trazabilidad — foco directo en un análisis puntual desde Programados
+  // (link al analysisId de latestRun) sin necesitar una vista de detalle dedicada.
+  @IsOptional()
+  @IsUUID()
+  analysisId?: string;
 
   @IsOptional()
   @IsUUID()

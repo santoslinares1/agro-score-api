@@ -46,7 +46,9 @@ import { ListAccessRequestsQueryDto } from './dto/list-access-requests-query.dto
 import { ListAnalysisQueryDto } from './dto/list-analysis-query.dto';
 import { ListAuditLogsQueryDto } from './dto/list-audit-logs-query.dto';
 import { ListFieldsQueryDto } from './dto/list-fields-query.dto';
-import { PaginationQueryDto } from './dto/pagination-query.dto';
+import { ListLotsQueryDto } from './dto/list-lots-query.dto';
+import { ListScheduledAnalysisQueryDto } from './dto/list-scheduled-analysis-query.dto';
+import { ListUsersQueryDto } from './dto/list-users-query.dto';
 import { UpdateAccessRequestDto } from './dto/update-access-request.dto';
 import { UpdateAdminUserDto } from './dto/update-admin-user.dto';
 
@@ -348,7 +350,7 @@ export class AdminService {
 
   // ── Usuarios ────────────────────────────────────────────────────────
 
-  async listUsers(query: PaginationQueryDto): Promise<Paginated<PublicUser>> {
+  async listUsers(query: ListUsersQueryDto): Promise<Paginated<PublicUser>> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
@@ -356,6 +358,7 @@ export class AdminService {
       page,
       limit,
       search: query.search,
+      userId: query.userId,
     });
 
     return {
@@ -894,6 +897,16 @@ export class AdminService {
       qb.andWhere('field.name ILIKE :search', { search: `%${query.search}%` });
     }
 
+    // Admin PR 2: trazabilidad — "ver campos de este usuario" (Usuarios/Diagnósticos/Programados)
+    // y "saltar a este campo puntual" (sin vista de detalle dedicada todavía).
+    if (query.userId) {
+      qb.andWhere('field."userId" = :userId', { userId: query.userId });
+    }
+
+    if (query.fieldId) {
+      qb.andWhere('field.id = :fieldId', { fieldId: query.fieldId });
+    }
+
     // Admin PR 1: mismo criterio (NOT) EXISTS que countFieldsWithNoAnalysis() más abajo — soporta
     // la alerta "Campos sin diagnóstico" del Dashboard, que necesita un link que filtre de verdad
     // en vez de mandar a la lista completa de campos.
@@ -958,7 +971,7 @@ export class AdminService {
     return new Map(rows.map((row) => [row.fieldId, Number(row.count)]));
   }
 
-  async listLots(query: PaginationQueryDto): Promise<Paginated<unknown>> {
+  async listLots(query: ListLotsQueryDto): Promise<Paginated<unknown>> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
@@ -972,6 +985,15 @@ export class AdminService {
 
     if (query.search) {
       qb.andWhere('lot.name ILIKE :search', { search: `%${query.search}%` });
+    }
+
+    // Admin PR 2: trazabilidad — "ver lotes de este campo/usuario" desde Campos/Usuarios.
+    if (query.fieldId) {
+      qb.andWhere('lot."fieldId" = :fieldId', { fieldId: query.fieldId });
+    }
+
+    if (query.userId) {
+      qb.andWhere('field."userId" = :userId', { userId: query.userId });
     }
 
     const [items, total] = await qb.getManyAndCount();
@@ -1015,6 +1037,13 @@ export class AdminService {
 
     if (query.status) {
       qb.andWhere('analysis.status = :status', { status: query.status });
+    }
+
+    // Admin PR 2: trazabilidad — foco directo en un análisis puntual desde Programados.
+    if (query.analysisId) {
+      qb.andWhere('analysis.id = :analysisId', {
+        analysisId: query.analysisId,
+      });
     }
 
     if (query.onlyFailed) {
@@ -1120,7 +1149,7 @@ export class AdminService {
    *      WeeklyTechnicalVerdictService.findResponsesByScheduledRunIds.
    */
   async listScheduledAnalysis(
-    query: PaginationQueryDto,
+    query: ListScheduledAnalysisQueryDto,
   ): Promise<Paginated<AdminScheduledAnalysisItem>> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
@@ -1140,6 +1169,20 @@ export class AdminService {
       .orderBy('schedule.createdAt', 'DESC')
       .skip((page - 1) * limit)
       .take(limit);
+
+    // Admin PR 2: trazabilidad — "ver programados de este campo/usuario" desde Campos/Usuarios,
+    // y "solo activos". hasRuns=false queda fuera (ver comentario en ListScheduledAnalysisQueryDto).
+    if (query.fieldId) {
+      qb.andWhere('schedule."fieldId" = :fieldId', { fieldId: query.fieldId });
+    }
+
+    if (query.userId) {
+      qb.andWhere('schedule."userId" = :userId', { userId: query.userId });
+    }
+
+    if (query.enabled !== undefined) {
+      qb.andWhere('schedule.enabled = :enabled', { enabled: query.enabled });
+    }
 
     const [schedules, total] = (await qb.getManyAndCount()) as [
       (FieldAnalysisSchedule & {

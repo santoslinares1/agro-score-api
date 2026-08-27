@@ -27,7 +27,9 @@ import { ListAccessRequestsQueryDto } from './dto/list-access-requests-query.dto
 import { ListAnalysisQueryDto } from './dto/list-analysis-query.dto';
 import { ListAuditLogsQueryDto } from './dto/list-audit-logs-query.dto';
 import { ListFieldsQueryDto } from './dto/list-fields-query.dto';
-import { PaginationQueryDto } from './dto/pagination-query.dto';
+import { ListLotsQueryDto } from './dto/list-lots-query.dto';
+import { ListScheduledAnalysisQueryDto } from './dto/list-scheduled-analysis-query.dto';
+import { ListUsersQueryDto } from './dto/list-users-query.dto';
 import { UpdateAccessRequestDto } from './dto/update-access-request.dto';
 import { UpdateAdminUserDto } from './dto/update-admin-user.dto';
 
@@ -71,7 +73,7 @@ export class AdminController {
   }
 
   @Get('users')
-  listUsers(@Query() query: PaginationQueryDto) {
+  listUsers(@Query() query: ListUsersQueryDto) {
     return this.adminService.listUsers(query);
   }
 
@@ -128,7 +130,7 @@ export class AdminController {
   }
 
   @Get('lots')
-  listLots(@Query() query: PaginationQueryDto) {
+  listLots(@Query() query: ListLotsQueryDto) {
     return this.adminService.listLots(query);
   }
 
@@ -158,7 +160,7 @@ export class AdminController {
 
   // PR 13B: solo lectura — nunca dispara una corrida, nunca reintenta un email.
   @Get('scheduled-analysis')
-  listScheduledAnalysis(@Query() query: PaginationQueryDto) {
+  listScheduledAnalysis(@Query() query: ListScheduledAnalysisQueryDto) {
     return this.adminService.listScheduledAnalysis(query);
   }
 
