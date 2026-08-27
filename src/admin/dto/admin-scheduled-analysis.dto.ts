@@ -52,3 +52,35 @@ export type AdminScheduledAnalysisItem = {
    */
   weeklyTechnicalVerdict: WeeklyTechnicalVerdictResponse | null;
 };
+
+/**
+ * Admin PR 3: resumen agregado de TODOS los schedules (no acotado a la página/filtros actuales de
+ * `GET /admin/scheduled-analysis` — "¿cómo está el flujo semanal?" es una pregunta global, mismo
+ * criterio que las alertas operativas del Dashboard en Admin PR 1). Viaja junto a la respuesta
+ * paginada de siempre para no sumar un endpoint nuevo ni una segunda llamada HTTP.
+ *
+ * - `withoutRuns` usa existencia real de `ScheduledAnalysisRun` (no `lastRunAt`), mismo criterio
+ *   que el filtro `hasRuns` — ver AdminService.listScheduledAnalysis.
+ * - `lastRunOk`/`lastRunFailed`: estado de la corrida MÁS RECIENTE de cada schedule (no de todas
+ *   las corridas históricas).
+ * - `mailSentLast7Days`/`mailSentLast30Days`: cuentan CORRIDAS con `emailSentAt` en la ventana,
+ *   no schedules — es una métrica de actividad ("cuántos reportes salieron"), no de estado actual.
+ * - `mailPendingOrFailed`: schedules cuya corrida más reciente todavía no mandó el mail — agrupa
+ *   dos casos reales y distinguibles (ver resolveMailStatus en agro-score-admin): la corrida
+ *   quedó `completed` sin `emailSentAt` (reintenta solo en el próximo ciclo), o quedó `failed` con
+ *   `failedAt` NULL (el análisis sí terminó bien — el mail se omitió porque el schedule se
+ *   desactivó antes de poder enviarlo, ver ScheduledAnalysisRunnerService.reconcileRun). Nunca
+ *   incluye corridas `failed` con `failedAt` seteado — esas fallaron en el análisis, antes de
+ *   siquiera llegar a la etapa de mail.
+ */
+export type AdminScheduledAnalysisSummary = {
+  total: number;
+  active: number;
+  inactive: number;
+  withoutRuns: number;
+  lastRunOk: number;
+  lastRunFailed: number;
+  mailSentLast7Days: number;
+  mailSentLast30Days: number;
+  mailPendingOrFailed: number;
+};

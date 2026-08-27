@@ -8,7 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcryptjs';
-import { In, IsNull, LessThan, Repository } from 'typeorm';
+import { In, IsNull, LessThan, MoreThanOrEqual, Repository } from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
@@ -24,7 +24,10 @@ import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { FieldAnalysisSchedule } from '../scheduled-analysis/entities/field-analysis-schedule.entity';
-import { ScheduledAnalysisRun } from '../scheduled-analysis/entities/scheduled-analysis-run.entity';
+import {
+  ScheduledAnalysisRun,
+  ScheduledRunStatus,
+} from '../scheduled-analysis/entities/scheduled-analysis-run.entity';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
@@ -38,6 +41,7 @@ import {
 import {
   AdminScheduledAnalysisItem,
   AdminScheduledAnalysisRun,
+  AdminScheduledAnalysisSummary,
 } from './dto/admin-scheduled-analysis.dto';
 import { CreateAdminUserDto } from './dto/create-admin-user.dto';
 import { CreateInvitationDto } from './dto/create-invitation.dto';
@@ -1148,9 +1152,11 @@ export class AdminService {
    *   4. (PR 16D) los weeklyTechnicalVerdict de esos scheduledRunId (run.id), vía
    *      WeeklyTechnicalVerdictService.findResponsesByScheduledRunIds.
    */
-  async listScheduledAnalysis(
-    query: ListScheduledAnalysisQueryDto,
-  ): Promise<Paginated<AdminScheduledAnalysisItem>> {
+  async listScheduledAnalysis(query: ListScheduledAnalysisQueryDto): Promise<
+    Paginated<AdminScheduledAnalysisItem> & {
+      summary: AdminScheduledAnalysisSummary;
+    }
+  > {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
@@ -1184,16 +1190,38 @@ export class AdminService {
       qb.andWhere('schedule.enabled = :enabled', { enabled: query.enabled });
     }
 
-    const [schedules, total] = (await qb.getManyAndCount()) as [
-      (FieldAnalysisSchedule & {
-        field?:
-          | (Pick<Field, 'id' | 'name' | 'userId'> & {
-              user?: Pick<User, 'id' | 'email' | 'fullName'>;
-            })
-          | null;
-      })[],
-      number,
-    ];
+    // Admin PR 3: existencia REAL de corridas (EXISTS/NOT EXISTS contra scheduled_analysis_runs),
+    // no `lastRunAt` — ver comentario en ListScheduledAnalysisQueryDto. Mismo criterio que usa el
+    // resumen agregado (`withoutRuns`, más abajo).
+    if (query.hasRuns === true) {
+      qb.andWhere(
+        `EXISTS (SELECT 1 FROM scheduled_analysis_runs r WHERE r."scheduleId" = schedule.id)`,
+      );
+    } else if (query.hasRuns === false) {
+      qb.andWhere(
+        `NOT EXISTS (SELECT 1 FROM scheduled_analysis_runs r WHERE r."scheduleId" = schedule.id)`,
+      );
+    }
+
+    // Admin PR 3: el resumen es GLOBAL (todos los schedules, sin los filtros de arriba) — responde
+    // "¿cómo está el flujo semanal?" en general, no la pregunta más angosta de la página actual.
+    // Se pide en paralelo con la query principal, no es N+1 (una consulta agregada más, no una por
+    // fila ni por schedule).
+    const [[schedules, total], summary] = await Promise.all([
+      qb.getManyAndCount() as Promise<
+        [
+          (FieldAnalysisSchedule & {
+            field?:
+              | (Pick<Field, 'id' | 'name' | 'userId'> & {
+                  user?: Pick<User, 'id' | 'email' | 'fullName'>;
+                })
+              | null;
+          })[],
+          number,
+        ]
+      >,
+      this.getScheduledAnalysisSummary(),
+    ]);
 
     const latestRunsByScheduleId = await this.getLatestRunsByScheduleId(
       schedules.map((schedule) => schedule.id),
@@ -1250,6 +1278,90 @@ export class AdminService {
       total,
       page,
       limit,
+      summary,
+    };
+  }
+
+  /**
+   * Admin PR 3: resumen global de Programados — ver AdminScheduledAnalysisSummary (comentario
+   * completo en el DTO) para el detalle de cada número. Una sola query DISTINCT ON resuelve
+   * lastRunOk/lastRunFailed/mailPendingOrFailed juntos (agregados en JS sobre esas filas, sin
+   * volver a golpear la DB), en vez de tres consultas separadas.
+   */
+  private async getScheduledAnalysisSummary(): Promise<AdminScheduledAnalysisSummary> {
+    const now = new Date();
+    const cutoff7 = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const cutoff30 = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    const [
+      total,
+      active,
+      inactive,
+      withoutRuns,
+      latestRunRows,
+      mailSentLast7Days,
+      mailSentLast30Days,
+    ] = await Promise.all([
+      this.fieldAnalysisScheduleRepository.count(),
+      this.fieldAnalysisScheduleRepository.count({ where: { enabled: true } }),
+      this.fieldAnalysisScheduleRepository.count({ where: { enabled: false } }),
+      this.fieldAnalysisScheduleRepository
+        .createQueryBuilder('schedule')
+        .where(
+          `NOT EXISTS (SELECT 1 FROM scheduled_analysis_runs r WHERE r."scheduleId" = schedule.id)`,
+        )
+        .getCount(),
+      this.fieldAnalysisScheduleRepository.manager.query<
+        {
+          status: ScheduledRunStatus;
+          failedAt: Date | null;
+          emailSentAt: Date | null;
+        }[]
+      >(`
+        SELECT DISTINCT ON (r."scheduleId") r.status, r."failedAt", r."emailSentAt"
+        FROM scheduled_analysis_runs r
+        ORDER BY r."scheduleId", r."createdAt" DESC
+      `),
+      this.scheduledAnalysisRunRepository.count({
+        where: { emailSentAt: MoreThanOrEqual(cutoff7) },
+      }),
+      this.scheduledAnalysisRunRepository.count({
+        where: { emailSentAt: MoreThanOrEqual(cutoff30) },
+      }),
+    ]);
+
+    let lastRunOk = 0;
+    let lastRunFailed = 0;
+    let mailPendingOrFailed = 0;
+
+    for (const row of latestRunRows) {
+      if (row.status === 'completed') {
+        lastRunOk += 1;
+        if (!row.emailSentAt) {
+          mailPendingOrFailed += 1;
+        }
+      } else if (row.status === 'failed') {
+        lastRunFailed += 1;
+        // failedAt NULL en una corrida 'failed' significa que el análisis SÍ terminó bien y recién
+        // después se omitió el mail porque el schedule se desactivó antes de poder enviarlo (ver
+        // ScheduledAnalysisRunnerService.reconcileRun) — nunca una falla del pipeline (esas
+        // siempre setean failedAt). Es el único caso real de "el mail específicamente falló".
+        if (!row.failedAt) {
+          mailPendingOrFailed += 1;
+        }
+      }
+    }
+
+    return {
+      total,
+      active,
+      inactive,
+      withoutRuns,
+      lastRunOk,
+      lastRunFailed,
+      mailSentLast7Days,
+      mailSentLast30Days,
+      mailPendingOrFailed,
     };
   }
 

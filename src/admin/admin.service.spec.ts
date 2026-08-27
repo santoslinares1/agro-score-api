@@ -879,9 +879,23 @@ describe('AdminService', () => {
         orderBy: jest.fn(),
         skip: jest.fn(),
         take: jest.fn(),
+        andWhere: jest.fn(),
+        // Admin PR 3: getScheduledAnalysisSummary() reusa este mismo repositorio (mockeado acá
+        // arriba con un único objeto para todas las llamadas a createQueryBuilder) para el conteo
+        // NOT EXISTS de `withoutRuns` — where/getCount con un default inocuo (0) para no romper
+        // los tests de arriba, que no verifican el resumen.
+        where: jest.fn(),
+        getCount: jest.fn().mockResolvedValue(0),
         getManyAndCount: jest.fn().mockResolvedValue([items, total]),
       };
-      for (const key of ['leftJoinAndMapOne', 'orderBy', 'skip', 'take']) {
+      for (const key of [
+        'leftJoinAndMapOne',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+        'where',
+      ]) {
         qb[key].mockReturnValue(qb);
       }
       return qb;
@@ -1647,6 +1661,10 @@ describe('AdminService', () => {
         skip: jest.fn(),
         take: jest.fn(),
         andWhere: jest.fn(),
+        // Admin PR 3: getScheduledAnalysisSummary() reusa el mismo mock de createQueryBuilder
+        // para el conteo NOT EXISTS de `withoutRuns` — default inocuo, estos tests no lo verifican.
+        where: jest.fn(),
+        getCount: jest.fn().mockResolvedValue(0),
         getManyAndCount: jest.fn().mockResolvedValue([items, total]),
       };
       for (const key of [
@@ -1655,6 +1673,7 @@ describe('AdminService', () => {
         'skip',
         'take',
         'andWhere',
+        'where',
       ]) {
         qb[key].mockReturnValue(qb);
       }
@@ -1731,6 +1750,208 @@ describe('AdminService', () => {
       await service.listScheduledAnalysis({ page: 1, limit: 20 });
 
       expect(qb.andWhere).not.toHaveBeenCalled();
+    });
+
+    it('Admin PR 3: filtra por hasRuns=true con EXISTS real contra scheduled_analysis_runs', async () => {
+      const qb = buildScheduleQueryBuilderForFilters([], 0);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+        hasRuns: true,
+      });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(
+        sqlCalls.some(
+          (sql) => sql.includes('EXISTS') && !sql.includes('NOT EXISTS'),
+        ),
+      ).toBe(true);
+    });
+
+    it('Admin PR 3: filtra por hasRuns=false con NOT EXISTS real, no lastRunAt', async () => {
+      const qb = buildScheduleQueryBuilderForFilters([], 0);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+        hasRuns: false,
+      });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(sqlCalls.some((sql) => sql.includes('NOT EXISTS'))).toBe(true);
+      expect(sqlCalls.some((sql) => sql.includes('lastRunAt'))).toBe(false);
+    });
+
+    it('Admin PR 3: no agrega filtro de hasRuns cuando no viene en el query', async () => {
+      const qb = buildScheduleQueryBuilderForFilters([], 0);
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.listScheduledAnalysis({ page: 1, limit: 20 });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(
+        sqlCalls.some((sql) => sql.includes('scheduled_analysis_runs')),
+      ).toBe(false);
+    });
+  });
+
+  describe('listScheduledAnalysis — resumen agregado (Admin PR 3)', () => {
+    function buildMinimalScheduleQueryBuilder() {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndMapOne: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        where: jest.fn(),
+        getCount: jest.fn().mockResolvedValue(5),
+        getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
+      };
+      for (const key of [
+        'leftJoinAndMapOne',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+        'where',
+      ]) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    it('incluye un resumen global con total/active/inactive/withoutRuns', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildMinimalScheduleQueryBuilder(),
+      );
+      fieldAnalysisScheduleRepo.count
+        .mockResolvedValueOnce(10) // total
+        .mockResolvedValueOnce(7) // active
+        .mockResolvedValueOnce(3); // inactive
+      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue([]);
+      scheduledAnalysisRunRepo.count.mockResolvedValue(0);
+
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
+
+      expect(result.summary).toEqual(
+        expect.objectContaining({
+          total: 10,
+          active: 7,
+          inactive: 3,
+          withoutRuns: 5,
+        }),
+      );
+    });
+
+    it('cuenta lastRunOk/lastRunFailed a partir de la corrida más reciente de cada schedule (DISTINCT ON)', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildMinimalScheduleQueryBuilder(),
+      );
+      fieldAnalysisScheduleRepo.count.mockResolvedValue(0);
+      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue([
+        { status: 'completed', failedAt: null, emailSentAt: new Date() },
+        { status: 'completed', failedAt: null, emailSentAt: null },
+        { status: 'failed', failedAt: new Date(), emailSentAt: null },
+      ]);
+      scheduledAnalysisRunRepo.count.mockResolvedValue(0);
+
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
+
+      expect(result.summary.lastRunOk).toBe(2);
+      expect(result.summary.lastRunFailed).toBe(1);
+    });
+
+    it('mailPendingOrFailed cuenta corridas completed sin emailSentAt Y corridas failed con failedAt NULL (mail omitido), nunca failed con failedAt seteado (falla de pipeline)', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildMinimalScheduleQueryBuilder(),
+      );
+      fieldAnalysisScheduleRepo.count.mockResolvedValue(0);
+      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue([
+        { status: 'completed', failedAt: null, emailSentAt: null }, // pendiente de envío
+        { status: 'failed', failedAt: null, emailSentAt: null }, // mail omitido (schedule desactivado)
+        { status: 'failed', failedAt: new Date(), emailSentAt: null }, // falla de pipeline, nunca llegó a mail
+        { status: 'completed', failedAt: null, emailSentAt: new Date() }, // ya enviado
+      ]);
+      scheduledAnalysisRunRepo.count.mockResolvedValue(0);
+
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
+
+      expect(result.summary.mailPendingOrFailed).toBe(2);
+    });
+
+    it('mailSentLast7Days/mailSentLast30Days cuentan corridas por emailSentAt en la ventana, vía scheduledAnalysisRunRepository.count', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildMinimalScheduleQueryBuilder(),
+      );
+      fieldAnalysisScheduleRepo.count.mockResolvedValue(0);
+      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue([]);
+      scheduledAnalysisRunRepo.count
+        .mockResolvedValueOnce(4)
+        .mockResolvedValueOnce(15);
+
+      const result = await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+      });
+
+      expect(result.summary.mailSentLast7Days).toBe(4);
+      expect(result.summary.mailSentLast30Days).toBe(15);
+    });
+
+    it('el resumen es global: no cambia según los filtros fieldId/userId/enabled/hasRuns de la página actual', async () => {
+      const qb = buildMinimalScheduleQueryBuilder();
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(qb);
+      fieldAnalysisScheduleRepo.count.mockResolvedValue(10);
+      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue([]);
+      scheduledAnalysisRunRepo.count.mockResolvedValue(0);
+
+      await service.listScheduledAnalysis({
+        page: 1,
+        limit: 20,
+        userId: 'user-1',
+        enabled: true,
+        hasRuns: false,
+      });
+
+      // getScheduledAnalysisSummary() usa fieldAnalysisScheduleRepository.count() sin where — no
+      // hereda ninguno de los filtros aplicados a la lista paginada.
+      expect(fieldAnalysisScheduleRepo.count).toHaveBeenCalledWith();
+    });
+
+    it('no rompe el shape existente: items/total/page/limit siguen presentes junto a summary', async () => {
+      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(
+        buildMinimalScheduleQueryBuilder(),
+      );
+      fieldAnalysisScheduleRepo.count.mockResolvedValue(0);
+      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue([]);
+      scheduledAnalysisRunRepo.count.mockResolvedValue(0);
+
+      const result = await service.listScheduledAnalysis({
+        page: 2,
+        limit: 10,
+      });
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          items: [],
+          total: 0,
+          page: 2,
+          limit: 10,
+          summary: expect.any(Object),
+        }),
+      );
     });
   });
 
