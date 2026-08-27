@@ -85,6 +85,15 @@ export class AdminController {
     return this.adminService.listUsers(query);
   }
 
+  // Admin PR 7: vista de detalle de un usuario, solo lectura — nunca dispara nada. 404 si el
+  // usuario no existe (ver AdminService.getUserDetail). Va ANTES de las rutas 'users/:id' con
+  // verbos mutantes (PATCH/DELETE/POST) por agrupación, aunque el orden no importa acá: Nest
+  // resuelve por método HTTP + patrón, no hay ambigüedad entre GET 'users/:userId' y esas otras.
+  @Get('users/:userId')
+  getUserDetail(@Param('userId', ParseUUIDPipe) userId: string) {
+    return this.adminService.getUserDetail(userId);
+  }
+
   @Post('users')
   createUser(
     @Body() dto: CreateAdminUserDto,

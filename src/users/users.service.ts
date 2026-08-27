@@ -1,6 +1,6 @@
 import { ConflictException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Not, Repository } from 'typeorm';
+import { In, Not, Repository } from 'typeorm';
 
 import { User } from './user.entity';
 import { UserRole } from './user-role.enum';
@@ -33,6 +33,19 @@ export class UsersService {
 
   async findById(id: string): Promise<User | null> {
     return this.usersRepository.findOne({ where: { id } });
+  }
+
+  /**
+   * Admin PR 7: resolución batched de actores de auditoría para el detalle de usuario (una sola
+   * consulta IN, nunca un findById por fila) — ver AdminService.getAuditLogsForUser. `ids` vacío
+   * evita un `IN ()` inválido (mismo criterio que getTechnicalVerdictsByAnalysisId en AdminService).
+   */
+  async findByIds(ids: string[]): Promise<User[]> {
+    if (!ids.length) {
+      return [];
+    }
+
+    return this.usersRepository.find({ where: { id: In(ids) } });
   }
 
   /**

@@ -84,6 +84,25 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
               },
               scheduledRuns: [],
             }),
+            getUserDetail: jest.fn().mockResolvedValue({
+              user: { id: 'user-1', email: 'user@agroscorelatam.com' },
+              summary: {
+                fieldsCount: 0,
+                lotsCount: 0,
+                analysesCount: 0,
+                completedAnalysesCount: 0,
+                failedAnalysesCount: 0,
+                fieldsWithoutAnalysisCount: 0,
+                fieldsRequiringAttentionCount: 0,
+                activeSchedulesCount: 0,
+                schedulesWithoutRunsCount: 0,
+                sentEmailsCount: 0,
+              },
+              fields: [],
+              recentAnalyses: [],
+              scheduledAnalysis: [],
+              recentAuditLogs: [],
+            }),
           },
         },
       ],
@@ -176,6 +195,20 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
 
     await request(app.getHttpServer())
       .get('/admin/fields/a1111111-1111-4111-8111-111111111111')
+      .set('x-test-role', UserRole.ADMIN)
+      .expect(200);
+  });
+
+  // Admin PR 7: mismo endpoint nuevo, misma composición de guards — GET 'users/:userId' convive
+  // sin ambigüedad con PATCH/DELETE/POST 'users/:id' (métodos HTTP distintos).
+  it('GET /admin/users/:userId — role "user" no entra, "admin" sí', async () => {
+    await request(app.getHttpServer())
+      .get('/admin/users/a1111111-1111-4111-8111-111111111111')
+      .set('x-test-role', UserRole.USER)
+      .expect(403);
+
+    await request(app.getHttpServer())
+      .get('/admin/users/a1111111-1111-4111-8111-111111111111')
       .set('x-test-role', UserRole.ADMIN)
       .expect(200);
   });

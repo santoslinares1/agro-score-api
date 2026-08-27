@@ -59,6 +59,17 @@ import {
 } from './dto/admin-field.dto';
 import { AdminLotItem } from './dto/admin-lot.dto';
 import {
+  AdminUserDetail,
+  AdminUserDetailAnalysisRow,
+  AdminUserDetailAuditLog,
+  AdminUserDetailField,
+  AdminUserDetailScheduledItem,
+  USER_DETAIL_ANALYSES_LIMIT,
+  USER_DETAIL_AUDIT_LOGS_LIMIT,
+  USER_DETAIL_FIELDS_LIMIT,
+  USER_DETAIL_SCHEDULES_LIMIT,
+} from './dto/admin-user-detail.dto';
+import {
   AdminAnalysisErrorBucket,
   AdminProductAnalyticsDto,
   AdminProductAnalyticsFunnelStage,
@@ -689,6 +700,349 @@ export class AdminService {
       page,
       limit,
     };
+  }
+
+  /**
+   * Admin PR 7: vista de detalle de UN usuario — GET /admin/users/:userId, solo lectura. Mismo
+   * principio de reuso que Field Detail (PR6): en vez de `fieldIds=[fieldId]`, acá los mismos
+   * helpers batched de PR5 se llaman con TODOS los fieldIds del usuario. `fields` se trae
+   * completo (sin paginar) porque los conteos de `summary` (fieldsWithoutAnalysisCount,
+   * fieldsRequiringAttentionCount, lotsCount) tienen que cubrir TODOS los campos del usuario, no
+   * solo los que se muestran en pantalla — sigue siendo O(1) queries (nunca una por campo), solo
+   * que el array de entrada a esas queries batched es más grande. El array `fields` que viaja al
+   * frontend sí se acota a USER_DETAIL_FIELDS_LIMIT.
+   */
+  async getUserDetail(userId: string): Promise<AdminUserDetail> {
+    const user = await this.usersService.findById(userId);
+
+    if (!user) {
+      throw new NotFoundException('Usuario no encontrado.');
+    }
+
+    const fields = await this.fieldRepository.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+    });
+    const fieldIds = fields.map((field) => field.id);
+
+    const [
+      lotsCountByFieldId,
+      latestAnalysisByFieldId,
+      scheduleByFieldId,
+      analysisCounts,
+      recentAnalysisRows,
+      sentEmailsCount,
+      recentAuditLogs,
+    ] = await Promise.all([
+      this.countLotsByFieldId(fieldIds),
+      this.getLatestAnalysisByFieldId(fieldIds),
+      this.getSchedulesByFieldId(fieldIds),
+      this.getAnalysisCountsForUser(userId),
+      this.getRecentAnalysesForUser(userId, USER_DETAIL_ANALYSES_LIMIT),
+      this.scheduledAnalysisRunRepository.count({
+        where: { userId, emailSentAt: Not(IsNull()) },
+      }),
+      this.getAuditLogsForUser(userId, USER_DETAIL_AUDIT_LOGS_LIMIT),
+    ]);
+
+    const analysisIds = Array.from(latestAnalysisByFieldId.values()).map(
+      (row) => row.id,
+    );
+    const verdictsByAnalysisId =
+      await this.getTechnicalVerdictsByAnalysisId(analysisIds);
+
+    const scheduleIds = Array.from(scheduleByFieldId.values()).map(
+      (schedule) => schedule.id,
+    );
+    const scheduleIdsWithRuns = await this.getScheduleIdsWithRuns(scheduleIds);
+
+    // Estado por campo, para TODOS los campos del usuario — reusa deriveFieldAnalysisStatus /
+    // fieldRequiresAttention tal cual (mismos métodos que listFields/getFieldDetail), sin
+    // divergir. Sirve tanto para el array `fields` (acotado abajo) como para los conteos de
+    // `summary` (que sí cubren el total).
+    const fieldRows: AdminUserDetailField[] = fields.map((field) => {
+      const latestAnalysisRow = latestAnalysisByFieldId.get(field.id) ?? null;
+      const latestAnalysis: AdminFieldLatestAnalysis | null = latestAnalysisRow
+        ? {
+            id: latestAnalysisRow.id,
+            status: latestAnalysisRow.status,
+            createdAt: latestAnalysisRow.createdAt.toISOString(),
+            completedAt: latestAnalysisRow.completedAt
+              ? latestAnalysisRow.completedAt.toISOString()
+              : null,
+            durationMs: latestAnalysisRow.durationMs,
+            score:
+              latestAnalysisRow.status === 'Finalizado'
+                ? latestAnalysisRow.globalScore
+                : null,
+          }
+        : null;
+
+      const technicalVerdict = latestAnalysis
+        ? (verdictsByAnalysisId.get(latestAnalysis.id) ?? null)
+        : null;
+
+      const schedule = scheduleByFieldId.get(field.id) ?? null;
+      const weeklyMonitoring: AdminFieldWeeklyMonitoring = {
+        active: schedule?.enabled ?? false,
+        scheduleId: schedule?.id ?? null,
+        nextRunAt: schedule?.nextRunAt
+          ? schedule.nextRunAt.toISOString()
+          : null,
+        lastRunAt: schedule?.lastRunAt
+          ? schedule.lastRunAt.toISOString()
+          : null,
+        hasRuns: schedule ? scheduleIdsWithRuns.has(schedule.id) : false,
+      };
+
+      return {
+        id: field.id,
+        name: field.name,
+        lotsCount: lotsCountByFieldId.get(field.id) ?? 0,
+        createdAt: field.createdAt.toISOString(),
+        updatedAt: field.updatedAt.toISOString(),
+        analysisStatus: this.deriveFieldAnalysisStatus(
+          latestAnalysis,
+          technicalVerdict,
+        ),
+        requiresAttention: this.fieldRequiresAttention(
+          latestAnalysis,
+          technicalVerdict,
+          weeklyMonitoring,
+        ),
+        latestAnalysis,
+        technicalVerdict,
+        weeklyMonitoring,
+      };
+    });
+
+    const schedules = Array.from(scheduleByFieldId.values())
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, USER_DETAIL_SCHEDULES_LIMIT);
+    const scheduledAnalysis = await this.buildScheduledAnalysisForSchedules(
+      schedules,
+      fields,
+    );
+
+    const recentAnalyses: AdminUserDetailAnalysisRow[] = recentAnalysisRows.map(
+      (analysis) => ({
+        id: analysis.id,
+        fieldId: analysis.fieldId,
+        fieldName: analysis.field?.name ?? analysis.lotName,
+        status: analysis.status,
+        createdAt: analysis.createdAt.toISOString(),
+        completedAt: analysis.completedAt
+          ? analysis.completedAt.toISOString()
+          : null,
+        durationMs: analysis.durationMs,
+        score: analysis.status === 'Finalizado' ? analysis.globalScore : null,
+        errorMessage: analysis.errorMessage,
+        reviewedAt: analysis.reviewedAt
+          ? analysis.reviewedAt.toISOString()
+          : null,
+      }),
+    );
+
+    const activeSchedules = Array.from(scheduleByFieldId.values()).filter(
+      (schedule) => schedule.enabled,
+    );
+
+    return {
+      user: this.usersService.toPublicUser(user),
+      summary: {
+        fieldsCount: fields.length,
+        lotsCount: Array.from(lotsCountByFieldId.values()).reduce(
+          (total, count) => total + count,
+          0,
+        ),
+        analysesCount: analysisCounts.total,
+        completedAnalysesCount: analysisCounts.completed,
+        failedAnalysesCount: analysisCounts.failed,
+        fieldsWithoutAnalysisCount: fieldRows.filter(
+          (field) => field.analysisStatus === 'without_analysis',
+        ).length,
+        fieldsRequiringAttentionCount: fieldRows.filter(
+          (field) => field.requiresAttention,
+        ).length,
+        activeSchedulesCount: activeSchedules.length,
+        schedulesWithoutRunsCount: activeSchedules.filter(
+          (schedule) => !scheduleIdsWithRuns.has(schedule.id),
+        ).length,
+        sentEmailsCount,
+      },
+      fields: fieldRows.slice(0, USER_DETAIL_FIELDS_LIMIT),
+      recentAnalyses,
+      scheduledAnalysis,
+      recentAuditLogs,
+    };
+  }
+
+  /**
+   * Admin PR 7: total/completados/fallidos de Analysis para TODOS los campos del usuario en una
+   * sola consulta agregada (COUNT... FILTER) — mismo join scope/lotId de siempre, nunca una
+   * consulta por campo ni por análisis.
+   */
+  private async getAnalysisCountsForUser(
+    userId: string,
+  ): Promise<{ total: number; completed: number; failed: number }> {
+    const rows = await this.fieldRepository.manager.query<
+      { total: string; completed: string; failed: string }[]
+    >(
+      `
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE a.status = 'Finalizado')::int AS completed,
+        COUNT(*) FILTER (WHERE a.status = 'Error')::int AS failed
+      FROM analysis a
+      INNER JOIN fields f ON (
+        (a.scope = 'field' AND a."fieldId" = f.id::text) OR
+        (a.scope IS NULL AND a."lotId" = f.id::text)
+      )
+      WHERE f."userId" = $1
+      `,
+      [userId],
+    );
+
+    const row = rows[0];
+    return {
+      total: Number(row?.total ?? 0),
+      completed: Number(row?.completed ?? 0),
+      failed: Number(row?.failed ?? 0),
+    };
+  }
+
+  /**
+   * Admin PR 7: últimas `limit` análisis de CUALQUIER campo del usuario — misma condición
+   * scope/lotId de siempre para el join, pero a diferencia de listAnalysis (que solo matchea por
+   * `fieldId` directo y por eso pierde los análisis legacy con scope=null al filtrar por userId),
+   * acá se usa el criterio completo (igual que getAnalysesForField/fieldAnalysisExistsSubquery)
+   * para no excluir esos análisis históricos del usuario.
+   */
+  private async getRecentAnalysesForUser(
+    userId: string,
+    limit: number,
+  ): Promise<AnalysisWithField[]> {
+    const items = await this.analysisRepository
+      .createQueryBuilder('analysis')
+      .leftJoinAndMapOne(
+        'analysis.field',
+        Field,
+        'field',
+        `(analysis.scope = 'field' AND field.id::text = analysis."fieldId") OR (analysis.scope IS NULL AND field.id::text = analysis."lotId")`,
+      )
+      .where('field."userId" = :userId', { userId })
+      .orderBy('analysis.createdAt', 'DESC')
+      .take(limit)
+      .getMany();
+
+    return items;
+  }
+
+  /**
+   * Admin PR 7: arma AdminUserDetailScheduledItem[] a partir de los schedules ya resueltos (sin
+   * volver a golpear field_analysis_schedules) — reusa getLatestRunsByScheduleId (PR13B),
+   * getTechnicalVerdictsByAnalysisId y findResponsesByScheduledRunIds (PR16D), igual que
+   * listScheduledAnalysis, solo que acotado a los schedules de este usuario en vez de paginado.
+   */
+  private async buildScheduledAnalysisForSchedules(
+    schedules: FieldAnalysisSchedule[],
+    fields: Field[],
+  ): Promise<AdminUserDetailScheduledItem[]> {
+    if (!schedules.length) {
+      return [];
+    }
+
+    const fieldNameById = new Map(
+      fields.map((field) => [field.id, field.name]),
+    );
+    const scheduleIds = schedules.map((schedule) => schedule.id);
+
+    const [latestRunsByScheduleId, scheduleIdsWithRuns] = await Promise.all([
+      this.getLatestRunsByScheduleId(scheduleIds),
+      this.getScheduleIdsWithRuns(scheduleIds),
+    ]);
+
+    const analysisIds = Array.from(latestRunsByScheduleId.values())
+      .map((run) => run.analysisId)
+      .filter((id): id is string => Boolean(id));
+    const verdictsByAnalysisId =
+      await this.getTechnicalVerdictsByAnalysisId(analysisIds);
+
+    const scheduledRunIds = Array.from(latestRunsByScheduleId.values()).map(
+      (run) => run.id,
+    );
+    const weeklyVerdictsByRunId =
+      await this.weeklyTechnicalVerdictService.findResponsesByScheduledRunIds(
+        scheduledRunIds,
+      );
+
+    return schedules.map((schedule) => {
+      const latestRunEntity = latestRunsByScheduleId.get(schedule.id) ?? null;
+      const technicalVerdict = latestRunEntity?.analysisId
+        ? (verdictsByAnalysisId.get(latestRunEntity.analysisId) ?? null)
+        : null;
+
+      return {
+        scheduleId: schedule.id,
+        fieldId: schedule.fieldId,
+        fieldName: fieldNameById.get(schedule.fieldId) ?? null,
+        enabled: schedule.enabled,
+        frequency: schedule.frequency,
+        nextRunAt: schedule.nextRunAt ? schedule.nextRunAt.toISOString() : null,
+        lastRunAt: schedule.lastRunAt ? schedule.lastRunAt.toISOString() : null,
+        hasRuns: scheduleIdsWithRuns.has(schedule.id),
+        latestRun: latestRunEntity
+          ? this.toAdminScheduledAnalysisRun(latestRunEntity)
+          : null,
+        technicalVerdict,
+        weeklyTechnicalVerdict: latestRunEntity
+          ? (weeklyVerdictsByRunId.get(latestRunEntity.id) ?? null)
+          : null,
+      };
+    });
+  }
+
+  /**
+   * Admin PR 7: auditoría relacionada — reusa AuditLogService.list() tal cual (mismos filtros
+   * targetType/targetId de ADMIN-2/PR2, sin duplicar lógica de query) y resuelve el email del
+   * actor en UNA consulta batched (UsersService.findByIds), nunca un findById por fila. Ver
+   * comentario en AdminUserDetailAuditLog (DTO) sobre por qué targetType='user' es la única
+   * correlación honesta disponible hoy.
+   */
+  private async getAuditLogsForUser(
+    userId: string,
+    limit: number,
+  ): Promise<AdminUserDetailAuditLog[]> {
+    const { items } = await this.auditLogService.list({
+      targetType: 'user',
+      targetId: userId,
+      page: 1,
+      limit,
+    });
+
+    const actorIds = Array.from(
+      new Set(
+        items
+          .map((log) => log.actorUserId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+    const actors = await this.usersService.findByIds(actorIds);
+    const emailByActorId = new Map(
+      actors.map((actor) => [actor.id, actor.email]),
+    );
+
+    return items.map((log) => ({
+      id: log.id,
+      action: log.action,
+      actorUserId: log.actorUserId,
+      actorEmail: log.actorUserId
+        ? (emailByActorId.get(log.actorUserId) ?? null)
+        : null,
+      targetType: log.targetType,
+      targetId: log.targetId,
+      createdAt: log.createdAt.toISOString(),
+    }));
   }
 
   async createUser(

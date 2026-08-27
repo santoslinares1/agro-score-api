@@ -34,6 +34,7 @@ import {
   FIELD_DETAIL_ANALYSES_LIMIT,
   FIELD_DETAIL_RUNS_LIMIT,
 } from './dto/admin-field-detail.dto';
+import { USER_DETAIL_ANALYSES_LIMIT } from './dto/admin-user-detail.dto';
 
 function buildUser(overrides: Partial<User> = {}): User {
   return {
@@ -129,6 +130,7 @@ describe('AdminService', () => {
           useValue: {
             findByEmail: jest.fn(),
             findById: jest.fn(),
+            findByIds: jest.fn().mockResolvedValue([]),
             create: jest.fn(),
             update: jest.fn(),
             countActiveByRole: jest.fn(),
@@ -144,7 +146,12 @@ describe('AdminService', () => {
         },
         {
           provide: AuditLogService,
-          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+          useValue: {
+            record: jest.fn().mockResolvedValue(undefined),
+            list: jest
+              .fn()
+              .mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
+          },
         },
         {
           provide: EmailService,
@@ -2229,6 +2236,437 @@ describe('AdminService', () => {
 
       expect(result.field.analysisStatus).toBe('error');
       expect(result.field.requiresAttention).toBe(true);
+    });
+  });
+
+  describe('getUserDetail (Admin PR 7)', () => {
+    function buildLotsCountQueryBuilder(
+      rows: { fieldId: string; count: string }[] = [],
+    ) {
+      const qb: Record<string, jest.Mock> = {
+        select: jest.fn(),
+        addSelect: jest.fn(),
+        where: jest.fn(),
+        groupBy: jest.fn(),
+        getRawMany: jest.fn().mockResolvedValue(rows),
+      };
+      for (const key of ['select', 'addSelect', 'where', 'groupBy']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    function buildAnalysesQueryBuilder(rows: unknown[] = []) {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndMapOne: jest.fn(),
+        where: jest.fn(),
+        orderBy: jest.fn(),
+        take: jest.fn(),
+        getMany: jest.fn().mockResolvedValue(rows),
+      };
+      for (const key of ['leftJoinAndMapOne', 'where', 'orderBy', 'take']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    function buildLatestRunsQueryBuilder(rows: unknown[] = []) {
+      const qb: Record<string, jest.Mock> = {
+        distinctOn: jest.fn(),
+        leftJoinAndSelect: jest.fn(),
+        where: jest.fn(),
+        orderBy: jest.fn(),
+        addOrderBy: jest.fn(),
+        getMany: jest.fn().mockResolvedValue(rows),
+      };
+      for (const key of [
+        'distinctOn',
+        'leftJoinAndSelect',
+        'where',
+        'orderBy',
+        'addOrderBy',
+      ]) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    // Fixture "vacía" — usuario sin campos/schedules/análisis/auditoría. Cada test override lo
+    // que necesita.
+    function setupEmptyUserDetail() {
+      usersService.findById.mockResolvedValue(buildUser());
+      fieldRepo.find.mockResolvedValue([]);
+      fieldLotRepo.createQueryBuilder.mockReturnValue(
+        buildLotsCountQueryBuilder(),
+      );
+      fieldRepo.manager.query.mockResolvedValue([]);
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([]);
+      analysisVerdictRepo.find.mockResolvedValue([]);
+      analysisRepo.createQueryBuilder.mockReturnValue(
+        buildAnalysesQueryBuilder([]),
+      );
+      scheduledAnalysisRunRepo.count.mockResolvedValue(0);
+      scheduledAnalysisRunRepo.manager.query.mockResolvedValue([]);
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildLatestRunsQueryBuilder([]),
+      );
+      auditLogService.list.mockResolvedValue({
+        items: [],
+        total: 0,
+        page: 1,
+        limit: 20,
+      });
+      usersService.findByIds.mockResolvedValue([]);
+    }
+
+    it('devuelve 404 (NotFoundException) si el usuario no existe', async () => {
+      usersService.findById.mockResolvedValue(null);
+
+      await expect(service.getUserDetail('user-inexistente')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('devuelve datos básicos del usuario, nunca passwordHash', async () => {
+      usersService.findById.mockResolvedValue(
+        buildUser({ id: 'user-1', email: 'user@agroscorelatam.com' }),
+      );
+      setupEmptyUserDetail();
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.user).toEqual(
+        expect.objectContaining({
+          id: 'user-1',
+          email: 'user@agroscorelatam.com',
+        }),
+      );
+      expect(result.user).not.toHaveProperty('passwordHash');
+    });
+
+    it('incluye fields del usuario con analysisStatus/requiresAttention (mismas reglas que PR5)', async () => {
+      setupEmptyUserDetail();
+      fieldRepo.find.mockResolvedValue([
+        {
+          id: 'field-1',
+          userId: 'user-1',
+          name: 'Campo Norte',
+          createdAt: new Date('2026-08-01T00:00:00.000Z'),
+          updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+        },
+      ]);
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        {
+          targetFieldId: 'field-1',
+          id: 'analysis-1',
+          status: 'Error',
+          createdAt: new Date('2026-08-10T00:00:00.000Z'),
+          completedAt: null,
+          durationMs: null,
+          globalScore: 0,
+        },
+      ]);
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.fields).toHaveLength(1);
+      expect(result.fields[0]).toEqual(
+        expect.objectContaining({
+          id: 'field-1',
+          name: 'Campo Norte',
+          analysisStatus: 'error',
+          requiresAttention: true,
+        }),
+      );
+    });
+
+    it('calcula fieldsWithoutAnalysisCount y fieldsRequiringAttentionCount sobre TODOS los campos', async () => {
+      setupEmptyUserDetail();
+      fieldRepo.find.mockResolvedValue([
+        {
+          id: 'field-sin-analisis',
+          userId: 'user-1',
+          name: 'Sin análisis',
+          createdAt: new Date('2026-08-01T00:00:00.000Z'),
+          updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+        },
+        {
+          id: 'field-con-error',
+          userId: 'user-1',
+          name: 'Con error',
+          createdAt: new Date('2026-08-02T00:00:00.000Z'),
+          updatedAt: new Date('2026-08-02T00:00:00.000Z'),
+        },
+      ]);
+      // getLatestAnalysisByFieldId — solo field-con-error tiene análisis (Error).
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        {
+          targetFieldId: 'field-con-error',
+          id: 'analysis-1',
+          status: 'Error',
+          createdAt: new Date('2026-08-10T00:00:00.000Z'),
+          completedAt: null,
+          durationMs: null,
+          globalScore: 0,
+        },
+      ]);
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.summary.fieldsCount).toBe(2);
+      expect(result.summary.fieldsWithoutAnalysisCount).toBe(1);
+      expect(result.summary.fieldsRequiringAttentionCount).toBe(1);
+    });
+
+    it('suma lotsCount de TODOS los campos del usuario, no solo los mostrados', async () => {
+      setupEmptyUserDetail();
+      fieldRepo.find.mockResolvedValue([
+        {
+          id: 'field-1',
+          userId: 'user-1',
+          name: 'Campo 1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+        {
+          id: 'field-2',
+          userId: 'user-1',
+          name: 'Campo 2',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ]);
+      fieldLotRepo.createQueryBuilder.mockReturnValue(
+        buildLotsCountQueryBuilder([
+          { fieldId: 'field-1', count: '3' },
+          { fieldId: 'field-2', count: '2' },
+        ]),
+      );
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.summary.lotsCount).toBe(5);
+    });
+
+    it('incluye analysesCount/completedAnalysesCount/failedAnalysesCount desde la query agregada', async () => {
+      setupEmptyUserDetail();
+      // Sin campos (fieldRepo.find → []), así que getLatestAnalysisByFieldId no llega a golpear
+      // fieldRepo.manager.query (corta antes por fieldIds vacío) — la única llamada real es la
+      // de getAnalysisCountsForUser, que consulta por userId directo.
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        { total: '10', completed: '7', failed: '2' },
+      ]);
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.summary.analysesCount).toBe(10);
+      expect(result.summary.completedAnalysesCount).toBe(7);
+      expect(result.summary.failedAnalysesCount).toBe(2);
+    });
+
+    it('incluye recentAnalyses, ordenadas DESC y acotadas a USER_DETAIL_ANALYSES_LIMIT', async () => {
+      setupEmptyUserDetail();
+      const rows = [
+        {
+          id: 'analysis-2',
+          fieldId: 'field-1',
+          field: { id: 'field-1', name: 'Campo Norte' },
+          lotName: 'Campo Norte',
+          status: 'Finalizado',
+          createdAt: new Date('2026-08-12T00:00:00.000Z'),
+          completedAt: new Date('2026-08-12T01:00:00.000Z'),
+          durationMs: 4000,
+          globalScore: 65,
+          errorMessage: null,
+          reviewedAt: null,
+        },
+      ];
+      const qb = buildAnalysesQueryBuilder(rows);
+      analysisRepo.createQueryBuilder.mockReturnValue(qb);
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.recentAnalyses).toEqual([
+        expect.objectContaining({
+          id: 'analysis-2',
+          fieldName: 'Campo Norte',
+          score: 65,
+        }),
+      ]);
+      expect(qb.orderBy).toHaveBeenCalledWith('analysis.createdAt', 'DESC');
+      expect(qb.take).toHaveBeenCalledWith(USER_DETAIL_ANALYSES_LIMIT);
+    });
+
+    it('incluye scheduledAnalysis del usuario con latestRun/emailSentAt/weeklyTechnicalVerdict', async () => {
+      setupEmptyUserDetail();
+      fieldRepo.find.mockResolvedValue([
+        {
+          id: 'field-1',
+          userId: 'user-1',
+          name: 'Campo Norte',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ]);
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([
+        {
+          id: 'schedule-1',
+          fieldId: 'field-1',
+          enabled: true,
+          frequency: 'weekly',
+          nextRunAt: null,
+          lastRunAt: new Date('2026-08-24T09:00:00.000Z'),
+          createdAt: new Date('2026-08-01T00:00:00.000Z'),
+        },
+      ]);
+      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
+        buildLatestRunsQueryBuilder([
+          {
+            id: 'run-1',
+            scheduleId: 'schedule-1',
+            status: 'completed',
+            scheduledFor: '2026-08-24',
+            analysisId: 'analysis-9',
+            analysis: { status: 'Finalizado' },
+            startedAt: new Date('2026-08-24T09:00:00.000Z'),
+            completedAt: new Date('2026-08-24T09:05:00.000Z'),
+            failedAt: null,
+            emailSentAt: new Date('2026-08-24T09:10:00.000Z'),
+            errorMessage: null,
+            createdAt: new Date('2026-08-24T09:00:00.000Z'),
+            updatedAt: new Date('2026-08-24T09:10:00.000Z'),
+          },
+        ]),
+      );
+      weeklyTechnicalVerdictService.findResponsesByScheduledRunIds.mockResolvedValue(
+        new Map([
+          [
+            'run-1',
+            {
+              status: 'generated',
+              verdict: 'favorable',
+              trend: 'improving',
+              confidence: 'high',
+              summary: 'Mejora sostenida.',
+              keyChanges: [],
+              areasToReview: [],
+              recommendations: [],
+              limitations: [],
+              previousSnapshotId: null,
+              generatedAt: '2026-08-24T09:12:00.000Z',
+              generator: 'deterministic-v1',
+              promptVersion: null,
+              errorMessage: null,
+            },
+          ],
+        ]) as never,
+      );
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.scheduledAnalysis).toHaveLength(1);
+      expect(result.scheduledAnalysis[0]).toEqual(
+        expect.objectContaining({
+          scheduleId: 'schedule-1',
+          fieldId: 'field-1',
+          fieldName: 'Campo Norte',
+        }),
+      );
+      expect(result.scheduledAnalysis[0].latestRun).toEqual(
+        expect.objectContaining({
+          id: 'run-1',
+          emailSentAt: '2026-08-24T09:10:00.000Z',
+        }),
+      );
+      expect(result.scheduledAnalysis[0].weeklyTechnicalVerdict?.trend).toBe(
+        'improving',
+      );
+    });
+
+    it('calcula schedulesWithoutRunsCount usando EXISTS real (no lastRunAt)', async () => {
+      setupEmptyUserDetail();
+      fieldRepo.find.mockResolvedValue([
+        {
+          id: 'field-1',
+          userId: 'user-1',
+          name: 'Campo 1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ]);
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([
+        {
+          id: 'schedule-1',
+          fieldId: 'field-1',
+          enabled: true,
+          frequency: 'weekly',
+          nextRunAt: null,
+          // lastRunAt seteado a propósito: el criterio real es EXISTS sobre
+          // scheduled_analysis_runs, nunca esta columna.
+          lastRunAt: new Date('2026-08-01T00:00:00.000Z'),
+          createdAt: new Date(),
+        },
+      ]);
+      // getScheduleIdsWithRuns → sin filas → ningún schedule tiene corridas reales.
+      scheduledAnalysisRunRepo.manager.query.mockResolvedValue([]);
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.summary.activeSchedulesCount).toBe(1);
+      expect(result.summary.schedulesWithoutRunsCount).toBe(1);
+    });
+
+    it('incluye recentAuditLogs (targetType=user, targetId=userId) con el email del actor resuelto', async () => {
+      setupEmptyUserDetail();
+      auditLogService.list.mockResolvedValue({
+        items: [
+          {
+            id: 'log-1',
+            actorUserId: 'admin-1',
+            action: 'admin.user.role_changed',
+            targetType: 'user',
+            targetId: 'user-1',
+            before: null,
+            after: null,
+            ip: null,
+            userAgent: null,
+            createdAt: new Date('2026-08-20T00:00:00.000Z'),
+          },
+        ] as never,
+        total: 1,
+        page: 1,
+        limit: 20,
+      });
+      usersService.findByIds.mockResolvedValue([
+        buildUser({ id: 'admin-1', email: 'admin@agroscorelatam.com' }),
+      ]);
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(auditLogService.list).toHaveBeenCalledWith(
+        expect.objectContaining({ targetType: 'user', targetId: 'user-1' }),
+      );
+      expect(result.recentAuditLogs).toEqual([
+        expect.objectContaining({
+          id: 'log-1',
+          action: 'admin.user.role_changed',
+          actorEmail: 'admin@agroscorelatam.com',
+        }),
+      ]);
+    });
+
+    it('calcula sentEmailsCount vía ScheduledAnalysisRun.count (userId, emailSentAt no nulo)', async () => {
+      setupEmptyUserDetail();
+      scheduledAnalysisRunRepo.count.mockResolvedValue(4);
+
+      const result = await service.getUserDetail('user-1');
+
+      expect(result.summary.sentEmailsCount).toBe(4);
+      expect(scheduledAnalysisRunRepo.count).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ userId: 'user-1' }),
+        }),
+      );
     });
   });
 
