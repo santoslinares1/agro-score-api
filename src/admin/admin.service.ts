@@ -18,7 +18,7 @@ import {
 } from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
-import { Analysis } from '../analysis/entities/analysis.entity';
+import { Analysis, AnalysisStatus } from '../analysis/entities/analysis.entity';
 import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
 import {
   AuditActorContext,
@@ -45,6 +45,13 @@ import {
   AdminAnalysisTechnicalVerdict,
   toAdminAnalysisTechnicalVerdict,
 } from './dto/admin-analysis-technical-verdict.dto';
+import {
+  AdminFieldAnalysisStatus,
+  AdminFieldItem,
+  AdminFieldLatestAnalysis,
+  AdminFieldWeeklyMonitoring,
+} from './dto/admin-field.dto';
+import { AdminLotItem } from './dto/admin-lot.dto';
 import {
   AdminAnalysisErrorBucket,
   AdminProductAnalyticsDto,
@@ -1191,7 +1198,9 @@ export class AdminService {
 
   // ── Campos / lotes ──────────────────────────────────────────────────
 
-  async listFields(query: ListFieldsQueryDto): Promise<Paginated<unknown>> {
+  async listFields(
+    query: ListFieldsQueryDto,
+  ): Promise<Paginated<AdminFieldItem>> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
@@ -1220,39 +1229,300 @@ export class AdminService {
     // la alerta "Campos sin diagnóstico" del Dashboard, que necesita un link que filtre de verdad
     // en vez de mandar a la lista completa de campos.
     if (query.hasAnalysis === false) {
-      qb.andWhere(`NOT EXISTS (
-        SELECT 1 FROM analysis a
-        WHERE (a.scope = 'field' AND a."fieldId" = field.id::text) OR
-              (a.scope IS NULL AND a."lotId" = field.id::text)
-      )`);
+      qb.andWhere(`NOT EXISTS (${this.fieldAnalysisExistsSubquery('field')})`);
     } else if (query.hasAnalysis === true) {
-      qb.andWhere(`EXISTS (
-        SELECT 1 FROM analysis a
-        WHERE (a.scope = 'field' AND a."fieldId" = field.id::text) OR
-              (a.scope IS NULL AND a."lotId" = field.id::text)
-      )`);
+      qb.andWhere(`EXISTS (${this.fieldAnalysisExistsSubquery('field')})`);
+    }
+
+    // Admin PR 5: "status" usa el análisis MÁS RECIENTE del campo — subquery correlacionada
+    // (nunca un join, que multiplicaría filas y complicaría la paginación). without_analysis
+    // reusa el mismo NOT EXISTS que hasAnalysis=false (misma pregunta, dos nombres de filtro por
+    // compatibilidad con PR1).
+    if (query.status === 'without_analysis') {
+      qb.andWhere(`NOT EXISTS (${this.fieldAnalysisExistsSubquery('field')})`);
+    } else if (query.status === 'processing') {
+      qb.andWhere(
+        `${this.latestAnalysisStatusSubquery('field')} = 'Procesando'`,
+      );
+    } else if (query.status === 'error') {
+      qb.andWhere(`${this.latestAnalysisStatusSubquery('field')} = 'Error'`);
+    } else if (query.status === 'attention') {
+      qb.andWhere(
+        `${this.latestAnalysisStatusSubquery('field')} = 'Finalizado'`,
+      );
+      qb.andWhere(
+        `${this.latestAnalysisVerdictSubquery('field')} IN ('attention', 'critical')`,
+      );
+    } else if (query.status === 'completed') {
+      qb.andWhere(
+        `${this.latestAnalysisStatusSubquery('field')} = 'Finalizado'`,
+      );
+      qb.andWhere(
+        `(${this.latestAnalysisVerdictSubquery('field')} IS NULL OR ${this.latestAnalysisVerdictSubquery('field')} NOT IN ('attention', 'critical'))`,
+      );
+    }
+
+    // Admin PR 5: "monitoreo activo/inactivo" — fieldId es unique en field_analysis_schedules,
+    // así que EXISTS enabled=true alcanza (nunca hay dos schedules activos para el mismo campo).
+    if (query.monitoring === 'active') {
+      qb.andWhere(
+        `EXISTS (SELECT 1 FROM field_analysis_schedules s WHERE s."fieldId" = field.id AND s.enabled = true)`,
+      );
+    } else if (query.monitoring === 'inactive') {
+      qb.andWhere(
+        `NOT EXISTS (SELECT 1 FROM field_analysis_schedules s WHERE s."fieldId" = field.id AND s.enabled = true)`,
+      );
     }
 
     const [items, total] = await qb.getManyAndCount();
-    const lotsCountByFieldId = await this.countLotsByFieldId(
-      items.map((field) => field.id),
+    const fieldIds = items.map((field) => field.id);
+
+    // Admin PR 5: 3 consultas en lote acotadas a los <=limit campos de esta página (nunca una por
+    // fila) + 2 más que dependen de sus resultados (verdicts por analysisId, runs por scheduleId)
+    // — 5 consultas totales sin importar cuántos campos traiga la página.
+    const [lotsCountByFieldId, latestAnalysisByFieldId, scheduleByFieldId] =
+      await Promise.all([
+        this.countLotsByFieldId(fieldIds),
+        this.getLatestAnalysisByFieldId(fieldIds),
+        this.getSchedulesByFieldId(fieldIds),
+      ]);
+
+    const analysisIds = Array.from(latestAnalysisByFieldId.values()).map(
+      (row) => row.id,
     );
+    const verdictsByAnalysisId =
+      await this.getTechnicalVerdictsByAnalysisId(analysisIds);
+
+    const scheduleIds = Array.from(scheduleByFieldId.values()).map(
+      (schedule) => schedule.id,
+    );
+    const scheduleIdsWithRuns = await this.getScheduleIdsWithRuns(scheduleIds);
 
     return {
-      items: items.map((field) => ({
-        id: field.id,
-        name: field.name,
-        ownerId: field.userId,
-        ownerEmail: field.user?.email ?? null,
-        ownerFullName: field.user?.fullName ?? null,
-        lotsCount: lotsCountByFieldId.get(field.id) ?? 0,
-        createdAt: field.createdAt,
-        updatedAt: field.updatedAt,
-      })),
+      items: items.map((field) => {
+        const latestAnalysisRow = latestAnalysisByFieldId.get(field.id) ?? null;
+        const latestAnalysis: AdminFieldLatestAnalysis | null =
+          latestAnalysisRow
+            ? {
+                id: latestAnalysisRow.id,
+                status: latestAnalysisRow.status,
+                createdAt: latestAnalysisRow.createdAt.toISOString(),
+                completedAt: latestAnalysisRow.completedAt
+                  ? latestAnalysisRow.completedAt.toISOString()
+                  : null,
+                durationMs: latestAnalysisRow.durationMs,
+                // Solo viaja cuando Finalizado — ver comentario en AdminFieldLatestAnalysis.
+                score:
+                  latestAnalysisRow.status === 'Finalizado'
+                    ? latestAnalysisRow.globalScore
+                    : null,
+              }
+            : null;
+
+        const technicalVerdict = latestAnalysis
+          ? (verdictsByAnalysisId.get(latestAnalysis.id) ?? null)
+          : null;
+
+        const schedule = scheduleByFieldId.get(field.id) ?? null;
+        const weeklyMonitoring: AdminFieldWeeklyMonitoring = {
+          active: schedule?.enabled ?? false,
+          scheduleId: schedule?.id ?? null,
+          nextRunAt: schedule?.nextRunAt
+            ? schedule.nextRunAt.toISOString()
+            : null,
+          lastRunAt: schedule?.lastRunAt
+            ? schedule.lastRunAt.toISOString()
+            : null,
+          hasRuns: schedule ? scheduleIdsWithRuns.has(schedule.id) : false,
+        };
+
+        return {
+          id: field.id,
+          name: field.name,
+          ownerId: field.userId,
+          ownerEmail: field.user?.email ?? null,
+          ownerFullName: field.user?.fullName ?? null,
+          lotsCount: lotsCountByFieldId.get(field.id) ?? 0,
+          createdAt: field.createdAt.toISOString(),
+          updatedAt: field.updatedAt.toISOString(),
+          analysisStatus: this.deriveFieldAnalysisStatus(
+            latestAnalysis,
+            technicalVerdict,
+          ),
+          requiresAttention: this.fieldRequiresAttention(
+            latestAnalysis,
+            technicalVerdict,
+            weeklyMonitoring,
+          ),
+          latestAnalysis,
+          technicalVerdict,
+          weeklyMonitoring,
+        };
+      }),
       total,
       page,
       limit,
     };
+  }
+
+  // Admin PR 5: fragmento reusado por hasAnalysis (PR1), status=without_analysis y
+  // countFieldsWithNoAnalysis (más abajo) — mismo criterio scope/lotId de siempre
+  // (Analysis.fieldId/lotId son texto libre histórico, sin FK real hacia Field).
+  private fieldAnalysisExistsSubquery(fieldAlias: string): string {
+    return `SELECT 1 FROM analysis a WHERE (a.scope = 'field' AND a."fieldId" = ${fieldAlias}.id::text) OR (a.scope IS NULL AND a."lotId" = ${fieldAlias}.id::text)`;
+  }
+
+  private latestAnalysisIdSubquery(fieldAlias: string): string {
+    return `(SELECT a.id FROM analysis a WHERE (a.scope = 'field' AND a."fieldId" = ${fieldAlias}.id::text) OR (a.scope IS NULL AND a."lotId" = ${fieldAlias}.id::text) ORDER BY a."createdAt" DESC LIMIT 1)`;
+  }
+
+  private latestAnalysisStatusSubquery(fieldAlias: string): string {
+    return `(SELECT a.status FROM analysis a WHERE (a.scope = 'field' AND a."fieldId" = ${fieldAlias}.id::text) OR (a.scope IS NULL AND a."lotId" = ${fieldAlias}.id::text) ORDER BY a."createdAt" DESC LIMIT 1)`;
+  }
+
+  private latestAnalysisVerdictSubquery(fieldAlias: string): string {
+    return `(SELECT v.verdict FROM analysis_technical_verdicts v WHERE v."analysisId" = ${this.latestAnalysisIdSubquery(fieldAlias)})`;
+  }
+
+  /**
+   * Admin PR 5: última fila de Analysis por campo en UNA consulta (DISTINCT ON, mismo patrón que
+   * getLatestRunsByScheduleId de PR13B) — nunca una consulta por campo.
+   */
+  private async getLatestAnalysisByFieldId(fieldIds: string[]): Promise<
+    Map<
+      string,
+      {
+        id: string;
+        status: AnalysisStatus;
+        createdAt: Date;
+        completedAt: Date | null;
+        durationMs: number | null;
+        globalScore: number;
+      }
+    >
+  > {
+    if (!fieldIds.length) {
+      return new Map();
+    }
+
+    const rows = await this.fieldRepository.manager.query<
+      {
+        targetFieldId: string;
+        id: string;
+        status: AnalysisStatus;
+        createdAt: Date;
+        completedAt: Date | null;
+        durationMs: number | null;
+        globalScore: number;
+      }[]
+    >(
+      `
+      SELECT DISTINCT ON (f.id)
+        f.id AS "targetFieldId", a.id, a.status, a."createdAt", a."completedAt", a."durationMs", a."globalScore"
+      FROM fields f
+      INNER JOIN analysis a ON (
+        (a.scope = 'field' AND a."fieldId" = f.id::text) OR
+        (a.scope IS NULL AND a."lotId" = f.id::text)
+      )
+      WHERE f.id = ANY($1::uuid[])
+      ORDER BY f.id, a."createdAt" DESC
+      `,
+      [fieldIds],
+    );
+
+    return new Map(rows.map((row) => [row.targetFieldId, row]));
+  }
+
+  // Admin PR 5: FieldAnalysisSchedule.fieldId es unique — a lo sumo un schedule por campo.
+  private async getSchedulesByFieldId(
+    fieldIds: string[],
+  ): Promise<Map<string, FieldAnalysisSchedule>> {
+    if (!fieldIds.length) {
+      return new Map();
+    }
+
+    const schedules = await this.fieldAnalysisScheduleRepository.find({
+      where: { fieldId: In(fieldIds) },
+    });
+
+    return new Map(schedules.map((schedule) => [schedule.fieldId, schedule]));
+  }
+
+  // Admin PR 5: existencia REAL de corridas por scheduleId (mismo criterio EXISTS que hasRuns,
+  // PR3) — nunca lastRunAt.
+  private async getScheduleIdsWithRuns(
+    scheduleIds: string[],
+  ): Promise<Set<string>> {
+    if (!scheduleIds.length) {
+      return new Set();
+    }
+
+    const rows = await this.scheduledAnalysisRunRepository.manager.query<
+      { scheduleId: string }[]
+    >(
+      `SELECT DISTINCT "scheduleId" FROM scheduled_analysis_runs WHERE "scheduleId" = ANY($1::uuid[])`,
+      [scheduleIds],
+    );
+
+    return new Set(rows.map((row) => row.scheduleId));
+  }
+
+  // Admin PR 5: estado administrativo/producto — ver AdminFieldAnalysisStatus (admin-field.dto.ts)
+  // para la definición completa de cada transición. Nunca un diagnóstico agronómico nuevo, solo
+  // una lectura de Analysis.status + AnalysisTechnicalVerdict.verdict, que ya existen.
+  private deriveFieldAnalysisStatus(
+    latestAnalysis: AdminFieldLatestAnalysis | null,
+    technicalVerdict: AdminAnalysisTechnicalVerdict | null,
+  ): AdminFieldAnalysisStatus {
+    if (!latestAnalysis) {
+      return 'without_analysis';
+    }
+
+    if (latestAnalysis.status === 'Procesando') {
+      return 'processing';
+    }
+
+    if (latestAnalysis.status === 'Error') {
+      return 'error';
+    }
+
+    if (
+      technicalVerdict?.verdict === 'attention' ||
+      technicalVerdict?.verdict === 'critical'
+    ) {
+      return 'attention';
+    }
+
+    return 'completed';
+  }
+
+  /**
+   * Admin PR 5: señal operativa independiente de analysisStatus (puede ser true incluso con
+   * analysisStatus='completed', ej. schedule activo sin corridas). Solo 3 criterios ya existentes
+   * — a propósito NO usa umbrales de score: el admin no tiene bandas de score propias (a
+   * diferencia de agro-score-web/shared/utils/score-band.ts), así que este PR no inventa una acá.
+   */
+  private fieldRequiresAttention(
+    latestAnalysis: AdminFieldLatestAnalysis | null,
+    technicalVerdict: AdminAnalysisTechnicalVerdict | null,
+    weeklyMonitoring: AdminFieldWeeklyMonitoring,
+  ): boolean {
+    if (latestAnalysis?.status === 'Error') {
+      return true;
+    }
+
+    if (
+      technicalVerdict?.verdict === 'attention' ||
+      technicalVerdict?.verdict === 'critical'
+    ) {
+      return true;
+    }
+
+    if (weeklyMonitoring.active && !weeklyMonitoring.hasRuns) {
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -1280,7 +1550,7 @@ export class AdminService {
     return new Map(rows.map((row) => [row.fieldId, Number(row.count)]));
   }
 
-  async listLots(query: ListLotsQueryDto): Promise<Paginated<unknown>> {
+  async listLots(query: ListLotsQueryDto): Promise<Paginated<AdminLotItem>> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
@@ -1307,6 +1577,15 @@ export class AdminService {
 
     const [items, total] = await qb.getManyAndCount();
 
+    // Admin PR 5: contexto mínimo del campo — 2 consultas en lote acotadas a los fieldId
+    // distintos de esta página, nunca una por lote.
+    const fieldIds = Array.from(new Set(items.map((lot) => lot.fieldId)));
+    const [fieldIdsWithAnalysis, fieldIdsWithActiveMonitoring] =
+      await Promise.all([
+        this.getFieldIdsWithAnalysis(fieldIds),
+        this.getFieldIdsWithActiveMonitoring(fieldIds),
+      ]);
+
     return {
       items: items.map((lot) => ({
         id: lot.id,
@@ -1316,13 +1595,52 @@ export class AdminService {
         ownerId: lot.field?.userId ?? null,
         ownerEmail: lot.field?.user?.email ?? null,
         ownerFullName: lot.field?.user?.fullName ?? null,
-        createdAt: lot.createdAt,
-        updatedAt: lot.updatedAt,
+        fieldHasAnalysis: fieldIdsWithAnalysis.has(lot.fieldId),
+        fieldHasActiveMonitoring: fieldIdsWithActiveMonitoring.has(lot.fieldId),
+        createdAt: lot.createdAt.toISOString(),
+        updatedAt: lot.updatedAt.toISOString(),
       })),
       total,
       page,
       limit,
     };
+  }
+
+  private async getFieldIdsWithAnalysis(
+    fieldIds: string[],
+  ): Promise<Set<string>> {
+    if (!fieldIds.length) {
+      return new Set();
+    }
+
+    const rows = await this.fieldRepository.manager.query<{ id: string }[]>(
+      `
+      SELECT DISTINCT f.id
+      FROM fields f
+      INNER JOIN analysis a ON (
+        (a.scope = 'field' AND a."fieldId" = f.id::text) OR
+        (a.scope IS NULL AND a."lotId" = f.id::text)
+      )
+      WHERE f.id = ANY($1::uuid[])
+      `,
+      [fieldIds],
+    );
+
+    return new Set(rows.map((row) => row.id));
+  }
+
+  private async getFieldIdsWithActiveMonitoring(
+    fieldIds: string[],
+  ): Promise<Set<string>> {
+    if (!fieldIds.length) {
+      return new Set();
+    }
+
+    const schedules = await this.fieldAnalysisScheduleRepository.find({
+      where: { fieldId: In(fieldIds), enabled: true },
+    });
+
+    return new Set(schedules.map((schedule) => schedule.fieldId));
   }
 
   // ── Diagnósticos ────────────────────────────────────────────────────

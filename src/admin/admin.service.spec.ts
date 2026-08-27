@@ -1544,6 +1544,367 @@ describe('AdminService', () => {
     });
   });
 
+  describe('listFields — estado real (Admin PR 5)', () => {
+    function buildFieldsQueryBuilder(items: unknown[], total: number) {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndSelect: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([items, total]),
+      };
+      for (const key of [
+        'leftJoinAndSelect',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+      ]) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    function buildFieldRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'field-1',
+        userId: 'user-1',
+        name: 'Campo Norte',
+        user: {
+          id: 'user-1',
+          email: 'owner@example.com',
+          fullName: 'Owner Test',
+        },
+        createdAt: new Date('2026-08-01T10:00:00.000Z'),
+        updatedAt: new Date('2026-08-01T10:00:00.000Z'),
+        ...overrides,
+      };
+    }
+
+    function buildLotsCountQueryBuilder() {
+      const qb: Record<string, jest.Mock> = {
+        select: jest.fn(),
+        addSelect: jest.fn(),
+        where: jest.fn(),
+        groupBy: jest.fn(),
+        getRawMany: jest.fn().mockResolvedValue([]),
+      };
+      for (const key of ['select', 'addSelect', 'where', 'groupBy']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    // Fixture "vacía" para las 5 consultas batched (manager.query de latestAnalysis, find de
+    // schedules, find de verdicts, manager.query de scheduleIdsWithRuns) — cada test override solo
+    // lo que necesita.
+    function setupEmptyBatches() {
+      fieldLotRepo.createQueryBuilder.mockReturnValue(
+        buildLotsCountQueryBuilder(),
+      );
+      fieldRepo.manager.query.mockResolvedValue([]);
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([]);
+      analysisVerdictRepo.find.mockResolvedValue([]);
+      scheduledAnalysisRunRepo.manager.query.mockResolvedValue([]);
+    }
+
+    it('devuelve latestAnalysis (con score) cuando el último análisis existe y está Finalizado', async () => {
+      fieldRepo.createQueryBuilder.mockReturnValue(
+        buildFieldsQueryBuilder([buildFieldRow()], 1),
+      );
+      setupEmptyBatches();
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        {
+          targetFieldId: 'field-1',
+          id: 'analysis-1',
+          status: 'Finalizado',
+          createdAt: new Date('2026-08-10T00:00:00.000Z'),
+          completedAt: new Date('2026-08-10T01:00:00.000Z'),
+          durationMs: 5000,
+          globalScore: 72,
+        },
+      ]);
+
+      const result = await service.listFields({ page: 1, limit: 20 });
+
+      expect(result.items[0].latestAnalysis).toEqual(
+        expect.objectContaining({
+          id: 'analysis-1',
+          status: 'Finalizado',
+          score: 72,
+        }),
+      );
+      expect(result.items[0].analysisStatus).toBe('completed');
+    });
+
+    it('devuelve analysisStatus=without_analysis y latestAnalysis=null cuando no hay análisis', async () => {
+      fieldRepo.createQueryBuilder.mockReturnValue(
+        buildFieldsQueryBuilder([buildFieldRow()], 1),
+      );
+      setupEmptyBatches();
+
+      const result = await service.listFields({ page: 1, limit: 20 });
+
+      expect(result.items[0].latestAnalysis).toBeNull();
+      expect(result.items[0].analysisStatus).toBe('without_analysis');
+      expect(result.items[0].requiresAttention).toBe(false);
+    });
+
+    it('marca analysisStatus=error y requiresAttention=true si el último análisis está en Error', async () => {
+      fieldRepo.createQueryBuilder.mockReturnValue(
+        buildFieldsQueryBuilder([buildFieldRow()], 1),
+      );
+      setupEmptyBatches();
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        {
+          targetFieldId: 'field-1',
+          id: 'analysis-1',
+          status: 'Error',
+          createdAt: new Date('2026-08-10T00:00:00.000Z'),
+          completedAt: null,
+          durationMs: null,
+          globalScore: 0,
+        },
+      ]);
+
+      const result = await service.listFields({ page: 1, limit: 20 });
+
+      expect(result.items[0].analysisStatus).toBe('error');
+      expect(result.items[0].requiresAttention).toBe(true);
+      // No score mientras no está Finalizado — 0 sería un score falso, no "ausente".
+      expect(result.items[0].latestAnalysis?.score).toBeNull();
+    });
+
+    it('marca analysisStatus=attention y requiresAttention=true si el veredicto técnico requiere atención', async () => {
+      fieldRepo.createQueryBuilder.mockReturnValue(
+        buildFieldsQueryBuilder([buildFieldRow()], 1),
+      );
+      setupEmptyBatches();
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        {
+          targetFieldId: 'field-1',
+          id: 'analysis-1',
+          status: 'Finalizado',
+          createdAt: new Date('2026-08-10T00:00:00.000Z'),
+          completedAt: new Date('2026-08-10T01:00:00.000Z'),
+          durationMs: 5000,
+          globalScore: 35,
+        },
+      ]);
+      analysisVerdictRepo.find.mockResolvedValue([
+        {
+          analysisId: 'analysis-1',
+          status: 'generated',
+          verdict: 'attention',
+          confidence: 'medium',
+          summary: 'Zona con variabilidad relevante.',
+          keyFindings: [],
+          possibleCauses: [],
+          recommendations: [],
+          limitations: [],
+          generatedAt: new Date('2026-08-10T01:05:00.000Z'),
+          generator: 'deterministic-v1',
+          promptVersion: null,
+          errorMessage: null,
+        },
+      ]);
+
+      const result = await service.listFields({ page: 1, limit: 20 });
+
+      expect(result.items[0].analysisStatus).toBe('attention');
+      expect(result.items[0].requiresAttention).toBe(true);
+      expect(result.items[0].technicalVerdict?.verdict).toBe('attention');
+    });
+
+    it('weeklyMonitoring.active=true y requiresAttention=true si el schedule está activo pero sin corridas', async () => {
+      fieldRepo.createQueryBuilder.mockReturnValue(
+        buildFieldsQueryBuilder([buildFieldRow()], 1),
+      );
+      setupEmptyBatches();
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([
+        {
+          id: 'schedule-1',
+          fieldId: 'field-1',
+          enabled: true,
+          nextRunAt: new Date('2026-09-01T09:00:00.000Z'),
+          lastRunAt: null,
+        },
+      ]);
+      scheduledAnalysisRunRepo.manager.query.mockResolvedValue([]); // sin corridas para schedule-1
+
+      const result = await service.listFields({ page: 1, limit: 20 });
+
+      expect(result.items[0].weeklyMonitoring).toEqual(
+        expect.objectContaining({
+          active: true,
+          scheduleId: 'schedule-1',
+          hasRuns: false,
+        }),
+      );
+      expect(result.items[0].requiresAttention).toBe(true);
+    });
+
+    it('weeklyMonitoring.hasRuns=true cuando existe una corrida real para el schedule (no lastRunAt)', async () => {
+      fieldRepo.createQueryBuilder.mockReturnValue(
+        buildFieldsQueryBuilder([buildFieldRow()], 1),
+      );
+      setupEmptyBatches();
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([
+        {
+          id: 'schedule-1',
+          fieldId: 'field-1',
+          enabled: true,
+          nextRunAt: null,
+          lastRunAt: null,
+        },
+      ]);
+      scheduledAnalysisRunRepo.manager.query.mockResolvedValue([
+        { scheduleId: 'schedule-1' },
+      ]);
+
+      const result = await service.listFields({ page: 1, limit: 20 });
+
+      expect(result.items[0].weeklyMonitoring.hasRuns).toBe(true);
+      expect(result.items[0].requiresAttention).toBe(false);
+    });
+
+    it('filtra status=without_analysis con el mismo NOT EXISTS que hasAnalysis=false', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+      setupEmptyBatches();
+
+      await service.listFields({
+        page: 1,
+        limit: 20,
+        status: 'without_analysis',
+      });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(sqlCalls.some((sql) => sql.includes('NOT EXISTS'))).toBe(true);
+    });
+
+    it('filtra status=attention combinando el status Finalizado y el veredicto del último análisis', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+      setupEmptyBatches();
+
+      await service.listFields({ page: 1, limit: 20, status: 'attention' });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(sqlCalls.some((sql) => sql.includes("= 'Finalizado'"))).toBe(true);
+      expect(
+        sqlCalls.some((sql) => sql.includes("IN ('attention', 'critical')")),
+      ).toBe(true);
+    });
+
+    it('filtra monitoring=active con EXISTS contra field_analysis_schedules.enabled', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+      setupEmptyBatches();
+
+      await service.listFields({ page: 1, limit: 20, monitoring: 'active' });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(
+        sqlCalls.some(
+          (sql) =>
+            sql.includes('field_analysis_schedules') &&
+            sql.includes('enabled = true') &&
+            !sql.includes('NOT EXISTS'),
+        ),
+      ).toBe(true);
+    });
+
+    it('sigue soportando hasAnalysis=false (PR1) junto a los filtros nuevos', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+      setupEmptyBatches();
+
+      await service.listFields({ page: 1, limit: 20, hasAnalysis: false });
+
+      const sqlCalls = qb.andWhere.mock.calls.map(([sql]: [string]) => sql);
+      expect(sqlCalls.some((sql) => sql.includes('NOT EXISTS'))).toBe(true);
+    });
+
+    it('sigue soportando userId/fieldId (PR2) junto a los filtros nuevos', async () => {
+      const qb = buildFieldsQueryBuilder([], 0);
+      fieldRepo.createQueryBuilder.mockReturnValue(qb);
+      setupEmptyBatches();
+
+      await service.listFields({
+        page: 1,
+        limit: 20,
+        userId: 'user-1',
+        fieldId: 'field-1',
+      });
+
+      expect(qb.andWhere).toHaveBeenCalledWith('field."userId" = :userId', {
+        userId: 'user-1',
+      });
+      expect(qb.andWhere).toHaveBeenCalledWith('field.id = :fieldId', {
+        fieldId: 'field-1',
+      });
+    });
+
+    it('no hace N+1: una sola consulta batched por tipo de dato, sin importar cuántos campos traiga la página', async () => {
+      fieldRepo.createQueryBuilder.mockReturnValue(
+        buildFieldsQueryBuilder(
+          [
+            buildFieldRow({ id: 'field-1' }),
+            buildFieldRow({ id: 'field-2' }),
+            buildFieldRow({ id: 'field-3' }),
+          ],
+          3,
+        ),
+      );
+      setupEmptyBatches();
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([
+        {
+          id: 'schedule-1',
+          fieldId: 'field-1',
+          enabled: true,
+          nextRunAt: null,
+          lastRunAt: null,
+        },
+        {
+          id: 'schedule-2',
+          fieldId: 'field-2',
+          enabled: true,
+          nextRunAt: null,
+          lastRunAt: null,
+        },
+      ]);
+
+      fieldRepo.manager.query.mockClear();
+      analysisVerdictRepo.find.mockClear();
+      // Al menos un fieldId con análisis real, para que analysisIds no quede vacío y
+      // getTechnicalVerdictsByAnalysisId (que corta temprano con ids=[]) sí golpee el repo.
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        {
+          targetFieldId: 'field-1',
+          id: 'analysis-1',
+          status: 'Finalizado',
+          createdAt: new Date('2026-08-10T00:00:00.000Z'),
+          completedAt: new Date('2026-08-10T01:00:00.000Z'),
+          durationMs: 5000,
+          globalScore: 50,
+        },
+      ]);
+
+      await service.listFields({ page: 1, limit: 20 });
+
+      // 1 llamada para latestAnalysis (batched por los 3 fieldIds), no 3.
+      expect(fieldRepo.manager.query).toHaveBeenCalledTimes(1);
+      // 1 llamada para verdicts (batched), aunque analysisIds venga vacío acá.
+      expect(analysisVerdictRepo.find).toHaveBeenCalledTimes(1);
+      // 1 llamada para schedules (batched por los 3 fieldIds), no 3.
+      expect(fieldAnalysisScheduleRepo.find).toHaveBeenCalledTimes(1);
+      // 1 llamada para hasRuns (batched por los 2 scheduleIds), no 2.
+      expect(scheduledAnalysisRunRepo.manager.query).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('listLots — filtros de trazabilidad (Admin PR 2)', () => {
     function buildLotsQueryBuilder(items: unknown[], total: number) {
       const qb: Record<string, jest.Mock> = {
@@ -1595,6 +1956,88 @@ describe('AdminService', () => {
       await service.listLots({ page: 1, limit: 20 });
 
       expect(qb.andWhere).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listLots — contexto mínimo del campo (Admin PR 5)', () => {
+    function buildLotsQueryBuilderWithItems(items: unknown[], total: number) {
+      const qb: Record<string, jest.Mock> = {
+        leftJoinAndSelect: jest.fn(),
+        orderBy: jest.fn(),
+        skip: jest.fn(),
+        take: jest.fn(),
+        andWhere: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([items, total]),
+      };
+      for (const key of [
+        'leftJoinAndSelect',
+        'orderBy',
+        'skip',
+        'take',
+        'andWhere',
+      ]) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    function buildLotRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'lot-1',
+        name: 'Lote 1',
+        fieldId: 'field-1',
+        field: {
+          id: 'field-1',
+          name: 'Campo Norte',
+          userId: 'user-1',
+          user: {
+            id: 'user-1',
+            email: 'owner@example.com',
+            fullName: 'Owner Test',
+          },
+        },
+        createdAt: new Date('2026-08-01T10:00:00.000Z'),
+        updatedAt: new Date('2026-08-01T10:00:00.000Z'),
+        ...overrides,
+      };
+    }
+
+    it('devuelve fieldHasAnalysis/fieldHasActiveMonitoring por lote, en lote (no N+1)', async () => {
+      fieldLotRepo.createQueryBuilder.mockReturnValue(
+        buildLotsQueryBuilderWithItems([buildLotRow()], 1),
+      );
+      fieldRepo.manager.query.mockResolvedValueOnce([{ id: 'field-1' }]);
+      fieldAnalysisScheduleRepo.find.mockResolvedValueOnce([
+        { id: 'schedule-1', fieldId: 'field-1', enabled: true },
+      ]);
+
+      const result = await service.listLots({ page: 1, limit: 20 });
+
+      expect(result.items[0]).toEqual(
+        expect.objectContaining({
+          fieldHasAnalysis: true,
+          fieldHasActiveMonitoring: true,
+        }),
+      );
+      expect(fieldRepo.manager.query).toHaveBeenCalledTimes(1);
+      expect(fieldAnalysisScheduleRepo.find).toHaveBeenCalledTimes(1);
+    });
+
+    it('devuelve false para ambos cuando el campo no tiene análisis ni monitoreo activo', async () => {
+      fieldLotRepo.createQueryBuilder.mockReturnValue(
+        buildLotsQueryBuilderWithItems([buildLotRow()], 1),
+      );
+      fieldRepo.manager.query.mockResolvedValueOnce([]);
+      fieldAnalysisScheduleRepo.find.mockResolvedValueOnce([]);
+
+      const result = await service.listLots({ page: 1, limit: 20 });
+
+      expect(result.items[0]).toEqual(
+        expect.objectContaining({
+          fieldHasAnalysis: false,
+          fieldHasActiveMonitoring: false,
+        }),
+      );
     });
   });
 

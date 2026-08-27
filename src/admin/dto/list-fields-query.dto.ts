@@ -1,6 +1,7 @@
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsOptional, IsUUID } from 'class-validator';
+import { IsBoolean, IsIn, IsOptional, IsUUID } from 'class-validator';
 
+import type { AdminFieldAnalysisStatus } from './admin-field.dto';
 import { PaginationQueryDto } from './pagination-query.dto';
 
 // Mismo transform que ListAnalysisQueryDto (onlyFailed/onlyUnreviewed) — el @Type(() => Boolean)
@@ -34,4 +35,19 @@ export class ListFieldsQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsUUID()
   fieldId?: string;
+
+  // Admin PR 5: mismo AdminFieldAnalysisStatus que devuelve cada fila (ver admin-field.dto.ts) —
+  // "status=without_analysis" reusa el mismo NOT EXISTS que hasAnalysis=false por debajo (son la
+  // misma pregunta), el resto usa el análisis MÁS RECIENTE del campo vía subquery correlacionada
+  // (ver AdminService.listFields), no un join que multiplique filas.
+  @IsOptional()
+  @IsIn(['without_analysis', 'processing', 'completed', 'error', 'attention'])
+  status?: AdminFieldAnalysisStatus;
+
+  // Admin PR 5: "campos con/sin monitoreo semanal activo" — EXISTS/NOT EXISTS contra
+  // field_analysis_schedules.enabled=true (fieldId es unique ahí, así que "activo" = existe un
+  // schedule habilitado para ese campo).
+  @IsOptional()
+  @IsIn(['active', 'inactive'])
+  monitoring?: 'active' | 'inactive';
 }
