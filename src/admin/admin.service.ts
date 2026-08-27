@@ -1284,7 +1284,7 @@ export class AdminService {
   /**
    * ADMIN-3: envío best-effort del email de invitación + auditoría del
    * resultado. Best-effort porque la invitación ya se persistió antes de
-   * llegar acá (ver issueInvitation) — un fallo de Resend nunca revierte la
+   * llegar acá (ver issueInvitation) — un fallo del envío SMTP nunca revierte la
    * creación, solo se refleja en `emailSent: false` en la respuesta y queda
    * registrado en el audit log (éxito o fallo, ambos se auditan).
    */

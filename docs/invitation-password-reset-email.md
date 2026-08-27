@@ -1,5 +1,12 @@
 # ADMIN-3 — Envío real de emails (invitaciones + password reset)
 
+> **Deprecado (SMTP-MIGRATION-1):** este documento describe la implementación original vía
+> Resend. El envío real ahora pasa por SMTP (Google Workspace) — ver
+> [`docs/email-configuration.md`](./email-configuration.md) para la configuración vigente.
+> `EMAIL_PROVIDER`/`EMAIL_FROM`/`EMAIL_DRY_RUN`/`RESEND_API_KEY` quedan como fallback deprecado,
+> no usar en un `.env` nuevo. El resto de este documento (flujo de invitación/reset,
+> `APP_PUBLIC_URL`) sigue vigente.
+
 Cierra la deuda documentada en ADMIN-2 (`docs/admin-backend.md`): las invitaciones
 de usuario y los tokens de password reset ya no dependen de que un admin copie
 un link de la respuesta HTTP — se envían por email de verdad, usando

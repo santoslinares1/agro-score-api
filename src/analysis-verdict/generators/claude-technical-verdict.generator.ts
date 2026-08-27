@@ -35,7 +35,7 @@ const MAX_OUTPUT_TOKENS = 4096;
  * el frontend ni desde ningún endpoint manual — solo AnalysisVerdictService.generateAndPersist la
  * invoca, y solo cuando TECHNICAL_VERDICT_PROVIDER=claude (ver ese servicio).
  *
- * Cliente lazy (mismo patrón que EmailService.getResendClient): no se construye ni valida
+ * Cliente lazy (mismo patrón que EmailService.getTransporter): no se construye ni valida
  * ANTHROPIC_API_KEY en el constructor, así que el boot de la app nunca falla por esta env var —
  * el error (si falta) sale recién acá, dentro de generate(), y queda contenido por el try/catch
  * de AnalysisVerdictService.generateAndPersist (persiste status='failed', el análisis sigue

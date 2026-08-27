@@ -4,6 +4,12 @@
 **Contexto:** AgroScore todavía no debe tener registro abierto libre. Se reemplaza el flujo público de "crear cuenta" por un flujo de "solicitar acceso": la landing ya no invita a registrarse, sino a dejar una solicitud que llega por email al equipo de AgroScore para habilitar el acceso manualmente.
 **Alcance respetado:** no se tocó DB schema ni migrations. No se hizo deploy. No se llamó a `/lots`. No se expusieron secretos. No se rompió `/auth/login`. `POST /auth/register` **sigue existiendo** (ver sección "Qué no se tocó").
 
+> **Deprecado — sección "Email" (SMTP-MIGRATION-1):** la sección "Email" de este documento
+> describe la implementación original vía Resend con cliente propio en `AccessRequestService`.
+> El envío real ahora pasa por SMTP (Google Workspace) vía `EmailService` centralizado — ver
+> [`docs/email-configuration.md`](../email-configuration.md). El resto de este documento (DTO,
+> validaciones, seguridad, rate limiting) sigue vigente.
+
 Frontend: [`docs/audits/access-request-flow.md`](../../../agro-score-web/docs/audits/access-request-flow.md) en `agro-score-web`.
 
 ---

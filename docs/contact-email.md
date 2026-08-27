@@ -1,5 +1,11 @@
 # Contact-1 — Formulario de contacto público (Resend)
 
+> **Deprecado (SMTP-MIGRATION-1):** este documento describe la implementación original vía
+> Resend. El envío real ahora pasa por SMTP (Google Workspace) — ver
+> [`docs/email-configuration.md`](./email-configuration.md) para la configuración vigente.
+> `CONTACT_TO_EMAIL`/`CONTACT_FROM_EMAIL`/`RESEND_API_KEY` quedan como fallback deprecado, no
+> usar en un `.env` nuevo. El resto de este documento (payload, DTO, seguridad) sigue vigente.
+
 Endpoint público que recibe las consultas del formulario de contacto de la landing
 y las envía por email a AgroScore usando [Resend](https://resend.com) como
 proveedor transaccional. Reemplaza el intento anterior con Gmail SMTP (la cuenta

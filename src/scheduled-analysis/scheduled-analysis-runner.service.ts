@@ -261,7 +261,7 @@ export class ScheduledAnalysisRunnerService {
    * reconciliación por polling que arma el puente: para cada run 'processing', mira el Analysis
    * real (AnalysisService.findOne, sin ownership porque corre como proceso interno) y reacciona
    * cuando pasa a Finalizado/Error. También reintenta el envío de email para runs 'completed' que
-   * por algún motivo se quedaron sin emailSentAt (ej. Resend caído momentáneamente).
+   * por algún motivo se quedaron sin emailSentAt (ej. SMTP caído momentáneamente).
    */
   async reconcilePendingRuns(): Promise<void> {
     const runs = await this.runRepository.find({
@@ -395,7 +395,7 @@ export class ScheduledAnalysisRunnerService {
     // Fase 5: el email ahora se arma SIEMPRE desde el snapshot semanal comparativo, no solo del
     // Analysis — si todavía no existe (createFromAnalysis falló en un tick anterior, ver
     // reconcileRun), no inventamos un email genérico: se reintenta en el próximo ciclo, mismo
-    // mecanismo que una falla transitoria de Resend.
+    // mecanismo que una falla transitoria de SMTP.
     const snapshot = await this.weeklySnapshotService.findByScheduledRunId(
       run.id,
     );
@@ -457,7 +457,7 @@ export class ScheduledAnalysisRunnerService {
       // "/app/analysis/…" sin host — roto en la mayoría de los clientes de correo, aunque el
       // envío se reporte como "exitoso". Mejor no mandar nada: queda 'completed' sin
       // emailSentAt, así que el próximo tick de reconciliación reintenta solo (mismo mecanismo
-      // que una falla transitoria de Resend) una vez que se corrija la config.
+      // que una falla transitoria de SMTP) una vez que se corrija la config.
       this.logger.error(
         `[scheduled-analysis] No se pudo armar el link del email: APP_PUBLIC_URL/FRONTEND_URL no está configurado (runId=${run.id}). Se reintenta en el próximo ciclo.`,
       );
