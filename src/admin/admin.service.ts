@@ -46,6 +46,12 @@ import {
   toAdminAnalysisTechnicalVerdict,
 } from './dto/admin-analysis-technical-verdict.dto';
 import {
+  AdminFieldDetail,
+  AdminFieldDetailWeeklyMonitoring,
+  FIELD_DETAIL_ANALYSES_LIMIT,
+  FIELD_DETAIL_RUNS_LIMIT,
+} from './dto/admin-field-detail.dto';
+import {
   AdminFieldAnalysisStatus,
   AdminFieldItem,
   AdminFieldLatestAnalysis,
@@ -1363,6 +1369,175 @@ export class AdminService {
       page,
       limit,
     };
+  }
+
+  /**
+   * Admin PR 6: vista de detalle de UN campo — GET /admin/fields/:fieldId, solo lectura. Reusa
+   * tal cual los helpers batched de PR5 (con fieldIds=[fieldId], mismo código, misma forma) más
+   * dos consultas nuevas acotadas por LIMIT: historial de análisis del campo y últimas corridas
+   * del schedule. Nunca duplica las reglas de analysisStatus/requiresAttention — mismos métodos
+   * privados que usa listFields.
+   */
+  async getFieldDetail(fieldId: string): Promise<AdminFieldDetail> {
+    const field = await this.fieldRepository.findOne({
+      where: { id: fieldId },
+      relations: { user: true },
+    });
+
+    if (!field) {
+      throw new NotFoundException('Campo no encontrado.');
+    }
+
+    const [
+      lotsCountByFieldId,
+      latestAnalysisByFieldId,
+      scheduleByFieldId,
+      lots,
+      analysisRows,
+    ] = await Promise.all([
+      this.countLotsByFieldId([fieldId]),
+      this.getLatestAnalysisByFieldId([fieldId]),
+      this.getSchedulesByFieldId([fieldId]),
+      this.fieldLotRepository.find({
+        where: { fieldId },
+        order: { createdAt: 'DESC' },
+      }),
+      this.getAnalysesForField(fieldId, FIELD_DETAIL_ANALYSES_LIMIT),
+    ]);
+
+    const latestAnalysisRow = latestAnalysisByFieldId.get(fieldId) ?? null;
+    const latestAnalysis: AdminFieldLatestAnalysis | null = latestAnalysisRow
+      ? {
+          id: latestAnalysisRow.id,
+          status: latestAnalysisRow.status,
+          createdAt: latestAnalysisRow.createdAt.toISOString(),
+          completedAt: latestAnalysisRow.completedAt
+            ? latestAnalysisRow.completedAt.toISOString()
+            : null,
+          durationMs: latestAnalysisRow.durationMs,
+          score:
+            latestAnalysisRow.status === 'Finalizado'
+              ? latestAnalysisRow.globalScore
+              : null,
+        }
+      : null;
+
+    // Solo el análisis más reciente necesita su veredicto resuelto acá (el historial de
+    // `analyses` no lo incluye, ver comentario en AdminFieldDetailAnalysisRow/DTO) — un solo id,
+    // pero se reusa el mismo helper batched de siempre en vez de un find() aparte.
+    const verdictsByAnalysisId = await this.getTechnicalVerdictsByAnalysisId(
+      latestAnalysis ? [latestAnalysis.id] : [],
+    );
+    const technicalVerdict = latestAnalysis
+      ? (verdictsByAnalysisId.get(latestAnalysis.id) ?? null)
+      : null;
+
+    const schedule = scheduleByFieldId.get(fieldId) ?? null;
+    const scheduleIdsWithRuns = await this.getScheduleIdsWithRuns(
+      schedule ? [schedule.id] : [],
+    );
+    const weeklyMonitoring: AdminFieldDetailWeeklyMonitoring = {
+      active: schedule?.enabled ?? false,
+      scheduleId: schedule?.id ?? null,
+      frequency: schedule?.frequency ?? null,
+      nextRunAt: schedule?.nextRunAt ? schedule.nextRunAt.toISOString() : null,
+      lastRunAt: schedule?.lastRunAt ? schedule.lastRunAt.toISOString() : null,
+      hasRuns: schedule ? scheduleIdsWithRuns.has(schedule.id) : false,
+    };
+
+    const scheduledRunRows = schedule
+      ? await this.getRecentRunsForSchedule(
+          schedule.id,
+          FIELD_DETAIL_RUNS_LIMIT,
+        )
+      : [];
+    const weeklyVerdictsByRunId =
+      await this.weeklyTechnicalVerdictService.findResponsesByScheduledRunIds(
+        scheduledRunRows.map((run) => run.id),
+      );
+
+    return {
+      field: {
+        id: field.id,
+        name: field.name,
+        ownerId: field.userId,
+        ownerEmail: field.user?.email ?? null,
+        ownerFullName: field.user?.fullName ?? null,
+        lotsCount: lotsCountByFieldId.get(fieldId) ?? 0,
+        createdAt: field.createdAt.toISOString(),
+        updatedAt: field.updatedAt.toISOString(),
+        analysisStatus: this.deriveFieldAnalysisStatus(
+          latestAnalysis,
+          technicalVerdict,
+        ),
+        requiresAttention: this.fieldRequiresAttention(
+          latestAnalysis,
+          technicalVerdict,
+          weeklyMonitoring,
+        ),
+      },
+      latestAnalysis,
+      technicalVerdict,
+      lots: lots.map((lot) => ({
+        id: lot.id,
+        name: lot.name,
+        createdAt: lot.createdAt.toISOString(),
+        updatedAt: lot.updatedAt.toISOString(),
+      })),
+      analyses: analysisRows.map((analysis) => ({
+        id: analysis.id,
+        status: analysis.status,
+        createdAt: analysis.createdAt.toISOString(),
+        completedAt: analysis.completedAt
+          ? analysis.completedAt.toISOString()
+          : null,
+        durationMs: analysis.durationMs,
+        score: analysis.status === 'Finalizado' ? analysis.globalScore : null,
+        errorMessage: analysis.errorMessage,
+        reviewedAt: analysis.reviewedAt
+          ? analysis.reviewedAt.toISOString()
+          : null,
+        reviewedByUserId: analysis.reviewedByUserId,
+      })),
+      weeklyMonitoring,
+      scheduledRuns: scheduledRunRows.map((run) => ({
+        ...this.toAdminScheduledAnalysisRun(run),
+        weeklyTechnicalVerdict: weeklyVerdictsByRunId.get(run.id) ?? null,
+      })),
+    };
+  }
+
+  // Admin PR 6: historial de análisis de UN campo (no solo el más reciente, a diferencia de
+  // getLatestAnalysisByFieldId) — mismo criterio scope/lotId de siempre, queryBuilder simple (no
+  // hace falta DISTINCT ON: es un solo campo, no una tanda).
+  private async getAnalysesForField(
+    fieldId: string,
+    limit: number,
+  ): Promise<Analysis[]> {
+    return this.analysisRepository
+      .createQueryBuilder('analysis')
+      .where(
+        `(analysis.scope = 'field' AND analysis."fieldId" = :fieldId) OR (analysis.scope IS NULL AND analysis."lotId" = :fieldId)`,
+        { fieldId },
+      )
+      .orderBy('analysis.createdAt', 'DESC')
+      .take(limit)
+      .getMany();
+  }
+
+  // Admin PR 6: últimas `limit` corridas de un schedule — relations:['analysis'] para que
+  // toAdminScheduledAnalysisRun pueda resolver analysisStatus sin una consulta aparte por fila
+  // (mismo criterio que getLatestRunsByScheduleId, PR13B).
+  private async getRecentRunsForSchedule(
+    scheduleId: string,
+    limit: number,
+  ): Promise<ScheduledAnalysisRun[]> {
+    return this.scheduledAnalysisRunRepository.find({
+      where: { scheduleId },
+      relations: { analysis: true },
+      order: { createdAt: 'DESC' },
+      take: limit,
+    });
   }
 
   // Admin PR 5: fragmento reusado por hasAnalysis (PR1), status=without_analysis y

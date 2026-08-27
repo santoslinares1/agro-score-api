@@ -64,6 +64,26 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
               },
               topAnalysisErrorsLast30Days: [],
             }),
+            getFieldDetail: jest.fn().mockResolvedValue({
+              field: {
+                id: 'field-1',
+                analysisStatus: 'without_analysis',
+                requiresAttention: false,
+              },
+              latestAnalysis: null,
+              technicalVerdict: null,
+              lots: [],
+              analyses: [],
+              weeklyMonitoring: {
+                active: false,
+                scheduleId: null,
+                frequency: null,
+                nextRunAt: null,
+                lastRunAt: null,
+                hasRuns: false,
+              },
+              scheduledRuns: [],
+            }),
           },
         },
       ],
@@ -141,6 +161,21 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
 
     await request(app.getHttpServer())
       .get('/admin/product-analytics')
+      .set('x-test-role', UserRole.ADMIN)
+      .expect(200);
+  });
+
+  // Admin PR 6: mismo endpoint nuevo, misma composición de guards — los guards corren ANTES que
+  // ParseUUIDPipe, así que un role sin permiso da 403 aunque el :fieldId ni siquiera sea un UUID
+  // válido.
+  it('GET /admin/fields/:fieldId — role "user" no entra, "admin" sí', async () => {
+    await request(app.getHttpServer())
+      .get('/admin/fields/a1111111-1111-4111-8111-111111111111')
+      .set('x-test-role', UserRole.USER)
+      .expect(403);
+
+    await request(app.getHttpServer())
+      .get('/admin/fields/a1111111-1111-4111-8111-111111111111')
       .set('x-test-role', UserRole.ADMIN)
       .expect(200);
   });

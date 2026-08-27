@@ -137,6 +137,13 @@ export class AdminController {
     return this.adminService.listFields(query);
   }
 
+  // Admin PR 6: vista de detalle de un campo, solo lectura — nunca dispara nada. 404 si el campo
+  // no existe (ver AdminService.getFieldDetail).
+  @Get('fields/:fieldId')
+  getFieldDetail(@Param('fieldId', ParseUUIDPipe) fieldId: string) {
+    return this.adminService.getFieldDetail(fieldId);
+  }
+
   @Get('lots')
   listLots(@Query() query: ListLotsQueryDto) {
     return this.adminService.listLots(query);

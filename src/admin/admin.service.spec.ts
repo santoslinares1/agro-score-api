@@ -30,6 +30,10 @@ import { UsersService } from '../users/users.service';
 import { WeeklyTechnicalVerdictService } from '../weekly-technical-verdict/weekly-technical-verdict.service';
 import { WeeklyTechnicalVerdictResponse } from '../weekly-technical-verdict/dto/weekly-technical-verdict.dto';
 import { AdminService } from './admin.service';
+import {
+  FIELD_DETAIL_ANALYSES_LIMIT,
+  FIELD_DETAIL_RUNS_LIMIT,
+} from './dto/admin-field-detail.dto';
 
 function buildUser(overrides: Partial<User> = {}): User {
   return {
@@ -1902,6 +1906,329 @@ describe('AdminService', () => {
       expect(fieldAnalysisScheduleRepo.find).toHaveBeenCalledTimes(1);
       // 1 llamada para hasRuns (batched por los 2 scheduleIds), no 2.
       expect(scheduledAnalysisRunRepo.manager.query).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getFieldDetail (Admin PR 6)', () => {
+    function buildFieldRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'field-1',
+        userId: 'user-1',
+        name: 'Campo Norte',
+        user: {
+          id: 'user-1',
+          email: 'owner@example.com',
+          fullName: 'Owner Test',
+        },
+        createdAt: new Date('2026-08-01T10:00:00.000Z'),
+        updatedAt: new Date('2026-08-01T10:00:00.000Z'),
+        ...overrides,
+      };
+    }
+
+    function buildLotsCountQueryBuilder() {
+      const qb: Record<string, jest.Mock> = {
+        select: jest.fn(),
+        addSelect: jest.fn(),
+        where: jest.fn(),
+        groupBy: jest.fn(),
+        getRawMany: jest.fn().mockResolvedValue([]),
+      };
+      for (const key of ['select', 'addSelect', 'where', 'groupBy']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    function buildAnalysesQueryBuilder(rows: unknown[] = []) {
+      const qb: Record<string, jest.Mock> = {
+        where: jest.fn(),
+        orderBy: jest.fn(),
+        take: jest.fn(),
+        getMany: jest.fn().mockResolvedValue(rows),
+      };
+      for (const key of ['where', 'orderBy', 'take']) {
+        qb[key].mockReturnValue(qb);
+      }
+      return qb;
+    }
+
+    // Fixture "vacía" para todas las consultas batched/limitadas — cada test override lo que
+    // necesita.
+    function setupEmptyDetail() {
+      fieldLotRepo.createQueryBuilder.mockReturnValue(
+        buildLotsCountQueryBuilder(),
+      );
+      fieldLotRepo.find.mockResolvedValue([]);
+      fieldRepo.manager.query.mockResolvedValue([]);
+      analysisRepo.createQueryBuilder.mockReturnValue(
+        buildAnalysesQueryBuilder([]),
+      );
+      analysisVerdictRepo.find.mockResolvedValue([]);
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([]);
+      scheduledAnalysisRunRepo.manager.query.mockResolvedValue([]);
+      scheduledAnalysisRunRepo.find.mockResolvedValue([]);
+      weeklyTechnicalVerdictService.findResponsesByScheduledRunIds.mockResolvedValue(
+        new Map(),
+      );
+    }
+
+    it('devuelve 404 (NotFoundException) si el campo no existe', async () => {
+      fieldRepo.findOne.mockResolvedValue(null);
+
+      await expect(service.getFieldDetail('field-inexistente')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('devuelve los datos básicos del campo, incluyendo ownerId/ownerEmail', async () => {
+      fieldRepo.findOne.mockResolvedValue(buildFieldRow());
+      setupEmptyDetail();
+
+      const result = await service.getFieldDetail('field-1');
+
+      expect(result.field).toEqual(
+        expect.objectContaining({
+          id: 'field-1',
+          name: 'Campo Norte',
+          ownerId: 'user-1',
+          ownerEmail: 'owner@example.com',
+          ownerFullName: 'Owner Test',
+        }),
+      );
+    });
+
+    it('incluye lots (limitados por fieldId, orden DESC)', async () => {
+      fieldRepo.findOne.mockResolvedValue(buildFieldRow());
+      setupEmptyDetail();
+      fieldLotRepo.find.mockResolvedValue([
+        {
+          id: 'lot-1',
+          name: 'Lote 1',
+          createdAt: new Date('2026-08-05T00:00:00.000Z'),
+          updatedAt: new Date('2026-08-05T00:00:00.000Z'),
+        },
+      ]);
+
+      const result = await service.getFieldDetail('field-1');
+
+      expect(result.lots).toEqual([
+        expect.objectContaining({ id: 'lot-1', name: 'Lote 1' }),
+      ]);
+      expect(fieldLotRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { fieldId: 'field-1' },
+          order: { createdAt: 'DESC' },
+        }),
+      );
+    });
+
+    it('incluye latestAnalysis y technicalVerdict del último análisis, si existen', async () => {
+      fieldRepo.findOne.mockResolvedValue(buildFieldRow());
+      setupEmptyDetail();
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        {
+          targetFieldId: 'field-1',
+          id: 'analysis-1',
+          status: 'Finalizado',
+          createdAt: new Date('2026-08-10T00:00:00.000Z'),
+          completedAt: new Date('2026-08-10T01:00:00.000Z'),
+          durationMs: 5000,
+          globalScore: 72,
+        },
+      ]);
+      analysisVerdictRepo.find.mockResolvedValue([
+        {
+          analysisId: 'analysis-1',
+          status: 'generated',
+          verdict: 'favorable',
+          confidence: 'high',
+          summary: 'Todo bien.',
+          keyFindings: [],
+          possibleCauses: [],
+          recommendations: [],
+          limitations: [],
+          generatedAt: new Date('2026-08-10T01:05:00.000Z'),
+          generator: 'deterministic-v1',
+          promptVersion: null,
+          errorMessage: null,
+        },
+      ]);
+
+      const result = await service.getFieldDetail('field-1');
+
+      expect(result.latestAnalysis).toEqual(
+        expect.objectContaining({
+          id: 'analysis-1',
+          status: 'Finalizado',
+          score: 72,
+        }),
+      );
+      expect(result.technicalVerdict?.verdict).toBe('favorable');
+    });
+
+    it('incluye analyses (historial), últimos N ordenados DESC', async () => {
+      fieldRepo.findOne.mockResolvedValue(buildFieldRow());
+      setupEmptyDetail();
+      const rows = [
+        {
+          id: 'analysis-2',
+          status: 'Finalizado',
+          createdAt: new Date('2026-08-12T00:00:00.000Z'),
+          completedAt: new Date('2026-08-12T01:00:00.000Z'),
+          durationMs: 4000,
+          globalScore: 60,
+          errorMessage: null,
+          reviewedAt: null,
+          reviewedByUserId: null,
+        },
+        {
+          id: 'analysis-1',
+          status: 'Error',
+          createdAt: new Date('2026-08-05T00:00:00.000Z'),
+          completedAt: null,
+          durationMs: null,
+          globalScore: 0,
+          errorMessage: 'Nubosidad excesiva',
+          reviewedAt: null,
+          reviewedByUserId: null,
+        },
+      ];
+      const qb = buildAnalysesQueryBuilder(rows);
+      analysisRepo.createQueryBuilder.mockReturnValue(qb);
+
+      const result = await service.getFieldDetail('field-1');
+
+      expect(result.analyses.map((a) => a.id)).toEqual([
+        'analysis-2',
+        'analysis-1',
+      ]);
+      expect(result.analyses[1].score).toBeNull(); // Error, nunca score
+      expect(result.analyses[1].errorMessage).toBe('Nubosidad excesiva');
+      expect(qb.take).toHaveBeenCalledWith(FIELD_DETAIL_ANALYSES_LIMIT);
+      expect(qb.orderBy).toHaveBeenCalledWith('analysis.createdAt', 'DESC');
+    });
+
+    it('incluye weeklyMonitoring con los datos del schedule cuando existe', async () => {
+      fieldRepo.findOne.mockResolvedValue(buildFieldRow());
+      setupEmptyDetail();
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([
+        {
+          id: 'schedule-1',
+          fieldId: 'field-1',
+          enabled: true,
+          frequency: 'weekly',
+          nextRunAt: new Date('2026-09-01T09:00:00.000Z'),
+          lastRunAt: new Date('2026-08-25T09:00:00.000Z'),
+        },
+      ]);
+
+      const result = await service.getFieldDetail('field-1');
+
+      expect(result.weeklyMonitoring).toEqual(
+        expect.objectContaining({
+          active: true,
+          scheduleId: 'schedule-1',
+          frequency: 'weekly',
+        }),
+      );
+    });
+
+    it('incluye scheduledRuns (últimos N del schedule, orden DESC) con su weeklyTechnicalVerdict', async () => {
+      fieldRepo.findOne.mockResolvedValue(buildFieldRow());
+      setupEmptyDetail();
+      fieldAnalysisScheduleRepo.find.mockResolvedValue([
+        {
+          id: 'schedule-1',
+          fieldId: 'field-1',
+          enabled: true,
+          frequency: 'weekly',
+          nextRunAt: null,
+          lastRunAt: null,
+        },
+      ]);
+      scheduledAnalysisRunRepo.find.mockResolvedValue([
+        {
+          id: 'run-1',
+          scheduleId: 'schedule-1',
+          status: 'completed',
+          scheduledFor: '2026-08-24',
+          analysisId: 'analysis-9',
+          analysis: { status: 'Finalizado' },
+          startedAt: new Date('2026-08-24T09:00:00.000Z'),
+          completedAt: new Date('2026-08-24T09:05:00.000Z'),
+          failedAt: null,
+          emailSentAt: new Date('2026-08-24T09:10:00.000Z'),
+          errorMessage: null,
+          createdAt: new Date('2026-08-24T09:00:00.000Z'),
+          updatedAt: new Date('2026-08-24T09:10:00.000Z'),
+        },
+      ]);
+      weeklyTechnicalVerdictService.findResponsesByScheduledRunIds.mockResolvedValue(
+        new Map([
+          [
+            'run-1',
+            {
+              status: 'generated',
+              verdict: 'stable',
+              trend: 'stable',
+              confidence: 'medium',
+              summary: 'Sin cambios relevantes.',
+              keyChanges: [],
+              areasToReview: [],
+              recommendations: [],
+              limitations: [],
+              previousSnapshotId: null,
+              generatedAt: '2026-08-24T09:12:00.000Z',
+              generator: 'deterministic-v1',
+              promptVersion: null,
+              errorMessage: null,
+            },
+          ],
+        ]) as never,
+      );
+
+      const result = await service.getFieldDetail('field-1');
+
+      expect(result.scheduledRuns).toHaveLength(1);
+      expect(result.scheduledRuns[0]).toEqual(
+        expect.objectContaining({
+          id: 'run-1',
+          analysisStatus: 'Finalizado',
+          emailSentAt: '2026-08-24T09:10:00.000Z',
+        }),
+      );
+      expect(result.scheduledRuns[0].weeklyTechnicalVerdict?.verdict).toBe(
+        'stable',
+      );
+      expect(scheduledAnalysisRunRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { scheduleId: 'schedule-1' },
+          order: { createdAt: 'DESC' },
+          take: FIELD_DETAIL_RUNS_LIMIT,
+        }),
+      );
+    });
+
+    it('mantiene las mismas reglas de analysisStatus/requiresAttention que listFields (PR5): Error => requiresAttention', async () => {
+      fieldRepo.findOne.mockResolvedValue(buildFieldRow());
+      setupEmptyDetail();
+      fieldRepo.manager.query.mockResolvedValueOnce([
+        {
+          targetFieldId: 'field-1',
+          id: 'analysis-1',
+          status: 'Error',
+          createdAt: new Date('2026-08-10T00:00:00.000Z'),
+          completedAt: null,
+          durationMs: null,
+          globalScore: 0,
+        },
+      ]);
+
+      const result = await service.getFieldDetail('field-1');
+
+      expect(result.field.analysisStatus).toBe('error');
+      expect(result.field.requiresAttention).toBe(true);
     });
   });
 
