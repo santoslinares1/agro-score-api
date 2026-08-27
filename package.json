@@ -25,7 +25,8 @@
     "migration:show": "npm run typeorm -- migration:show",
     "migration:baseline": "ts-node -r tsconfig-paths/register scripts/baseline-migration.ts",
     "backfill:fields-user": "ts-node -r tsconfig-paths/register scripts/backfill-fields-user.ts",
-    "promote:user-role": "ts-node -r tsconfig-paths/register scripts/promote-user-role.ts"
+    "promote:user-role": "ts-node -r tsconfig-paths/register scripts/promote-user-role.ts",
+    "cleanup:test-data": "ts-node -r tsconfig-paths/register src/scripts/cleanup-test-data.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",
