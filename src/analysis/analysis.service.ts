@@ -7,6 +7,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, Repository } from 'typeorm';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
+import { ANALYSIS_STALE_THRESHOLD_MS, isAnalysisStale } from './analysis-stale.util';
 import { Analysis } from './entities/analysis.entity';
 import { Field } from '../fields/entities/field.entity';
 import { FieldsService } from '../fields/fields.service';
@@ -48,6 +49,15 @@ const ANALYSIS_STATUS_COLUMNS = [
 // ADMIN-1: cota para errorMessage — nunca stack traces completos ni datos
 // sensibles, solo lo suficiente para que el panel admin muestre qué pasó.
 const ANALYSIS_ERROR_MESSAGE_MAX_LENGTH = 500;
+
+/**
+ * OPS-1: mensaje persistido cuando un Analysis 'Procesando' se marca 'Error' por staleness (ver
+ * isAnalysisStale/ANALYSIS_STALE_THRESHOLD_MS) — nunca afirma una causa concreta (reinicio,
+ * crash, etc.) porque no se conoce con certeza; solo describe el hecho observable: superó el
+ * tiempo máximo esperado sin resolverse.
+ */
+const ANALYSIS_STALE_ERROR_MESSAGE =
+  'El análisis superó el tiempo máximo de procesamiento y fue marcado automáticamente como Error.';
 
 @Injectable()
 export class AnalysisService {
@@ -333,9 +343,13 @@ export class AnalysisService {
     // Lanza NotFoundException si el campo no existe o no es del usuario.
     await this.fieldsService.findOne(fieldId, userId);
 
-    if (new Date(input.startDate) > new Date(input.endDate)) {
+    // OPS-2: rechaza también la igualdad (antes solo `>`). El Worker exige end > start
+    // estrictamente (limits.py: `if end <= start: raise ...`) — permitir startDate === endDate
+    // acá dejaba crear un Analysis=Procesando que el Worker siempre terminaba rechazando
+    // (RISK-005). No hay evidencia en el código de una necesidad real de análisis de un solo día.
+    if (new Date(input.startDate) >= new Date(input.endDate)) {
       throw new BadRequestException(
-        'La fecha de inicio debe ser anterior o igual a la fecha de fin.',
+        'La fecha de inicio debe ser estrictamente anterior a la fecha de fin.',
       );
     }
 
@@ -347,11 +361,28 @@ export class AnalysisService {
     });
 
     if (runningAnalysis) {
+      const now = new Date();
+
+      // OPS-1: si el 'Procesando' existente sigue fresco, mantenemos el dedupe de siempre
+      // (reutilizarlo, no crear otro). Si ya superó ANALYSIS_STALE_THRESHOLD_MS, lo tratamos
+      // como si el proceso que lo estaba corriendo ya no existe: lo marcamos Error acá mismo
+      // (única autoridad que muta Analysis.status por staleness, ver también
+      // reconcileStaleAnalyses) y seguimos el flujo normal para crear uno nuevo — así el usuario
+      // recupera el campo en su propio próximo intento, sin esperar al reconciliador periódico.
+      if (!isAnalysisStale(runningAnalysis, now, ANALYSIS_STALE_THRESHOLD_MS)) {
+        this.logger.warn(
+          `Ya hay un análisis en curso para fieldId=${fieldId} (analysisId=${runningAnalysis.id}); no se dispara uno nuevo.`,
+        );
+
+        return runningAnalysis;
+      }
+
       this.logger.warn(
-        `Ya hay un análisis en curso para fieldId=${fieldId} (analysisId=${runningAnalysis.id}); no se dispara uno nuevo.`,
+        `Análisis Procesando stale para fieldId=${fieldId} (analysisId=${runningAnalysis.id}); ` +
+          'se marca Error y se inicia uno nuevo.',
       );
 
-      return runningAnalysis;
+      await this.failStaleAnalysis(runningAnalysis, now);
     }
 
     const fieldInput = await this.fieldsService.getPipelineInput(fieldId);
@@ -508,6 +539,12 @@ export class AnalysisService {
 
       if (analysis) {
         const failedAt = new Date();
+        // OPS-3 (RISK-053): un único summarizeError() para errorMessage Y resultJson.error —
+        // antes resultJson.error tomaba error.message crudo, sin el truncado de 500 caracteres
+        // que sí tenía errorMessage. Ahora ambos campos quedan idénticos y con el mismo límite,
+        // y como PythonWorkerService ya lanza mensajes públicos sanitizados (ver
+        // handleWorkerError), ninguno de los dos puede terminar con detalle interno del Worker.
+        const summarizedError = this.summarizeError(error);
 
         analysis.status = 'Error';
         analysis.failedAt = failedAt;
@@ -515,12 +552,12 @@ export class AnalysisService {
           analysis.startedAt,
           failedAt,
         );
-        analysis.errorMessage = this.summarizeError(error);
+        analysis.errorMessage = summarizedError;
         analysis.category = 'Error al procesar análisis de campo';
         analysis.resultJson = {
           mode: 'error',
           message: 'Error al ejecutar el pipeline de campo.',
-          error: error instanceof Error ? error.message : String(error),
+          error: summarizedError,
           // Sin esto, el frontend no puede distinguir un análisis de campo
           // errado de uno de lote único (isFieldAnalysis se basa en
           // resultJson.fieldId) y el botón "Volver" queda mal armado.
@@ -530,6 +567,59 @@ export class AnalysisService {
         await this.analysisRepository.save(analysis);
       }
     }
+  }
+
+  /**
+   * OPS-1: reconciliador periódico (ver AnalysisReconcileScheduler, @Interval cada 5 min) —
+   * única responsabilidad: 'Procesando' stale → 'Error'. Nunca crea un Analysis nuevo, nunca
+   * llama al Worker, nunca toca ScheduledAnalysisRun. El reconcile ya existente de
+   * scheduled-analysis (ScheduledAnalysisRunnerService.reconcileRun, @Interval cada 2 min) ya
+   * sabe reaccionar a un Analysis que pasó a 'Error' — con esto alcanza para que una corrida
+   * programada atada a un análisis colgado se resuelva sola en el próximo tick, sin que este
+   * método necesite saber nada de schedules/runs.
+   */
+  async reconcileStaleAnalyses(now: Date = new Date()): Promise<void> {
+    const candidates = await this.analysisRepository.find({
+      where: { status: 'Procesando' },
+    });
+
+    for (const analysis of candidates) {
+      if (!isAnalysisStale(analysis, now, ANALYSIS_STALE_THRESHOLD_MS)) {
+        continue;
+      }
+
+      try {
+        await this.failStaleAnalysis(analysis, now);
+
+        this.logger.warn(
+          `[analysis-reconcile] analysisId=${analysis.id} marcado Error por staleness ` +
+            `(Procesando desde ${(analysis.startedAt ?? analysis.createdAt)?.toISOString?.() ?? 'fecha desconocida'}).`,
+        );
+      } catch (error) {
+        this.logger.error(
+          `[analysis-reconcile] Fallo marcando stale analysisId=${analysis.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+  }
+
+  /**
+   * OPS-1: única función que persiste la transición 'Procesando' → 'Error' por staleness — la
+   * llaman tanto el dedupe inline de runFieldAnalysis como reconcileStaleAnalyses, para no
+   * duplicar qué campos se setean. Nunca dispara nada más (ni verdict, ni email, ni Worker).
+   */
+  private async failStaleAnalysis(
+    analysis: Analysis,
+    now: Date,
+  ): Promise<Analysis> {
+    analysis.status = 'Error';
+    analysis.failedAt = now;
+    analysis.durationMs = this.computeDurationMs(analysis.startedAt, now);
+    analysis.errorMessage = ANALYSIS_STALE_ERROR_MESSAGE;
+
+    return this.analysisRepository.save(analysis);
   }
 
   /**

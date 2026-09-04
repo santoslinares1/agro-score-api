@@ -4,6 +4,10 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { LessThanOrEqual, Repository } from 'typeorm';
 
 import { AnalysisService } from '../analysis/analysis.service';
+import {
+  ANALYSIS_STALE_THRESHOLD_MS,
+  isAnalysisStale,
+} from '../analysis/analysis-stale.util';
 import { AnalysisVerdictService } from '../analysis-verdict/analysis-verdict.service';
 import { EmailService } from '../email/email.service';
 import { FieldsService } from '../fields/fields.service';
@@ -152,7 +156,20 @@ export class ScheduledAnalysisRunnerService {
         schedule.userId,
       );
 
-      if (history.some((item) => item.status === 'Procesando')) {
+      const blockingAnalysis = history.find(
+        (item) => item.status === 'Procesando',
+      );
+
+      // OPS-1: un Analysis 'Procesando' stale (isAnalysisStale — misma utilidad que usa
+      // AnalysisService.runFieldAnalysis para su propio dedupe, una sola definición de
+      // "staleness" para ambos) no debe bloquear la corrida para siempre. Este chequeo NUNCA
+      // marca nada como Error por su cuenta — solo decide si bloquear o no; la mutación real la
+      // hace exclusivamente AnalysisService.runFieldAnalysis (llamado más abajo), que vuelve a
+      // evaluar el mismo Analysis con el dato completo (startedAt) antes de tocarlo.
+      if (
+        blockingAnalysis &&
+        !isAnalysisStale(blockingAnalysis, now, ANALYSIS_STALE_THRESHOLD_MS)
+      ) {
         throw new Error(
           'Ya hay un análisis en proceso para este campo. Se reintentará en la próxima ejecución.',
         );

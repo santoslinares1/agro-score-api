@@ -37,6 +37,42 @@ describe('FieldsService', () => {
     ],
   };
 
+  // GEOMETRY-2: fixtures compartidas para el contrato geométrico del piloto (ver
+  // FieldsService.validateLotGeojson). Un solo ring exterior válido en todos los casos base.
+  const exteriorRing = [
+    [-64.1, -31.4],
+    [-64.0, -31.4],
+    [-64.0, -31.3],
+    [-64.1, -31.4],
+  ];
+  const interiorRing = [
+    [-64.08, -31.38],
+    [-64.06, -31.38],
+    [-64.06, -31.36],
+    [-64.08, -31.38],
+  ];
+  const polygonWithHole = { type: 'Polygon', coordinates: [exteriorRing, interiorRing] };
+  const featureWithHole = { type: 'Feature', geometry: polygonWithHole };
+  const multiPolygonGeojson = { type: 'MultiPolygon', coordinates: [[exteriorRing]] };
+  const featureCollectionOnePolygon = {
+    type: 'FeatureCollection',
+    features: [{ type: 'Feature', geometry: { type: 'Polygon', coordinates: [exteriorRing] } }],
+  };
+  const featureCollectionTwoPolygons = {
+    type: 'FeatureCollection',
+    features: [
+      { type: 'Feature', geometry: { type: 'Polygon', coordinates: [exteriorRing] } },
+      { type: 'Feature', geometry: { type: 'Polygon', coordinates: [exteriorRing] } },
+    ],
+  };
+  const ringWithOutOfRangeLongitude = [
+    [200, -31.4],
+    [-64.0, -31.4],
+    [-64.0, -31.3],
+    [200, -31.4],
+  ];
+  const geojsonWithOutOfRangeCoordinate = { type: 'Polygon', coordinates: [ringWithOutOfRangeLongitude] };
+
   const buildField = (overrides: Partial<Field> = {}): Field =>
     ({
       id: 'field-1',
@@ -86,12 +122,14 @@ describe('FieldsService', () => {
   });
 
   describe('create', () => {
+    // GEOMETRY-2: create() ahora valida geometría, así que el fixture base tiene que traer un
+    // Polygon de 1 ring válido (antes usaba geojson: {} porque create() no validaba nada).
     const dto: CreateFieldDto = {
       name: 'Campo A',
       startDate: '2024-01-01',
       endDate: '2024-06-01',
       maxCloudiness: 30,
-      lots: [{ name: 'lote_1', geojson: {}, areaHa: 10 }],
+      lots: [{ name: 'lote_1', geojson: validGeojson, areaHa: 10 }],
     } as CreateFieldDto;
 
     it('asigna el userId recibido por parámetro, nunca uno del body', async () => {
@@ -109,6 +147,101 @@ describe('FieldsService', () => {
 
       const createArg = fieldRepository.create.mock.calls[0][0];
       expect(createArg.userId).toBe('user-A');
+    });
+
+    // GEOMETRY-2 (contrato geométrico del piloto): create() valida CADA lote antes de construir
+    // o persistir cualquier cosa — ni fieldRepository.create ni .save deben llamarse si un solo
+    // lote es incompatible, aunque el resto del Field sea válido.
+
+    it('acepta un Polygon de exactamente 1 ring', async () => {
+      await service.create(dto, 'user-A');
+
+      expect(fieldRepository.save).toHaveBeenCalled();
+    });
+
+    it('rechaza un MultiPolygon con el mensaje público de "un solo polígono por lote"', async () => {
+      const invalidDto = {
+        ...dto,
+        lots: [{ name: 'lote_1', geojson: multiPolygonGeojson, areaHa: 10 }],
+      } as CreateFieldDto;
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toThrow(
+        'AgroScore admite por ahora un solo polígono continuo por lote.',
+      );
+      expect(fieldRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un Polygon con hole (2+ rings) con el mensaje público de áreas internas', async () => {
+      const invalidDto = {
+        ...dto,
+        lots: [{ name: 'lote_1', geojson: polygonWithHole, areaHa: 10 }],
+      } as CreateFieldDto;
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toThrow(
+        'áreas internas excluidas',
+      );
+      expect(fieldRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('no persiste NADA si uno de varios lotes es incompatible (sin creación parcial)', async () => {
+      const multiLotDto = {
+        ...dto,
+        lots: [
+          { name: 'lote_1', geojson: validGeojson, areaHa: 10 },
+          { name: 'lote_2', geojson: multiPolygonGeojson, areaHa: 5 },
+        ],
+      } as CreateFieldDto;
+
+      await expect(service.create(multiLotDto, 'user-A')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(fieldLotRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza coordenadas con longitud fuera de rango antes de persistir', async () => {
+      const invalidDto = {
+        ...dto,
+        lots: [{ name: 'lote_1', geojson: geojsonWithOutOfRangeCoordinate, areaHa: 10 }],
+      } as CreateFieldDto;
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    // RISK-052: startDate/endDate representan un rango real — igualdad e inversión se rechazan
+    // antes de tocar los repositorios, ni fieldLotRepository ni fieldRepository deben llamarse.
+    it('rechaza startDate === endDate antes de persistir', async () => {
+      const invalidDto = { ...dto, startDate: '2024-06-01', endDate: '2024-06-01' };
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(fieldRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza startDate > endDate antes de persistir', async () => {
+      const invalidDto = { ...dto, startDate: '2024-06-02', endDate: '2024-06-01' };
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(fieldRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('persiste normalmente si startDate < endDate', async () => {
+      await service.create(dto, 'user-A');
+
+      expect(fieldRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ startDate: '2024-01-01', endDate: '2024-06-01' }),
+      );
     });
   });
 
@@ -167,6 +300,72 @@ describe('FieldsService', () => {
       await service.update('field-1', { name: 'Nuevo nombre' }, 'user-A');
 
       expect(fieldRepository.update).toHaveBeenCalledWith('field-1', { name: 'Nuevo nombre' });
+    });
+
+    // RISK-052: el Field persistido siempre tiene startDate='2024-01-01'/endDate='2024-06-01'
+    // (ver buildField) — estos tests validan el PAR RESULTANTE de combinar el PATCH con eso,
+    // no solo lo que trae el DTO.
+
+    it('rechaza un PATCH con ambas fechas inválidas entre sí', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.update('field-1', { startDate: '2024-06-01', endDate: '2024-06-01' }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(fieldRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un PATCH que solo trae startDate si invalida contra el endDate ya persistido', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.update('field-1', { startDate: '2027-01-01' }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(fieldRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un PATCH que solo trae endDate si invalida contra el startDate ya persistido', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.update('field-1', { endDate: '2023-12-31' }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(fieldRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('acepta un PATCH que solo trae startDate si sigue siendo anterior al endDate persistido', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await service.update('field-1', { startDate: '2024-02-01' }, 'user-A');
+
+      expect(fieldRepository.update).toHaveBeenCalledWith('field-1', { startDate: '2024-02-01' });
+    });
+
+    it('acepta un PATCH que solo trae endDate si sigue siendo posterior al startDate persistido', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await service.update('field-1', { endDate: '2024-12-31' }, 'user-A');
+
+      expect(fieldRepository.update).toHaveBeenCalledWith('field-1', { endDate: '2024-12-31' });
+    });
+
+    it('un PATCH sin fechas no se ve afectado por un rango histórico ya inválido', async () => {
+      fieldRepository.findOne.mockResolvedValue(
+        buildField({ userId: 'user-A', startDate: '2024-06-01', endDate: '2024-01-01' }),
+      );
+
+      await service.update('field-1', { name: 'Nuevo nombre' }, 'user-A');
+
+      expect(fieldRepository.update).toHaveBeenCalledWith('field-1', { name: 'Nuevo nombre' });
+    });
+
+    it('resuelve ownership antes de validar fechas: un PATCH inválido de otro usuario sigue dando NotFoundException', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.update('field-1', { startDate: '2024-06-01', endDate: '2024-06-01' }, 'user-B'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(fieldRepository.update).not.toHaveBeenCalled();
     });
   });
 
@@ -238,6 +437,28 @@ describe('FieldsService', () => {
       expect(fieldLotRepository.update).not.toHaveBeenCalled();
     });
 
+    it('rechaza MultiPolygon al reemplazar la geometría de un lote', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+      fieldLotRepository.findOne.mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' });
+
+      await expect(
+        service.updateLot('field-1', 'lot-1', { geojson: multiPolygonGeojson }, 'user-A'),
+      ).rejects.toThrow('AgroScore admite por ahora un solo polígono continuo por lote.');
+
+      expect(fieldLotRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un Polygon con hole al reemplazar la geometría de un lote', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+      fieldLotRepository.findOne.mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' });
+
+      await expect(
+        service.updateLot('field-1', 'lot-1', { geojson: featureWithHole }, 'user-A'),
+      ).rejects.toThrow('áreas internas excluidas');
+
+      expect(fieldLotRepository.update).not.toHaveBeenCalled();
+    });
+
     it('recalcula totalAreaHa cuando cambia areaHa', async () => {
       fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
       fieldLotRepository.findOne
@@ -289,6 +510,57 @@ describe('FieldsService', () => {
 
       await expect(
         service.createLot('field-1', { ...dto, geojson: { type: 'Point' } }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(fieldLotRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza MultiPolygon con el mensaje público de "un solo polígono por lote"', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.createLot('field-1', { ...dto, geojson: multiPolygonGeojson }, 'user-A'),
+      ).rejects.toThrow('AgroScore admite por ahora un solo polígono continuo por lote.');
+
+      expect(fieldLotRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('acepta una FeatureCollection con exactamente 1 Feature<Polygon>', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+      fieldLotRepository.find.mockResolvedValueOnce([]).mockResolvedValueOnce([{ areaHa: 30 }]);
+
+      await service.createLot(
+        'field-1',
+        { ...dto, geojson: featureCollectionOnePolygon },
+        'user-A',
+      );
+
+      expect(fieldLotRepository.save).toHaveBeenCalled();
+    });
+
+    it('rechaza una FeatureCollection con 2 features Polygon, sin elegir la primera en silencio', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.createLot(
+          'field-1',
+          { ...dto, geojson: featureCollectionTwoPolygons },
+          'user-A',
+        ),
+      ).rejects.toThrow('AgroScore admite por ahora un solo polígono continuo por lote.');
+
+      expect(fieldLotRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza coordenadas con latitud fuera de rango', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.createLot(
+          'field-1',
+          { ...dto, geojson: geojsonWithOutOfRangeCoordinate },
+          'user-A',
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
 
       expect(fieldLotRepository.save).not.toHaveBeenCalled();

@@ -590,6 +590,73 @@ describe('ScheduledAnalysisRunnerService', () => {
       expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
     });
 
+    it('OPS-1: un Analysis Procesando stale (más de 20 min) NO bloquea triggerRun — se dispara la corrida', async () => {
+      const schedule = buildSchedule();
+      const now = new Date('2026-08-24T12:00:00Z');
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.findByField.mockResolvedValue([
+        buildAnalysisSummary({
+          id: 'stale-analysis-1',
+          status: 'Procesando',
+          createdAt: new Date(now.getTime() - 25 * 60 * 1000),
+        }),
+      ]);
+      analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
+
+      const run = await service.triggerRun(schedule, now);
+
+      expect(analysisService.runFieldAnalysis).toHaveBeenCalledTimes(1);
+      expect(run.status).toBe('processing');
+    });
+
+    it('OPS-1: triggerRun nunca marca el Analysis stale como Error por su cuenta — esa autoridad es de AnalysisService', async () => {
+      const schedule = buildSchedule();
+      const now = new Date('2026-08-24T12:00:00Z');
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.findByField.mockResolvedValue([
+        buildAnalysisSummary({
+          id: 'stale-analysis-1',
+          status: 'Procesando',
+          createdAt: new Date(now.getTime() - 25 * 60 * 1000),
+        }),
+      ]);
+      analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
+
+      await service.triggerRun(schedule, now);
+
+      // ScheduledAnalysisRunnerService no tiene ningún repositorio de Analysis inyectado — la
+      // única forma de que el stale se resuelva es que runFieldAnalysis (mockeado acá) lo haga
+      // internamente. Este test documenta esa separación de responsabilidad explícitamente.
+      expect(analysisService.runFieldAnalysis).toHaveBeenCalledWith(
+        'field-1',
+        expect.anything(),
+        'user-A',
+      );
+    });
+
+    it('un Analysis Procesando reciente sigue bloqueando triggerRun (comportamiento actual sin cambios)', async () => {
+      const schedule = buildSchedule();
+      const now = new Date('2026-08-24T12:00:00Z');
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.findByField.mockResolvedValue([
+        buildAnalysisSummary({
+          status: 'Procesando',
+          createdAt: new Date(now.getTime() - 2 * 60 * 1000),
+        }),
+      ]);
+
+      const run = await service.triggerRun(schedule, now);
+
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+      expect(run.status).toBe('failed');
+      expect(run.errorMessage).toContain(
+        'Ya hay un análisis en proceso para este campo',
+      );
+    });
+
     it('FIX: si un análisis manual normal existe pero NO está Procesando, el scheduled run sí se dispara', async () => {
       const schedule = buildSchedule();
       runRepository.findOne.mockResolvedValue(null);

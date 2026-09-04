@@ -15,6 +15,8 @@ import {
 
 import { Type } from 'class-transformer';
 
+import { MAX_ANALYSIS_CLOUDINESS } from '../../analysis/analysis-constraints';
+
 export class CreateFieldLotDto {
   @IsString()
   name: string;
@@ -70,9 +72,16 @@ export class CreateFieldDto {
   @IsDateString()
   endDate: string;
 
+  /**
+   * OPS-2: tope alineado a MAX_ANALYSIS_CLOUDINESS — este valor viaja tal cual a
+   * scheduled-analysis (ScheduledAnalysisRunnerService.triggerRun usa field.maxCloudiness
+   * directo, sin volver a pasar por RunFieldAnalysisDto), así que un Field persistido con
+   * maxCloudiness > 80 rompería el Worker en cada corrida semanal automática, no solo en el
+   * análisis manual. UpdateFieldDto hereda este mismo límite (PartialType de este DTO).
+   */
   @IsInt()
   @Min(0)
-  @Max(100)
+  @Max(MAX_ANALYSIS_CLOUDINESS)
   maxCloudiness: number;
 
   @IsArray()

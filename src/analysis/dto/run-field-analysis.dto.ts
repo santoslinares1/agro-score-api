@@ -9,6 +9,8 @@ import {
   Min,
 } from 'class-validator';
 
+import { MAX_ANALYSIS_CLOUDINESS } from '../analysis-constraints';
+
 export class RunFieldAnalysisDto {
   @IsDateString()
   startDate: string;
@@ -16,9 +18,14 @@ export class RunFieldAnalysisDto {
   @IsDateString()
   endDate: string;
 
+  /**
+   * OPS-2: tope alineado a MAX_ANALYSIS_CLOUDINESS (lo que el Worker acepta hoy por default,
+   * ver analysis-constraints.ts) — antes era 100, lo que permitía crear un Analysis=Procesando
+   * que el Worker siempre terminaba rechazando con 81..100 (RISK-004).
+   */
   @IsInt()
   @Min(0)
-  @Max(100)
+  @Max(MAX_ANALYSIS_CLOUDINESS)
   maxCloudiness: number;
 
   /**

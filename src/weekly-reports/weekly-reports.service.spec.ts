@@ -1,4 +1,4 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 import { LessThan } from 'typeorm';
@@ -387,6 +387,87 @@ describe('WeeklyReportsService', () => {
       );
     });
 
+    it('trunca unavailableReason si el worker manda un motivo excepcionalmente largo (red defensiva, RISK-022)', async () => {
+      const longReason = 'X'.repeat(600);
+      const result: WeeklyReportWorkerResult = {
+        ...workerResultBase,
+        lots: [
+          {
+            lotId: 'lot-1',
+            lotName: 'Lote 1',
+            index: 'NDVI',
+            experimental: false,
+            available: false,
+            weekAnchorDate: '2026-08-19',
+            imageDate: null,
+            cloudPct: null,
+            scaleM: 10,
+            scaleWarning: null,
+            stats: null,
+            deltaVsPrevious: null,
+            notes: [longReason],
+          },
+        ],
+      };
+
+      await (service as any).persistResult('report-1', 'field-1', result);
+
+      const [[savedObservations]] = observationRepository.save.mock.calls;
+      const [saved] = savedObservations as [{ unavailableReason: string; metadata: unknown }];
+
+      expect(saved.unavailableReason.length).toBeLessThan(longReason.length);
+      expect(saved.unavailableReason.endsWith('…')).toBe(true);
+      // El truncado es solo defensivo por longitud: metadata.notes conserva el contenido
+      // sanitizado tal cual lo mandó el Worker (ver comentario en persistResult).
+      expect((saved.metadata as { notes: string[] }).notes).toEqual([longReason]);
+    });
+
+    it('deja intacto un unavailableReason corto y legítimo (no trunca de más)', async () => {
+      const shortReason = 'No se pudo calcular este índice para el lote.';
+      const result: WeeklyReportWorkerResult = {
+        ...workerResultBase,
+        lots: [
+          {
+            lotId: 'lot-1',
+            lotName: 'Lote 1',
+            index: 'NDVI',
+            experimental: false,
+            available: false,
+            weekAnchorDate: '2026-08-19',
+            imageDate: null,
+            cloudPct: null,
+            scaleM: 10,
+            scaleWarning: null,
+            stats: null,
+            deltaVsPrevious: null,
+            notes: [shortReason],
+          },
+        ],
+      };
+
+      await (service as any).persistResult('report-1', 'field-1', result);
+
+      expect(observationRepository.save).toHaveBeenCalledWith([
+        expect.objectContaining({ unavailableReason: shortReason }),
+      ]);
+    });
+
+    it('trunca cada elemento de warnings si el worker manda alguno excepcionalmente largo', async () => {
+      const longWarning = 'Y'.repeat(600);
+      const result: WeeklyReportWorkerResult = {
+        ...workerResultBase,
+        warnings: [longWarning, 'aviso corto'],
+      };
+
+      await (service as any).persistResult('report-1', 'field-1', result);
+
+      const [, updatePayload] = weeklyReportRepository.update.mock.calls[0] as [string, { warnings: string[] }];
+
+      expect(updatePayload.warnings[0].length).toBeLessThan(longWarning.length);
+      expect(updatePayload.warnings[0].endsWith('…')).toBe(true);
+      expect(updatePayload.warnings[1]).toBe('aviso corto');
+    });
+
     it('marca el reporte failed si el worker rechaza la promesa, sin inventar observaciones', async () => {
       const field = buildField();
       pythonWorkerService.runWeeklyReport.mockRejectedValue(new Error('No se pudo conectar con el worker Python.'));
@@ -405,6 +486,35 @@ describe('WeeklyReportsService', () => {
         expect.objectContaining({
           status: 'failed',
           errorMessage: 'No se pudo conectar con el worker Python.',
+        }),
+      );
+    });
+
+    // OPS-3 (RISK-053): WeeklyFieldReport.errorMessage se muestra DIRECTO al productor
+    // (weekly-monitoring-panel.component.html en agro-score-web) — este test confirma que el
+    // mensaje público ya sanitizado que ahora lanza PythonWorkerService.handleWorkerError llega
+    // intacto acá, sin que WeeklyReportsService le agregue ni le saque nada.
+    it('persiste el mensaje público sanitizado del Worker en errorMessage, sin alterarlo', async () => {
+      const field = buildField();
+      const safeMessage =
+        'El motor de análisis no está disponible temporalmente.';
+      pythonWorkerService.runWeeklyReport.mockRejectedValue(
+        new ServiceUnavailableException(safeMessage),
+      );
+
+      await (service as any).processInBackground('report-1', field, field.lots, {
+        campaignStart: '2025-10-01',
+        campaignEnd: null,
+        targetDate: '2026-08-21',
+        indices: ['NDVI', 'NDMI'],
+        includeNdreExperimental: false,
+      });
+
+      expect(weeklyReportRepository.update).toHaveBeenCalledWith(
+        'report-1',
+        expect.objectContaining({
+          status: 'failed',
+          errorMessage: safeMessage,
         }),
       );
     });

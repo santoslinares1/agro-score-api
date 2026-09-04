@@ -1,5 +1,6 @@
 import { HttpService } from '@nestjs/axios';
 import {
+  BadRequestException,
   Injectable,
   Logger,
   ServiceUnavailableException,
@@ -8,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import { AxiosError } from 'axios';
 import { firstValueFrom } from 'rxjs';
 
+import { MAX_ANALYSIS_CLOUDINESS } from '../analysis/analysis-constraints';
 import {
   PipelineInput,
   WeeklyReportWorkerInput,
@@ -62,6 +64,13 @@ type FieldWorkerInput = {
     includeInProductivityClassification: boolean;
   }>;
 };
+
+/**
+ * OPS-3 (RISK-053): distingue en logs/mensajes de qué llamada al Worker viene el fallo —
+ * postToWorker() (/analyze) o runWeeklyReport() (/weekly-report/spike). No cambia los mensajes
+ * públicos (son los mismos para ambas, ver handleWorkerError), solo el contexto que se loguea.
+ */
+type WorkerOperation = 'analyze' | 'weekly-report';
 
 /**
  * NDVI y NDMI son los índices base del producto: siempre viajan al worker,
@@ -153,25 +162,94 @@ export class PythonWorkerService {
 
       return response.data;
     } catch (error) {
-      const axiosError = error as AxiosError;
-      const status = axiosError?.response?.status;
-      const isTimeout = axiosError?.code === 'ECONNABORTED';
-      const reason = isTimeout
-        ? 'timeout'
-        : status
-          ? `http ${status}`
-          : 'network/unreachable';
+      this.handleWorkerError(error, 'analyze');
+    }
+  }
 
-      this.logger.error(
-        `Python worker call failed (${reason}): ${JSON.stringify(
-          axiosError?.response?.data ?? axiosError?.message ?? error,
-        )}`,
-      );
+  /**
+   * OPS-3 (RISK-053): única función que traduce cualquier fallo de la llamada HTTP al Worker
+   * (postToWorker / runWeeklyReport, antes cada una con su propio catch duplicado) en una
+   * excepción NestJS con mensaje público seguro. El detalle técnico completo (status, código de
+   * Axios, body del Worker, mensaje crudo de Axios) se loguea acá — nunca en el mensaje de la
+   * excepción, porque eso es lo que AnalysisService/WeeklyReportsService terminan persistiendo
+   * casi tal cual en Analysis.errorMessage/resultJson.error y WeeklyFieldReport.errorMessage
+   * (este último ya se muestra directo al productor, ver weekly-monitoring-panel.component.html
+   * en agro-score-web — no se toca en esta ficha, pero el mensaje que le llega sí tiene que ser
+   * seguro para esa audiencia).
+   *
+   * Clasificación (verificada contra agro-score-worker/app/main.py y limits.py):
+   * - 400: `PayloadValidationError` del Worker — límite de negocio (lots, coordenadas, fechas,
+   *   cloudiness). El Worker ya sanitiza su `detail`, pero igual no lo propagamos: puede nombrar
+   *   campos internos del payload (`max_cloud_pct`, `campaign_start`, etc.) que no aportan nada
+   *   útil al usuario y sí exponen forma interna del contrato.
+   * - 422: rechazo automático de FastAPI/Pydantic por shape del payload — `detail` viene como
+   *   array de objetos `{loc, msg, type}`, nunca como string; no debe serializarse en el mensaje
+   *   público bajo ningún concepto.
+   * - 5xx: el Worker fue alcanzado pero falló procesando (Earth Engine, bug interno). Su `detail`
+   *   ya es un mensaje genérico sanitizado (el traceback real solo queda en el log del Worker),
+   *   pero igual usamos nuestro propio mensaje para no depender de la redacción del otro repo.
+   * - timeout (`ECONNABORTED`): la llamada superó el timeout configurado (sin cambios acá).
+   * - sin `response` y sin timeout (ECONNREFUSED/ENOTFOUND/DNS/etc.) o cualquier otro status
+   *   inesperado: Worker realmente no alcanzable — nunca `error.message` de Axios acá, puede
+   *   contener IP/puerto/hostname del Worker (`"connect ECONNREFUSED 127.0.0.1:8000"`).
+   */
+  private handleWorkerError(error: unknown, operation: WorkerOperation): never {
+    const axiosError = error as AxiosError<{ detail?: unknown }>;
+    const status = axiosError?.response?.status;
+    const isTimeout = axiosError?.code === 'ECONNABORTED';
 
-      throw new ServiceUnavailableException(
-        'No se pudo conectar con el worker Python.',
+    this.logger.error(
+      `Worker call failed (operation=${operation}): ${JSON.stringify(
+        this.buildWorkerErrorLogContext(axiosError),
+      )}`,
+    );
+
+    if (status === 400) {
+      throw new BadRequestException(
+        'Los parámetros enviados al motor de análisis no son válidos.',
       );
     }
+
+    if (status === 422) {
+      throw new BadRequestException(
+        'El motor de análisis rechazó el formato de los datos enviados.',
+      );
+    }
+
+    if (status !== undefined && status >= 500) {
+      throw new ServiceUnavailableException(
+        'El motor de análisis no pudo completar la operación.',
+      );
+    }
+
+    if (isTimeout) {
+      throw new ServiceUnavailableException(
+        'El motor de análisis excedió el tiempo máximo de respuesta.',
+      );
+    }
+
+    // Sin response y sin timeout (red/DNS/connection refused), o cualquier status 4xx que el
+    // contrato actual del Worker no debería producir (401/403/404/etc.) — se trata igual como
+    // indisponibilidad general, nunca como "parámetros inválidos".
+    throw new ServiceUnavailableException(
+      'El motor de análisis no está disponible temporalmente.',
+    );
+  }
+
+  /**
+   * OPS-3: objeto reducido y controlado para el log — nunca el AxiosError completo (que incluye
+   * `config`/`request` con headers, y podría incluir Authorization si alguna vez se agrega auth
+   * service-to-service). Solo lo mínimo útil para diagnóstico interno.
+   */
+  private buildWorkerErrorLogContext(
+    axiosError: AxiosError<{ detail?: unknown }>,
+  ): Record<string, unknown> {
+    return {
+      code: axiosError?.code ?? null,
+      status: axiosError?.response?.status ?? null,
+      responseData: axiosError?.response?.data ?? null,
+      message: axiosError?.message ?? null,
+    };
   }
 
   /**
@@ -215,7 +293,7 @@ export class PythonWorkerService {
       // todavía, así que siempre manda la base NDVI/NDMI.
       indices: this.normalizeIndices(),
 
-      max_cloud_pct: input.maxCloudiness ?? 20,
+      max_cloud_pct: this.clampMaxCloudiness(input.maxCloudiness, 20),
 
       scale: 10,
 
@@ -367,6 +445,24 @@ export class PythonWorkerService {
       Math.max(MIN_MAX_ZONE_CAMPAIGNS, Math.round(value)),
     );
   }
+
+  /**
+   * OPS-2: normalización defensiva, NO sustituto de la validación pública. RunFieldAnalysisDto y
+   * CreateFieldDto ya rechazan (@Max(MAX_ANALYSIS_CLOUDINESS)) cualquier valor nuevo por encima
+   * del límite antes de llegar acá — esto solo protege contra un `Field.maxCloudiness` persistido
+   * antes de ese fix (o cualquier caller interno futuro que no pase por esas DTOs), para que no
+   * rompa el Worker en cada corrida de scheduled-analysis. `undefined` conserva el default propio
+   * del flujo que llama (20 legacy de lote único, 30 de campo) — no hay dato inválido que acotar
+   * en ese caso.
+   */
+  private clampMaxCloudiness(value: number | undefined, fallback: number): number {
+    if (value === undefined || value === null || Number.isNaN(value)) {
+      return fallback;
+    }
+
+    return Math.min(MAX_ANALYSIS_CLOUDINESS, Math.max(0, value));
+  }
+
   private mapFieldInputToWorkerPayload(
     input: FieldWorkerInput,
   ): NewWorkerPayload {
@@ -401,7 +497,7 @@ export class PythonWorkerService {
       // extras arriba de esa base.
       indices: this.normalizeIndices(input.indices),
 
-      max_cloud_pct: input.maxCloudiness ?? 30,
+      max_cloud_pct: this.clampMaxCloudiness(input.maxCloudiness, 30),
 
       scale: 10,
 
@@ -507,24 +603,7 @@ export class PythonWorkerService {
 
       return response.data;
     } catch (error) {
-      const axiosError = error as AxiosError;
-      const status = axiosError?.response?.status;
-      const isTimeout = axiosError?.code === 'ECONNABORTED';
-      const reason = isTimeout
-        ? 'timeout'
-        : status
-          ? `http ${status}`
-          : 'network/unreachable';
-
-      this.logger.error(
-        `Python worker weekly-report call failed (${reason}): ${JSON.stringify(
-          axiosError?.response?.data ?? axiosError?.message ?? error,
-        )}`,
-      );
-
-      throw new ServiceUnavailableException(
-        'No se pudo conectar con el worker Python para el seguimiento semanal.',
-      );
+      this.handleWorkerError(error, 'weekly-report');
     }
   }
 }

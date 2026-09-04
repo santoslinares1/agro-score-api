@@ -284,6 +284,7 @@ export class WeeklyReportsService {
     for (const lotObservation of result.lots) {
       const delta = await this.resolveDelta(fieldId, lotObservation);
       const notes = lotObservation.notes ?? [];
+      const rawUnavailableReason = lotObservation.available ? null : (notes[0] ?? null);
 
       observations.push(
         this.observationRepository.create({
@@ -305,7 +306,11 @@ export class WeeklyReportsService {
           validPixelCount: lotObservation.stats?.validPixelCount ?? null,
           deltaVsPrevious: delta,
           deltaDirection: computeDeltaDirection(delta),
-          unavailableReason: lotObservation.available ? null : (notes[0] ?? null),
+          // RISK-022: la sanitización principal vive en el Worker (weekly.py) — esto es solo un
+          // truncado defensivo por longitud, no reemplaza esa sanitización. Ver truncatePublicText.
+          unavailableReason: rawUnavailableReason ? this.truncatePublicText(rawUnavailableReason) : null,
+          // metadata.notes conserva el array completo tal cual lo manda el Worker: una vez
+          // sanitizado en origen, este campo queda seguro automáticamente sin tocarlo acá.
           metadata:
             notes.length || lotObservation.scaleWarning
               ? { notes, scaleWarning: lotObservation.scaleWarning }
@@ -321,7 +326,9 @@ export class WeeklyReportsService {
     await this.weeklyReportRepository.update(reportId, {
       status: 'completed',
       completedAt: new Date(),
-      warnings: result.warnings?.length ? result.warnings : null,
+      warnings: result.warnings?.length
+        ? result.warnings.map((warning) => this.truncatePublicText(warning))
+        : null,
       errorMessage: null,
     });
   }
@@ -372,10 +379,20 @@ export class WeeklyReportsService {
     await this.weeklyReportRepository.update(reportId, {
       status: 'failed',
       failedAt: new Date(),
-      errorMessage:
-        message.length > ERROR_MESSAGE_MAX_LENGTH
-          ? `${message.slice(0, ERROR_MESSAGE_MAX_LENGTH)}…`
-          : message,
+      errorMessage: this.truncatePublicText(message),
     });
+  }
+
+  /**
+   * Truncado defensivo para texto persistido y expuesto al usuario (errorMessage,
+   * unavailableReason, warnings). NO es la sanitización principal de RISK-022 — esa vive en el
+   * origen, en agro-score-worker/app/pipeline/weekly.py — es solo una red de seguridad ante un
+   * futuro cambio del Worker que reintroduzca contenido largo o crudo. Mismo límite que
+   * AnalysisService.summarizeError() para Analysis.errorMessage.
+   */
+  private truncatePublicText(text: string): string {
+    return text.length > ERROR_MESSAGE_MAX_LENGTH
+      ? `${text.slice(0, ERROR_MESSAGE_MAX_LENGTH)}…`
+      : text;
   }
 }

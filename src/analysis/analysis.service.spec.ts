@@ -1,4 +1,4 @@
-import { NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 
@@ -751,6 +751,261 @@ describe('AnalysisService', () => {
       await runAnalysisAndFlush();
 
       expect(analysisVerdictService.generateAndPersist).not.toHaveBeenCalled();
+    });
+
+    // OPS-3 (RISK-053): PythonWorkerService ahora lanza mensajes públicos ya sanitizados (ver
+    // PythonWorkerService.handleWorkerError) — este test confirma que AnalysisService los
+    // persiste intactos (ni los reescribe ni los trunca de más) y, sobre todo, que
+    // resultJson.error queda con el mismo valor que errorMessage — antes tomaba error.message
+    // crudo sin el truncado de summarizeError().
+    it('persiste el mensaje público del Worker intacto en errorMessage Y en resultJson.error (mismo valor)', async () => {
+      const safeMessage =
+        'Los parámetros enviados al motor de análisis no son válidos.';
+      pythonWorkerService.runFieldAnalysis.mockRejectedValue(
+        new BadRequestException(safeMessage),
+      );
+
+      await runAnalysisAndFlush();
+
+      const errorSaveCall = analysisRepository.save.mock.calls.find(
+        ([entity]) => entity.status === 'Error',
+      );
+      expect(errorSaveCall).toBeDefined();
+      const [savedAnalysis] = errorSaveCall as [any];
+
+      expect(savedAnalysis.errorMessage).toBe(safeMessage);
+      expect(savedAnalysis.resultJson.error).toBe(safeMessage);
+      expect(savedAnalysis.errorMessage).toBe(savedAnalysis.resultJson.error);
+    });
+  });
+
+  describe('runFieldAnalysis — validación de rango de fechas (OPS-2)', () => {
+    it('rechaza startDate === endDate con BadRequestException, sin llegar a consultar el dedupe', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate: '2024-01-01', endDate: '2024-01-01', maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toThrow(
+        'La fecha de inicio debe ser estrictamente anterior a la fecha de fin.',
+      );
+
+      expect(analysisRepository.findOne).not.toHaveBeenCalled();
+    });
+
+    it('sigue rechazando startDate > endDate (comportamiento previo, sin regresión)', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate: '2024-06-01', endDate: '2024-01-01', maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(analysisRepository.findOne).not.toHaveBeenCalled();
+    });
+
+    it('startDate < endDate sigue creando el Analysis con normalidad', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue({
+        fieldId: 'field-1',
+        name: 'Campo A',
+        lots: [
+          {
+            id: 'lot-1',
+            name: 'Lote 1',
+            geojson: {},
+            areaHa: 10,
+            includeInProductivityClassification: true,
+          },
+        ],
+      } as any);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toBeDefined();
+      expect(analysisRepository.save).toHaveBeenCalled();
+    });
+  });
+
+  describe('runFieldAnalysis — dedupe de Procesando (OPS-1: stale vs. fresco)', () => {
+    const buildFieldInput = () => ({
+      fieldId: 'field-1',
+      name: 'Campo A',
+      lots: [
+        {
+          id: 'lot-1',
+          name: 'Lote 1',
+          geojson: {},
+          areaHa: 10,
+          includeInProductivityClassification: true,
+        },
+      ],
+    });
+
+    const minimalWorkerResult = {
+      globalScore: 60,
+      category: 'Media aptitud productiva',
+      confidenceScore: 50,
+      productivityScore: 50,
+      stabilityScore: 50,
+      soilScore: 0,
+      climateScore: 0,
+      ndviAverageMax: 0.5,
+      ndviVariability: 'Media' as const,
+      zonesDetected: 1,
+      resultJson: { mode: 'python-worker-v2' as const, message: '' },
+    };
+
+    const STALE_MINUTES = 25; // > ANALYSIS_STALE_THRESHOLD_MS (20 min)
+    const FRESH_MINUTES = 5;
+
+    it('Procesando fresco: devuelve el existente sin marcarlo Error ni crear uno nuevo (dedupe actual sin cambios)', async () => {
+      const freshAnalysis = buildAnalysis({
+        id: 'fresh-analysis-1',
+        status: 'Procesando',
+        startedAt: new Date(Date.now() - FRESH_MINUTES * 60 * 1000),
+      });
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisRepository.findOne.mockResolvedValueOnce(freshAnalysis);
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toBe(freshAnalysis);
+      expect(analysisRepository.save).not.toHaveBeenCalled();
+      expect(fieldsService.getPipelineInput).not.toHaveBeenCalled();
+    });
+
+    it('Procesando stale (más de 20 min): lo marca Error y crea un Analysis nuevo en la misma request', async () => {
+      const staleAnalysis = buildAnalysis({
+        id: 'stale-analysis-1',
+        status: 'Procesando',
+        startedAt: new Date(Date.now() - STALE_MINUTES * 60 * 1000),
+      });
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(
+        buildFieldInput() as any,
+      );
+      analysisRepository.findOne
+        .mockResolvedValueOnce(staleAnalysis) // dedupe: encuentra el stale
+        .mockResolvedValueOnce(
+          buildAnalysis({
+            id: 'analysis-1',
+            status: 'Procesando',
+            startedAt: new Date(),
+          }),
+        ); // this.findOne(analysisId) dentro de processFieldAnalysisInBackground, del nuevo
+      pythonWorkerService.runFieldAnalysis.mockResolvedValue(
+        minimalWorkerResult as any,
+      );
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+        'user-A',
+      );
+      await flushBackgroundWork();
+
+      // El viejo quedó marcado Error con el mensaje fijo de staleness.
+      expect(analysisRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'stale-analysis-1',
+          status: 'Error',
+          errorMessage:
+            'El análisis superó el tiempo máximo de procesamiento y fue marcado automáticamente como Error.',
+        }),
+      );
+
+      // Se creó y se devolvió un Analysis nuevo, no el viejo.
+      expect(fieldsService.getPipelineInput).toHaveBeenCalledWith('field-1');
+      expect(result.id).not.toBe('stale-analysis-1');
+    });
+  });
+
+  describe('reconcileStaleAnalyses (OPS-1)', () => {
+    const now = new Date('2026-01-01T12:00:00Z');
+    const minutesAgo = (minutes: number) =>
+      new Date(now.getTime() - minutes * 60 * 1000);
+
+    it('consulta solo Analysis con status Procesando', async () => {
+      analysisRepository.find.mockResolvedValue([]);
+
+      await service.reconcileStaleAnalyses(now);
+
+      expect(analysisRepository.find).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { status: 'Procesando' } }),
+      );
+    });
+
+    it('marca Error los Analysis Procesando que superaron el umbral de staleness', async () => {
+      const stale = buildAnalysis({
+        id: 'stale-1',
+        status: 'Procesando',
+        startedAt: minutesAgo(25),
+      });
+      analysisRepository.find.mockResolvedValue([stale]);
+
+      await service.reconcileStaleAnalyses(now);
+
+      expect(analysisRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'stale-1',
+          status: 'Error',
+          failedAt: now,
+          errorMessage:
+            'El análisis superó el tiempo máximo de procesamiento y fue marcado automáticamente como Error.',
+        }),
+      );
+    });
+
+    it('no toca un Analysis Procesando reciente', async () => {
+      const fresh = buildAnalysis({
+        id: 'fresh-1',
+        status: 'Procesando',
+        startedAt: minutesAgo(5),
+      });
+      analysisRepository.find.mockResolvedValue([fresh]);
+
+      await service.reconcileStaleAnalyses(now);
+
+      expect(analysisRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('un fallo al marcar uno como Error no frena la reconciliación de los demás', async () => {
+      const broken = buildAnalysis({
+        id: 'broken-1',
+        status: 'Procesando',
+        startedAt: minutesAgo(25),
+      });
+      const healthy = buildAnalysis({
+        id: 'healthy-1',
+        status: 'Procesando',
+        startedAt: minutesAgo(30),
+      });
+      analysisRepository.find.mockResolvedValue([broken, healthy]);
+      analysisRepository.save
+        .mockRejectedValueOnce(new Error('DB caída'))
+        .mockResolvedValueOnce({ id: 'healthy-1', status: 'Error' });
+
+      await expect(
+        service.reconcileStaleAnalyses(now),
+      ).resolves.toBeUndefined();
+
+      expect(analysisRepository.save).toHaveBeenCalledTimes(2);
     });
   });
 });
