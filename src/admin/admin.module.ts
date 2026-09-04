@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
+import { AnalysisVerdictModule } from '../analysis-verdict/analysis-verdict.module';
 import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
 import { AuditLogModule } from '../audit-log/audit-log.module';
 import { EmailModule } from '../email/email.module';
@@ -59,6 +60,13 @@ import { AdminService } from './admin.service';
  * findResponseByAnalysisId no servía porque el shape público omite errorMessage, ver PR 13A),
  * WeeklyTechnicalVerdictResponse ya incluye errorMessage por diseño desde PR 16B — no hay motivo
  * real para duplicar la query/el mapeo entidad→DTO que el servicio ya resuelve.
+ *
+ * PR 17: AnalysisVerdictModule es la SEGUNDA excepción, por el mismo motivo que weeklyTechnicalVerdict
+ * arriba — AdminService.retryTechnicalVerdict necesita ejecutar una generación real (nunca solo
+ * leer), y esa lógica (resolver provider, guardar 'generated'/'failed', ser idempotente por
+ * analysisId) ya vive completa y testeada en AnalysisVerdictService.generateAndPersist. Reinventarla
+ * acá con el repositorio directo (como si fuera solo lectura, PR 13A) duplicaría exactamente el
+ * código que este PR necesita reusar sin tocar.
  */
 @Module({
   imports: [
@@ -67,6 +75,7 @@ import { AdminService } from './admin.service';
     AuditLogModule,
     EmailModule,
     WeeklyTechnicalVerdictModule,
+    AnalysisVerdictModule,
     TypeOrmModule.forFeature([
       Field,
       FieldLot,

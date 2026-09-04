@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 
 import { VerdictGeneratorInput } from '../analysis-verdict-generator.util';
+import { VerdictSafetyValidationReason } from './claude-output.validator';
 
 /**
  * PR 11B: bump esta constante cada vez que cambie el system prompt o el schema de la tool
@@ -15,8 +16,17 @@ import { VerdictGeneratorInput } from '../analysis-verdict-generator.util';
  * siendo el mismo: solo cambia cómo se redacta el texto, no qué campos devuelve Claude. Los
  * veredictos ya persistidos con promptVersion="technical-verdict-v1" no se regeneran — quedan
  * identificables contra la política de redacción vieja.
+ *
+ * PR 17: v1.1 → v1.2. Tampoco cambia el contrato/schema de la tool, ni las reglas de contenido de
+ * buildSystemPrompt (siguen siendo exactamente las mismas — no se relajó ninguna). Lo que cambia
+ * es el comportamiento efectivo de prompting: cuando el intento 1 es rechazado por el guardrail de
+ * seguridad (VerdictSafetyValidationError), ahora existe un segundo turno correctivo
+ * (buildCorrectiveInstruction) que Claude puede llegar a ver antes de responder — un veredicto
+ * "generated" con promptVersion=v1.2 puede haber pasado por ese segundo turno, uno con v1.1 nunca
+ * pudo. Igual que en PR 14A, versión menor (no v2) porque el contrato de salida no cambió; los
+ * veredictos ya persistidos con "technical-verdict-v1.1" no se regeneran retroactivamente.
  */
-export const TECHNICAL_VERDICT_PROMPT_VERSION = 'technical-verdict-v1.1';
+export const TECHNICAL_VERDICT_PROMPT_VERSION = 'technical-verdict-v1.2';
 
 export const VERDICT_TOOL_NAME = 'submit_technical_verdict';
 
@@ -140,4 +150,36 @@ export function buildClaudeUserMessage(input: VerdictGeneratorInput): string {
       mean: input.ndmiMean,
     },
   });
+}
+
+/**
+ * PR 17: instrucción correctiva del segundo intento — se agrega DESPUÉS del system prompt base
+ * (buildSystemPrompt()), nunca lo reemplaza ni lo modifica, así que las reglas de contenido siguen
+ * siendo exactamente las mismas. Deliberadamente no incluye la respuesta rechazada de Claude ni
+ * ningún fragmento de ella: solo nombra el TIPO de fallo y le pide a Claude regenerar el veredicto
+ * completo desde cero, en línea con la política de "preferir regeneración desde cero con feedback
+ * sobre el tipo de fallo" (ver ClaudeTechnicalVerdictGenerator, que es el único caller).
+ */
+export function buildCorrectiveInstruction(
+  reason: VerdictSafetyValidationReason,
+): string {
+  if (reason === 'forbidden_terms') {
+    return [
+      'Tu respuesta anterior fue rechazada porque mencionó un término prohibido (por ejemplo "Claude", "Anthropic", "IA", "inteligencia artificial" o "chatbot") en algún campo de texto.',
+      '',
+      'Generá nuevamente el veredicto completo.',
+      '',
+      'No te menciones a vos mismo ni al modelo que generó la respuesta en ningún campo. El resultado debe leerse como un diagnóstico técnico de AgroScore.',
+    ].join('\n');
+  }
+
+  return [
+    'La respuesta anterior fue rechazada porque formuló una interpretación agronómica con un nivel de certeza no permitido.',
+    '',
+    'Generá nuevamente el veredicto completo.',
+    '',
+    'Las posibles causas deben expresarse exclusivamente como hipótesis o aspectos a verificar en campo.',
+    '',
+    'No afirmes causalidad a partir de los datos satelitales.',
+  ].join('\n');
 }

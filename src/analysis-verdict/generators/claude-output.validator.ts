@@ -16,6 +16,35 @@ import {
  * función es la que queda cubierta por tests sin necesidad de mockear el SDK.
  */
 
+/**
+ * PR 17: motivo acotado (nunca texto libre) de por qué el guardrail de seguridad rechazó el
+ * output — exactamente los dos checks de "no confiar ciegamente en Claude" de más abajo, nunca
+ * los checks de forma (enum/summary vacío/etc.), que siguen tirando `Error` genérico a propósito:
+ * esos no son reintentables con un prompt correctivo (ver ClaudeTechnicalVerdictGenerator).
+ */
+export type VerdictSafetyValidationReason =
+  | 'forbidden_terms'
+  | 'unhedged_causal_claim';
+
+/**
+ * PR 17: error específico del guardrail de seguridad — permite a ClaudeTechnicalVerdictGenerator
+ * distinguir "Claude violó una regla de estilo/seguridad" (reintentable una vez, con feedback
+ * correctivo) de cualquier otro error (schema inválido, auth, rate limit, red, timeout — ninguno
+ * de esos se arregla reintentando con el mismo input). El `message` es siempre el mismo texto fijo
+ * y genérico que ya se usaba acá — nunca incluye la respuesta cruda de Claude, el texto generado
+ * completo, prompts, ni ningún dato sensible; eso es justamente lo que evita que el error termine
+ * filtrando contenido rechazado hacia logs o hacia AnalysisTechnicalVerdict.errorMessage.
+ */
+export class VerdictSafetyValidationError extends Error {
+  readonly reason: VerdictSafetyValidationReason;
+
+  constructor(reason: VerdictSafetyValidationReason, message: string) {
+    super(message);
+    this.name = 'VerdictSafetyValidationError';
+    this.reason = reason;
+  }
+}
+
 const VALID_VERDICTS = new Set<AnalysisVerdictLabel>([
   'favorable',
   'attention',
@@ -61,13 +90,19 @@ function clampStringArray(value: unknown, maxItems: number): string[] {
 /**
  * Valida y normaliza el `tool_use.input` crudo que devuelve Claude. Tira (nunca devuelve un
  * valor parcial) si:
- * - no es un objeto;
- * - `verdict`/`confidence` no están en el enum permitido;
- * - `summary` falta, no es string, o queda vacío tras trim;
- * - el texto (summary o cualquier item de los arrays) menciona Claude/IA/Anthropic/chatbot, o
- * - afirma una causa agronómica como hecho en vez de como hipótesis (PR 14A) —
+ * - no es un objeto (`Error` genérico);
+ * - `verdict`/`confidence` no están en el enum permitido (`Error` genérico);
+ * - `summary` falta, no es string, o queda vacío tras trim (`Error` genérico);
+ * - el texto (summary o cualquier item de los arrays) menciona Claude/IA/Anthropic/chatbot
+ *   (`VerdictSafetyValidationError` con reason='forbidden_terms'), o
+ * - afirma una causa agronómica como hecho en vez de como hipótesis (PR 14A)
+ *   (`VerdictSafetyValidationError` con reason='unhedged_causal_claim') —
  *   ver claude-text-safety.util.ts (PR 16B: extraído acá para compartirlo con el validator de
  *   weeklyTechnicalVerdict, ver claude-weekly-output.validator.ts).
+ * PR 17: los dos últimos casos usan un error tipado a propósito — es la señal que
+ * ClaudeTechnicalVerdictGenerator usa para decidir si vale la pena un segundo intento con
+ * feedback correctivo (un enum inválido o un summary vacío no se arreglan reintentando con el
+ * mismo input, así que esos siguen siendo `Error` genérico, nunca reintentados).
  * Los arrays (keyFindings/possibleCauses/recommendations/limitations) son más tolerantes: si
  * faltan, no son array, o traen items no-string, se normalizan a lo que sí sea válido en vez de
  * fallar — un array mal formado no es motivo para descartar un veredicto por lo demás válido.
@@ -116,13 +151,15 @@ export function validateAndNormalizeGeneratedVerdict(
   ].join(' ');
 
   if (containsForbiddenTerms(allText)) {
-    throw new Error(
+    throw new VerdictSafetyValidationError(
+      'forbidden_terms',
       'Claude mencionó un término prohibido (Claude/IA/Anthropic/chatbot) en el texto generado.',
     );
   }
 
   if (containsUnhedgedCausalClaim(allText)) {
-    throw new Error(
+    throw new VerdictSafetyValidationError(
+      'unhedged_causal_claim',
       'Claude usó lenguaje demasiado afirmativo sobre una causa agronómica (debe hablar en hipótesis, no en certezas).',
     );
   }

@@ -182,6 +182,21 @@ export class AdminController {
     return this.adminService.retryAnalysis(id, this.buildActorContext(req));
   }
 
+  // PR 17: retry manual y acotado — solo AnalysisVerdictService.generateAndPersist sobre el
+  // Analysis ya persistido, nunca vuelve a correr worker/scoring/zoning (ver
+  // AdminService.retryTechnicalVerdict). Protegido por los mismos guards owner|admin del
+  // controller (ADMIN-1) — no hace falta un @Roles/@UseGuards adicional acá.
+  @Post('analysis/:id/technical-verdict/retry')
+  retryTechnicalVerdict(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.adminService.retryTechnicalVerdict(
+      id,
+      this.buildActorContext(req),
+    );
+  }
+
   // PR 13B: solo lectura — nunca dispara una corrida, nunca reintenta un email.
   @Get('scheduled-analysis')
   listScheduledAnalysis(@Query() query: ListScheduledAnalysisQueryDto) {

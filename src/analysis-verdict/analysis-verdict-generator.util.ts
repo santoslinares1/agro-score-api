@@ -16,6 +16,13 @@ export interface VerdictGeneratorInput {
   ndviVariability: NdviVariability;
   /** null si el resultJson no trae NDMI_mean utilizable (ver extractNdmiMean). */
   ndmiMean: number | null;
+  /**
+   * PR 17: opcional, solo para logging local (ver ClaudeTechnicalVerdictGenerator y su retry
+   * correctivo) — nunca viaja a Anthropic. buildClaudeUserMessage arma su propio objeto explícito
+   * (score/hasZoneData/ndvi/ndmi) en vez de spread(input), así que agregar este campo acá no
+   * cambia el payload que efectivamente recibe Claude.
+   */
+  analysisId?: string;
 }
 
 export interface GeneratedVerdict {

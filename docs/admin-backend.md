@@ -74,6 +74,7 @@ Todos bajo `/admin`, todos protegidos por `JwtAuthGuard + RolesGuard` (`owner`/`
 | GET | `/admin/analysis?page=&limit=&status=&fieldId=&userId=&from=&to=&onlyFailed=&onlyUnreviewed=` | Lista diagnósticos con timing/error/revisión (ADMIN-2: filtros nuevos) |
 | PATCH | `/admin/analysis/:id/mark-reviewed` | *(ADMIN-2)* Marca un diagnóstico `Error` como revisado |
 | POST | `/admin/analysis/:id/retry` | *(ADMIN-2)* "Retry requested" — ver sección Diagnósticos abajo |
+| POST | `/admin/analysis/:id/technical-verdict/retry` | *(PR 17)* Reintento real, pero acotado al veredicto técnico — ver sección Diagnósticos abajo |
 | GET | `/admin/access-requests?page=&limit=&status=&search=` | Lista solicitudes de acceso de la landing |
 | PATCH | `/admin/access-requests/:id` | *(ADMIN-2)* Edita `status`/`internalNotes`/`assignedToUserId` |
 | POST | `/admin/access-requests/:id/create-user` | *(ADMIN-2)* Convierte una solicitud en invitación de usuario |
@@ -201,7 +202,7 @@ el mismo email/password una vez que los tiene.
 
 `AdminAuditLog` + `AuditLogService` — extraídos en ADMIN-3 a su propio módulo, `src/audit-log/` (antes vivían en `src/admin/`, provider directo de `AdminModule`). El motivo: `AuthModule` también necesita auditar ahora (`accept-invitation`/`reset-password` sí generan auditoría — el comentario de ADMIN-2 que decía lo contrario quedó desactualizado). Importar `AdminModule` completo en `AuthModule` hubiera traído de arrastre `Field`/`Analysis`/`AccessRequest`; `AuditLogModule` es liviano y lo importan ambos. Ledger append-only — ningún endpoint lo edita ni lo borra.
 
-Acciones auditadas (`AdminAuditAction`, `src/audit-log/audit-log.service.ts`): `admin.user.created`, `admin.user.updated`, `admin.user.role_changed`, `admin.user.deactivated`, `admin.access_request.updated`, `admin.access_request.converted`, `admin.invitation.created`, `admin.invitation.email_sent` *(ADMIN-3)*, `admin.password_reset.created`, `admin.password_reset.email_sent` *(ADMIN-3)*, `admin.analysis.marked_reviewed`, `admin.analysis.retry_requested`, `auth.invitation.accepted` *(ADMIN-3)*, `auth.password_reset.completed` *(ADMIN-3)*. Las últimas dos son las únicas dos acciones cuyo actor es el propio usuario final, no un admin — disparadas desde endpoints públicos de `/auth`.
+Acciones auditadas (`AdminAuditAction`, `src/audit-log/audit-log.service.ts`): `admin.user.created`, `admin.user.updated`, `admin.user.role_changed`, `admin.user.deactivated`, `admin.access_request.updated`, `admin.access_request.converted`, `admin.invitation.created`, `admin.invitation.email_sent` *(ADMIN-3)*, `admin.password_reset.created`, `admin.password_reset.email_sent` *(ADMIN-3)*, `admin.analysis.marked_reviewed`, `admin.analysis.retry_requested`, `admin.analysis.technical_verdict_retry_requested` *(PR 17)*, `auth.invitation.accepted` *(ADMIN-3)*, `auth.password_reset.completed` *(ADMIN-3)*. Las últimas dos son las únicas dos acciones cuyo actor es el propio usuario final, no un admin — disparadas desde endpoints públicos de `/auth`.
 
 `GET /admin/audit-logs?actorUserId=&action=&targetType=&targetId=&page=&limit=` — filtros exactos, no hay `search` de texto libre (a propósito: son campos estructurados, no texto).
 
@@ -215,6 +216,15 @@ Además de `startedAt`/`completedAt`/`failedAt`/`durationMs`/`errorMessage` (ADM
 
 - `PATCH /admin/analysis/:id/mark-reviewed`: exige `status='Error'` (400 si no), setea `reviewedAt=now()` + `reviewedByUserId=<actor>`, audita `admin.analysis.marked_reviewed`.
 - `POST /admin/analysis/:id/retry`: **"retry requested", no reintento real.** Exige `status='Error'`, incrementa `retryCount`, setea `lastRetriedAt=now()`, audita `admin.analysis.retry_requested`. **No vuelve a llamar al worker/Earth Engine.** Reconstruir con confianza el input original (índices elegidos, `maxZoneCampaigns`, lotes incluidos en la clasificación) y volver a dispararlo desde un endpoint admin implica riesgo real: llamadas duplicadas a Earth Engine (costo), falta de garantías de idempotencia, y ningún mecanismo de rate-limit para evitar que alguien reintente en loop. Se prefirió dejar constancia operativa (cuántas veces se pidió, cuándo, quién) para que el equipo lo dispare a mano o para que una ficha futura lo automatice con las guardas correspondientes.
+- `POST /admin/analysis/:id/technical-verdict/retry` *(PR 17)*: a diferencia del punto anterior, **este SÍ ejecuta un reintento real** — pero acotado exclusivamente al veredicto técnico (`AnalysisTechnicalVerdict`), nunca al análisis satelital en sí. `AdminService.retryTechnicalVerdict`:
+  - Exige que el `Analysis` exista (404 si no) y esté `status='Finalizado'` (400 si no — nunca `'Procesando'` ni `'Error'`, no hay nada que interpretar en ninguno de esos dos casos).
+  - **Nunca vuelve a correr el worker Python, Earth Engine, scoring ni zoning** — parte del `Analysis` ya persistido, tal como está guardado en DB. La razón por la que este endpoint sí puede ejecutar un reintento real (a diferencia de `/retry` arriba) es justamente que no toca nada de eso: reutiliza tal cual `AnalysisVerdictService.generateAndPersist(analysis)`, el mismo código que ya corre en el pipeline automático — nunca lo reimplementa.
+  - **Idempotente por `analysisId`**: `generateAndPersist` hace find-then-merge sobre `analysis_technical_verdicts` (constraint `unique(analysisId)`) — no puede crear una segunda fila, sin importar cuántas veces se llame.
+  - Si Claude (u otro provider) vuelve a fallar (incluido un rechazo del guardrail de seguridad — ver `docs/technical-verdict-claude.md`, sección 10), el resultado es el mismo `status='failed'` de siempre, con el contenido placeholder seguro. **Nunca fuerza ni maquilla una publicación.**
+  - Audita `admin.analysis.technical_verdict_retry_requested` con `before`/`after` (`status`/`generator`/`promptVersion`/`errorMessage` del veredicto).
+  - Protegido por los mismos guards `owner`/`admin` del controller (nada adicional) — un usuario `role='user'` (productor) nunca llega a este método.
+  - Devuelve el shape admin (`AdminAnalysisTechnicalVerdict`, incluye `errorMessage`) del veredicto ya actualizado.
+  - Contraparte de lectura del flujo completo (guardrail, retry correctivo interno de Claude, corrective prompt, límite de 2 llamadas): `docs/technical-verdict-claude.md`, sección 10.
 - `GET /admin/analysis` suma filtros: `fieldId`, `userId` (dueño del field, vía join — `Analysis` no tiene ownership propio), `from`/`to` (rango de `createdAt`, `ISO date`), `onlyFailed` (equivalente a `status=Error`, combinable), `onlyUnreviewed` (`reviewedAt IS NULL`).
 
 ## Sistema / health
@@ -314,7 +324,14 @@ Ver comentario agregado en `.env.example`.
 - `src/auth/dto/reset-password.dto.spec.ts`.
 - `src/audit-log/audit-log.service.spec.ts` (movido de `src/admin/`, sin cambios de contenido).
 
-Suite completa: **277/277** (`npm test`).
+**PR 17 (nuevos)** — retry correctivo del Technical Verdict, ver `docs/technical-verdict-claude.md` sección 10:
+- `src/analysis-verdict/generators/claude-output.validator.spec.ts` (extendido): `VerdictSafetyValidationError` con `reason` correcto (`forbidden_terms`/`unhedged_causal_claim`); un enum/summary inválido nunca es `VerdictSafetyValidationError` (error de forma, no de estilo).
+- `src/analysis-verdict/generators/claude-technical-verdict.generator.spec.ts` (extendido): válido en intento 1 → 1 llamada; rechazo de seguridad en intento 1 + válido en intento 2 → `generated`, exactamente 2 llamadas; rechazo en ambos intentos → falla tras exactamente 2 llamadas; `AuthenticationError`/`RateLimitError`/`APIConnectionError`/"no tool_use"/enum inválido → nunca disparan el intento 2; el intento 2 pasa por el mismo validador; el log del rechazo nunca incluye el texto generado.
+- `src/analysis-verdict/generators/technical-verdict-prompt.spec.ts` (extendido): `promptVersion='technical-verdict-v1.2'`; `buildCorrectiveInstruction` por `reason`, nunca menciona contenido de un veredicto real rechazado.
+- `src/admin/admin.service.spec.ts` (extendido) — `retryTechnicalVerdict`: 404 si el `Analysis` no existe, 400 si no está `Finalizado` (incluido `status='Error'`), llama a `AnalysisVerdictService.generateAndPersist` y audita `admin.analysis.technical_verdict_retry_requested` con `before`/`after`, propaga `status='failed'` tal cual si el reintento vuelve a fallar (nunca fuerza un resultado), nunca escribe la fila directamente (toda la escritura queda delegada a `generateAndPersist`, sin duplicarla).
+- `src/admin/admin.guards.spec.ts` (extendido): `POST /admin/analysis/:id/technical-verdict/retry` — role `user` → 403, `owner` → 201, sin JWT → 403 (misma composición de guards a nivel controller que el resto de `/admin/*`).
+
+Suite completa: **277/277** (`npm test`) — número histórico de la ficha ADMIN-3, ya desactualizado por PRs posteriores (13A/13B/14A/16B/17/etc.); ver el output real de `npm test` para el conteo vigente.
 
 ## Qué no se tocó / deuda conocida
 

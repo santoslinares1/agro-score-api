@@ -19,6 +19,7 @@ import {
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis, AnalysisStatus } from '../analysis/entities/analysis.entity';
+import { AnalysisVerdictService } from '../analysis-verdict/analysis-verdict.service';
 import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
 import {
   AuditActorContext,
@@ -151,6 +152,7 @@ export class AdminService {
     @InjectRepository(PasswordResetToken)
     private readonly passwordResetRepository: Repository<PasswordResetToken>,
     private readonly weeklyTechnicalVerdictService: WeeklyTechnicalVerdictService,
+    private readonly analysisVerdictService: AnalysisVerdictService,
   ) {}
 
   // ── Métricas ────────────────────────────────────────────────────────
@@ -2648,6 +2650,78 @@ export class AdminService {
     });
 
     return saved;
+  }
+
+  /**
+   * PR 17: retry manual y acotado del veredicto técnico de un Analysis ya 'Finalizado' — el caso
+   * de uso es exactamente el de la mini-auditoría: un rechazo legítimo del guardrail de seguridad
+   * (VerdictSafetyValidationError) no debe dejar el Analysis sin veredicto para siempre si un
+   * admin quiere pedir una nueva generación.
+   *
+   * A diferencia de retryAnalysis (arriba), que solo deja constancia operativa sin ejecutar nada,
+   * este método SÍ ejecuta una generación real — pero reutiliza tal cual
+   * AnalysisVerdictService.generateAndPersist, el mismo código que ya usa el pipeline automático
+   * (ver AnalysisService.processFieldAnalysisInBackground). Nunca reimplementa esa lógica acá:
+   * - nunca vuelve a correr el worker/Earth Engine/scoring/zoning — parte del Analysis ya
+   *   persistido, tal como está guardado;
+   * - es idempotente por analysisId (find-then-merge, ver AnalysisVerdictService.saveVerdict) —
+   *   no puede crear una segunda fila en analysis_technical_verdicts;
+   * - si Claude vuelve a ser rechazado por el guardrail (o falla por cualquier otro motivo),
+   *   generateAndPersist ya se encarga de persistir status='failed' con el contenido placeholder
+   *   seguro de siempre — este método nunca fuerza ni maquilla un resultado.
+   *
+   * Guardas explícitas antes de invocar la generación: el Analysis debe existir y estar
+   * 'Finalizado' (nunca 'Procesando' ni 'Error' — no hay nada que interpretar en ninguno de esos
+   * dos casos). La autorización admin/owner ya la resuelve @UseGuards(JwtAuthGuard, RolesGuard) +
+   * @Roles(...) a nivel de AdminController (ADMIN-1) — un producer nunca llega a este método.
+   */
+  async retryTechnicalVerdict(
+    id: string,
+    actor: AuditActorContext,
+  ): Promise<AdminAnalysisTechnicalVerdict> {
+    const analysis = await this.analysisRepository.findOne({ where: { id } });
+
+    if (!analysis) {
+      throw new NotFoundException('Análisis no encontrado.');
+    }
+
+    if (analysis.status !== 'Finalizado') {
+      throw new BadRequestException(
+        'Solo se puede reintentar el veredicto técnico de análisis con status Finalizado.',
+      );
+    }
+
+    const existing = await this.analysisVerdictRepository.findOne({
+      where: { analysisId: id },
+    });
+    const before = existing
+      ? {
+          status: existing.status,
+          generator: existing.generator,
+          promptVersion: existing.promptVersion,
+          errorMessage: existing.errorMessage,
+        }
+      : null;
+
+    const verdict = await this.analysisVerdictService.generateAndPersist(
+      analysis,
+    );
+
+    await this.auditLogService.record({
+      actor,
+      action: 'admin.analysis.technical_verdict_retry_requested',
+      targetType: 'analysis_technical_verdict',
+      targetId: id,
+      before,
+      after: {
+        status: verdict.status,
+        generator: verdict.generator,
+        promptVersion: verdict.promptVersion,
+        errorMessage: verdict.errorMessage,
+      },
+    });
+
+    return toAdminAnalysisTechnicalVerdict(verdict);
   }
 
   // ── Solicitudes de acceso (lectura) ─────────────────────────────────

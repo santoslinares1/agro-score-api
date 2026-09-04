@@ -10,6 +10,7 @@ import { In, IsNull } from 'typeorm';
 
 import { AccessRequest } from '../access-request/entities/access-request.entity';
 import { Analysis } from '../analysis/entities/analysis.entity';
+import { AnalysisVerdictService } from '../analysis-verdict/analysis-verdict.service';
 import { AnalysisTechnicalVerdict } from '../analysis-verdict/entities/analysis-technical-verdict.entity';
 import {
   AuditActorContext,
@@ -109,6 +110,9 @@ describe('AdminService', () => {
   let scheduledAnalysisRunRepo: ReturnType<typeof noopRepo>;
   let weeklyTechnicalVerdictService: jest.Mocked<
     Pick<WeeklyTechnicalVerdictService, 'findResponsesByScheduledRunIds'>
+  >;
+  let analysisVerdictService: jest.Mocked<
+    Pick<AnalysisVerdictService, 'generateAndPersist'>
   >;
 
   beforeEach(async () => {
@@ -214,6 +218,12 @@ describe('AdminService', () => {
               .mockResolvedValue(new Map()),
           },
         },
+        {
+          provide: AnalysisVerdictService,
+          useValue: {
+            generateAndPersist: jest.fn(),
+          },
+        },
       ],
     }).compile();
 
@@ -224,6 +234,7 @@ describe('AdminService', () => {
     pythonWorkerService = module.get(PythonWorkerService);
     configService = module.get(ConfigService);
     weeklyTechnicalVerdictService = module.get(WeeklyTechnicalVerdictService);
+    analysisVerdictService = module.get(AnalysisVerdictService);
   });
 
   describe('createUser', () => {
@@ -716,6 +727,163 @@ describe('AdminService', () => {
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'admin.analysis.retry_requested' }),
       );
+    });
+  });
+
+  describe('retryTechnicalVerdict (PR 17)', () => {
+    it('Analysis inexistente → NotFoundException, nunca invoca generateAndPersist', async () => {
+      analysisRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.retryTechnicalVerdict('missing-id', actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(analysisVerdictService.generateAndPersist).not.toHaveBeenCalled();
+    });
+
+    it('Analysis no Finalizado (p.ej. Procesando) → BadRequestException, nunca invoca generateAndPersist', async () => {
+      analysisRepo.findOne.mockResolvedValue({
+        id: 'a1',
+        status: 'Procesando',
+      });
+
+      await expect(
+        service.retryTechnicalVerdict('a1', actor),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(analysisVerdictService.generateAndPersist).not.toHaveBeenCalled();
+    });
+
+    it('Analysis con status=Error (ni Finalizado) → BadRequestException', async () => {
+      analysisRepo.findOne.mockResolvedValue({ id: 'a1', status: 'Error' });
+
+      await expect(
+        service.retryTechnicalVerdict('a1', actor),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(analysisVerdictService.generateAndPersist).not.toHaveBeenCalled();
+    });
+
+    it('Analysis Finalizado → reutiliza generateAndPersist, audita el retry y devuelve el veredicto mapeado', async () => {
+      const analysis = { id: 'a1', status: 'Finalizado' };
+      analysisRepo.findOne.mockResolvedValue(analysis);
+      analysisVerdictRepo.findOne.mockResolvedValue({
+        status: 'failed',
+        generator: 'claude',
+        promptVersion: 'technical-verdict-v1.2',
+        errorMessage:
+          'Claude usó lenguaje demasiado afirmativo sobre una causa agronómica (debe hablar en hipótesis, no en certezas).',
+      });
+      analysisVerdictService.generateAndPersist.mockResolvedValue({
+        status: 'generated',
+        verdict: 'attention',
+        confidence: 'medium',
+        summary: 'ok',
+        keyFindings: [],
+        possibleCauses: [],
+        recommendations: [],
+        limitations: [],
+        generator: 'claude',
+        promptVersion: 'technical-verdict-v1.2',
+        errorMessage: null,
+        generatedAt: new Date('2026-01-01T00:00:00.000Z'),
+      } as any);
+
+      const result = await service.retryTechnicalVerdict('a1', actor);
+
+      expect(analysisVerdictService.generateAndPersist).toHaveBeenCalledWith(
+        analysis,
+      );
+      expect(result.status).toBe('generated');
+      expect(result.verdict).toBe('attention');
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'admin.analysis.technical_verdict_retry_requested',
+          targetType: 'analysis_technical_verdict',
+          targetId: 'a1',
+          before: expect.objectContaining({ status: 'failed' }),
+          after: expect.objectContaining({ status: 'generated' }),
+        }),
+      );
+    });
+
+    it('smoke test failed→retry→generated (PR 17, caso de producción): antes failed, después generated', async () => {
+      const analysis = { id: 'a1', status: 'Finalizado' };
+      analysisRepo.findOne.mockResolvedValue(analysis);
+      analysisVerdictRepo.findOne.mockResolvedValue({
+        status: 'failed',
+        generator: 'claude',
+        promptVersion: 'technical-verdict-v1.2',
+        errorMessage: 'Claude usó lenguaje demasiado afirmativo...',
+      });
+      analysisVerdictService.generateAndPersist.mockResolvedValue({
+        status: 'generated',
+        verdict: 'favorable',
+        confidence: 'high',
+        summary: 'ok',
+        keyFindings: [],
+        possibleCauses: [],
+        recommendations: [],
+        limitations: [],
+        generator: 'claude',
+        promptVersion: 'technical-verdict-v1.2',
+        errorMessage: null,
+        generatedAt: new Date(),
+      } as any);
+
+      const result = await service.retryTechnicalVerdict('a1', actor);
+
+      expect(result.status).toBe('generated');
+      expect(result.errorMessage).toBeNull();
+    });
+
+    it('si el reintento vuelve a fallar el guardrail, propaga status=failed tal cual — nunca fuerza un resultado', async () => {
+      const analysis = { id: 'a1', status: 'Finalizado' };
+      analysisRepo.findOne.mockResolvedValue(analysis);
+      analysisVerdictRepo.findOne.mockResolvedValue({
+        status: 'failed',
+        generator: 'claude',
+        promptVersion: 'technical-verdict-v1.2',
+        errorMessage: 'rechazo previo',
+      });
+      analysisVerdictService.generateAndPersist.mockResolvedValue({
+        status: 'failed',
+        verdict: 'insufficient_data',
+        confidence: 'low',
+        summary: 'No se pudo generar el veredicto técnico automático.',
+        keyFindings: [],
+        possibleCauses: [],
+        recommendations: [],
+        limitations: [],
+        generator: 'claude',
+        promptVersion: 'technical-verdict-v1.2',
+        errorMessage:
+          'Claude usó lenguaje demasiado afirmativo sobre una causa agronómica (debe hablar en hipótesis, no en certezas).',
+        generatedAt: null,
+      } as any);
+
+      const result = await service.retryTechnicalVerdict('a1', actor);
+
+      expect(result.status).toBe('failed');
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          after: expect.objectContaining({ status: 'failed' }),
+        }),
+      );
+    });
+
+    it('nunca crea/guarda la fila directamente — toda la escritura queda delegada a generateAndPersist (idempotencia)', async () => {
+      const analysis = { id: 'a1', status: 'Finalizado' };
+      analysisRepo.findOne.mockResolvedValue(analysis);
+      analysisVerdictRepo.findOne.mockResolvedValue(null);
+      analysisVerdictService.generateAndPersist.mockResolvedValue({
+        status: 'generated',
+        generator: 'claude',
+        promptVersion: 'technical-verdict-v1.2',
+        errorMessage: null,
+      } as any);
+
+      await service.retryTechnicalVerdict('a1', actor);
+
+      expect(analysisVerdictRepo.create).not.toHaveBeenCalled();
+      expect(analysisVerdictRepo.save).not.toHaveBeenCalled();
     });
   });
 

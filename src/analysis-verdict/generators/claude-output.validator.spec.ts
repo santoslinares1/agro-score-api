@@ -1,4 +1,7 @@
-import { validateAndNormalizeGeneratedVerdict } from './claude-output.validator';
+import {
+  VerdictSafetyValidationError,
+  validateAndNormalizeGeneratedVerdict,
+} from './claude-output.validator';
 
 describe('validateAndNormalizeGeneratedVerdict', () => {
   const validRaw = {
@@ -31,6 +34,15 @@ describe('validateAndNormalizeGeneratedVerdict', () => {
         verdict: 'muy_bueno',
       }),
     ).toThrow(/verdict/i);
+  });
+
+  it('PR 17: un verdict fuera de enum NUNCA es VerdictSafetyValidationError (error de forma, no de estilo — no reintentable)', () => {
+    expect.assertions(1);
+    try {
+      validateAndNormalizeGeneratedVerdict({ ...validRaw, verdict: 'muy_bueno' });
+    } catch (error) {
+      expect(error).not.toBeInstanceOf(VerdictSafetyValidationError);
+    }
   });
 
   it('rechaza un confidence fuera del enum permitido', () => {
@@ -134,6 +146,21 @@ describe('validateAndNormalizeGeneratedVerdict', () => {
     ).toThrow(/prohibido/i);
   });
 
+  it('PR 17: término prohibido tira VerdictSafetyValidationError con reason=forbidden_terms', () => {
+    expect.assertions(2);
+    try {
+      validateAndNormalizeGeneratedVerdict({
+        ...validRaw,
+        summary: 'Este análisis fue generado por Claude.',
+      });
+    } catch (error) {
+      expect(error).toBeInstanceOf(VerdictSafetyValidationError);
+      expect((error as VerdictSafetyValidationError).reason).toBe(
+        'forbidden_terms',
+      );
+    }
+  });
+
   describe('lenguaje afirmativo sobre causas agronómicas (PR 14A)', () => {
     it.each([
       'hay estrés hídrico',
@@ -180,6 +207,21 @@ describe('validateAndNormalizeGeneratedVerdict', () => {
           possibleCauses: ['La causa es un manejo de riego inadecuado.'],
         }),
       ).toThrow(/afirmativo/i);
+    });
+
+    it('PR 17: causa afirmativa tira VerdictSafetyValidationError con reason=unhedged_causal_claim', () => {
+      expect.assertions(2);
+      try {
+        validateAndNormalizeGeneratedVerdict({
+          ...validRaw,
+          summary: 'hay estrés hídrico',
+        });
+      } catch (error) {
+        expect(error).toBeInstanceOf(VerdictSafetyValidationError);
+        expect((error as VerdictSafetyValidationError).reason).toBe(
+          'unhedged_causal_claim',
+        );
+      }
     });
 
     it('no bloquea "compactación"/"plaga"/"enfermedad" cuando no siguen a un verbo afirmativo', () => {

@@ -84,6 +84,20 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
               },
               scheduledRuns: [],
             }),
+            retryTechnicalVerdict: jest.fn().mockResolvedValue({
+              status: 'generated',
+              verdict: 'favorable',
+              confidence: 'high',
+              summary: 'ok',
+              keyFindings: [],
+              possibleCauses: [],
+              recommendations: [],
+              limitations: [],
+              generatedAt: new Date().toISOString(),
+              generator: 'claude',
+              promptVersion: 'technical-verdict-v1.2',
+              errorMessage: null,
+            }),
             getUserDetail: jest.fn().mockResolvedValue({
               user: { id: 'user-1', email: 'user@agroscorelatam.com' },
               summary: {
@@ -211,5 +225,31 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
       .get('/admin/users/a1111111-1111-4111-8111-111111111111')
       .set('x-test-role', UserRole.ADMIN)
       .expect(200);
+  });
+
+  // PR 17: mismo endpoint nuevo, misma composición de guards a nivel controller — un producer
+  // ("user") nunca puede pedir el retry manual del veredicto técnico.
+  it('POST /admin/analysis/:id/technical-verdict/retry — role "user" no entra, "owner" sí', async () => {
+    await request(app.getHttpServer())
+      .post(
+        '/admin/analysis/a1111111-1111-4111-8111-111111111111/technical-verdict/retry',
+      )
+      .set('x-test-role', UserRole.USER)
+      .expect(403);
+
+    await request(app.getHttpServer())
+      .post(
+        '/admin/analysis/a1111111-1111-4111-8111-111111111111/technical-verdict/retry',
+      )
+      .set('x-test-role', UserRole.OWNER)
+      .expect(201);
+  });
+
+  it('POST /admin/analysis/:id/technical-verdict/retry — sin JWT (sin header de test) no entra', async () => {
+    await request(app.getHttpServer())
+      .post(
+        '/admin/analysis/a1111111-1111-4111-8111-111111111111/technical-verdict/retry',
+      )
+      .expect(403);
   });
 });

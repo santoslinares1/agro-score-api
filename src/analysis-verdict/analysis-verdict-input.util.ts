@@ -58,5 +58,6 @@ export function buildVerdictGeneratorInput(
     ndviAverageMax: analysis.ndviAverageMax,
     ndviVariability: analysis.ndviVariability,
     ndmiMean: extractNdmiMean(analysis.resultJson),
+    analysisId: analysis.id,
   };
 }

@@ -20,6 +20,11 @@ export type AdminAuditAction =
   | 'admin.password_reset.email_sent'
   | 'admin.analysis.retry_requested'
   | 'admin.analysis.marked_reviewed'
+  // PR 17: retry manual, acotado, del veredicto técnico de un Analysis ya Finalizado — ver
+  // AdminService.retryTechnicalVerdict. Distinto de 'admin.analysis.retry_requested' (que es solo
+  // una marca operativa para el pipeline completo, nunca dispara nada) porque este SÍ ejecuta un
+  // reintento real, aunque acotado exclusivamente al veredicto (nunca worker/scoring/zoning).
+  | 'admin.analysis.technical_verdict_retry_requested'
   // ADMIN-3: acciones disparadas por el propio usuario final (no un admin)
   // desde endpoints públicos de /auth — mismo ledger, mismo AuditLogService
   // (ver src/audit-log/audit-log.module.ts sobre por qué se extrajo de
