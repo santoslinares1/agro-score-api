@@ -35,6 +35,19 @@ export class Analysis {
   @Column({ type: 'varchar', nullable: true })
   scope: AnalysisScope | null;
 
+  /**
+   * F04 (revisión independiente, ronda 3): identidad OPCIONAL de la solicitud, provista por el
+   * caller (ver RunFieldAnalysisDto.clientRequestId) — dos requests con el mismo (campo,
+   * clientRequestId) siempre coalescen en esta misma fila, sin importar el orden en que sus
+   * INSERT lleguen a Postgres ni el status actual de la fila (a diferencia del dedupe por
+   * status='Procesando', que solo protege mientras el análisis sigue corriendo). null para
+   * callers que no lo envían — el dedupe por status existente sigue funcionando sin cambios. Ver
+   * UQ_analysis_client_request_per_field y el comentario junto al INSERT atómico en
+   * AnalysisService.runFieldAnalysis.
+   */
+  @Column({ type: 'varchar', nullable: true })
+  clientRequestId: string | null;
+
   @Column()
   lotName: string;
 

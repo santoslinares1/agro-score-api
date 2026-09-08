@@ -6,6 +6,7 @@ import {
   IsOptional,
   IsString,
   Max,
+  MaxLength,
   Min,
 } from 'class-validator';
 
@@ -89,4 +90,24 @@ export class RunFieldAnalysisDto {
   @Min(1)
   @Max(6)
   maxZoneCampaigns?: number;
+
+  /**
+   * F04 (revisión independiente, ronda 3): identidad OPCIONAL de esta acción del usuario (no del
+   * campo) — generada UNA vez por el caller (p. ej. al abrir el modal de análisis, o al armar el
+   * pedido) y reenviada TAL CUAL si esta misma acción se reintenta (error de red, doble click,
+   * reintento automático del cliente HTTP). Con este dato, la API reconoce dos llamadas como la
+   * MISMA solicitud lógica y siempre devuelve el MISMO análisis — incluso si sus escrituras
+   * llegan a Postgres en cualquier orden, algo que el dedupe por campo (como máximo un
+   * 'Procesando' por campo) no puede garantizar una vez que el análisis anterior ya terminó.
+   *
+   * Completamente opcional y sin efecto en el resto del contrato: si no se envía, el
+   * comportamiento es exactamente el de antes (dedupe solo mientras el análisis previo sigue
+   * 'Procesando'). Una acción de usuario NUEVA debe usar un valor NUEVO — reenviar un valor viejo
+   * para una acción distinta haría que esta API devuelva, incorrectamente, el resultado de la
+   * acción anterior.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  clientRequestId?: string;
 }

@@ -706,7 +706,26 @@ export function isSoilClimateAvailable(resultJson: any): boolean {
   );
 }
 
-export function scoreInterpretation(score: number): string {
+/**
+ * F01: mismo criterio de compatibilidad que isSoilClimateAvailable — resultJson.dataAvailability
+ * ausente (análisis previos a este fix del worker) se trata como "disponible", nunca como
+ * indisponible por default. `globalScore` es la señal que importa acá: si el score general no
+ * tiene evidencia, ningún consumidor debería interpretar el número como si la tuviera (ver
+ * agro-score-worker/app/pipeline/response_mapper.py: dataAvailability.globalScore).
+ */
+export function isVigorDataAvailable(resultJson: any): boolean {
+  if (resultJson?.dataAvailability?.globalScore === false) {
+    return false;
+  }
+
+  return true;
+}
+
+export function scoreInterpretation(score: number, dataAvailable: boolean = true): string {
+  if (!dataAvailable) {
+    return 'No hay evidencia satelital suficiente en este período para interpretar el estado del lote/campo: el score no refleja una condición evaluada, sino la ausencia de observaciones válidas.';
+  }
+
   if (score >= 70) {
     return 'El campo muestra una respuesta satelital favorable en los indicadores evaluados.';
   }

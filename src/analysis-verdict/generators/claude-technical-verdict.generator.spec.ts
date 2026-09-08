@@ -49,6 +49,7 @@ describe('ClaudeTechnicalVerdictGenerator', () => {
     ndviAverageMax: 0.6,
     ndviVariability: 'Media',
     ndmiMean: 0.25,
+    hasSufficientVigorData: true,
   };
 
   const validToolResponse = (overrides: Record<string, unknown> = {}) => ({
@@ -120,6 +121,7 @@ describe('ClaudeTechnicalVerdictGenerator', () => {
     expect(userContent).toEqual({
       score: 58,
       hasZoneData: true,
+      hasSufficientVigorData: true,
       ndvi: { averageMax: 0.6, variability: 'Media' },
       ndmi: { mean: 0.25 },
     });

@@ -66,6 +66,21 @@ export type ImageSeries = {
   ndmi: CampaignImageSeries[];
 };
 
+/**
+ * F01: mismo idioma que `soilClimateAvailable` (más abajo), extendido a los scores derivados del
+ * índice de vigor (productivity/stability/confidence/ndviAverageMax/globalScore) — ver
+ * agro-score-worker/app/pipeline/response_mapper.py. Ausente en resultJson de análisis previos a
+ * este fix: un consumidor debe tratar esa ausencia como "disponible" (mismo criterio de
+ * compatibilidad hacia atrás que ya usa isSoilClimateAvailable en report-pdf.helpers.ts).
+ */
+export type ScoreDataAvailability = {
+  productivity: boolean;
+  stability: boolean;
+  confidence: boolean;
+  ndviAverageMax: boolean;
+  globalScore: boolean;
+};
+
 export type WorkerResultJson = {
   mode: 'fake' | 'python-worker' | 'python-worker-v2' | 'error';
   message: string;
@@ -83,6 +98,11 @@ export type WorkerResultJson = {
 
   /** Fase 2 mínima: solo presente si el análisis se pidió con includeImageSeries=true. */
   imageSeries?: ImageSeries;
+
+  /** F01: ver ScoreDataAvailability. Ausente en análisis previos a este fix. */
+  dataAvailability?: ScoreDataAvailability;
+  /** F01: {total, valid} filas de timeseries vs. filas con una medición de vigor utilizable. */
+  vigorObservations?: { total: number; valid: number };
 
   raw?: Record<string, unknown>;
 

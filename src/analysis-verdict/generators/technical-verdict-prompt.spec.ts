@@ -13,14 +13,18 @@ import {
 describe('buildSystemPrompt (PR 14A — lenguaje conservador)', () => {
   const prompt = buildSystemPrompt();
 
-  it('PR 17: la promptVersion queda en technical-verdict-v1.2', () => {
-    expect(TECHNICAL_VERDICT_PROMPT_VERSION).toBe('technical-verdict-v1.2');
+  it('F01: la promptVersion queda en technical-verdict-v1.3', () => {
+    expect(TECHNICAL_VERDICT_PROMPT_VERSION).toBe('technical-verdict-v1.3');
   });
 
   it('exige lenguaje hipotético en vez de afirmativo', () => {
     expect(prompt).toMatch(/lenguaje hipotético/i);
     expect(prompt).toMatch(/podría estar asociado a/i);
     expect(prompt).toMatch(/es compatible con/i);
+  });
+
+  it('F01: menciona hasSufficientVigorData como motivo válido de insufficient_data', () => {
+    expect(prompt).toMatch(/hasSufficientVigorData/);
   });
 
   it('prohíbe afirmar causas agronómicas como hecho, con ejemplos concretos', () => {

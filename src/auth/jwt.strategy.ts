@@ -11,6 +11,9 @@ export type JwtPayload = {
   sub: string;
   email: string;
   role: UserRole;
+  // PROFILE-SEC-1: opcional para que tokens firmados antes de esta ficha
+  // (sin el claim) sigan validando — ver el fallback `?? 0` en validate().
+  tokenVersion?: number;
 };
 
 export type AuthenticatedUser = {
@@ -44,6 +47,19 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     // acceso de inmediato, sin esperar a que expire el JWT (hasta 7 días).
     if (!user.isActive) {
       throw new UnauthorizedException('Usuario desactivado.');
+    }
+
+    // PROFILE-SEC-1: mismo criterio que isActive arriba, pero para
+    // "cambiar contraseña" y "cerrar otras sesiones" desde /app/profile —
+    // sin esto, un JWT emitido con la password/sesión anterior seguiría
+    // siendo válido hasta expirar (hasta 7 días). Un payload sin el claim
+    // (tokens emitidos antes de esta ficha) se trata como versión 0, que es
+    // el default de todo usuario existente — no invalida sesiones activas
+    // al desplegar este cambio, solo a partir del primer bump real.
+    const payloadTokenVersion = payload.tokenVersion ?? 0;
+
+    if (payloadTokenVersion !== user.tokenVersion) {
+      throw new UnauthorizedException('Sesión inválida. Iniciá sesión nuevamente.');
     }
 
     return { sub: user.id, email: user.email, role: user.role };

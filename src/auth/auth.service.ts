@@ -5,9 +5,9 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { InjectRepository } from '@nestjs/typeorm';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcryptjs';
-import { IsNull, MoreThan, Repository } from 'typeorm';
+import { DataSource, IsNull, MoreThan, Repository } from 'typeorm';
 
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
@@ -47,6 +47,8 @@ export class AuthService {
     private readonly invitationRepository: Repository<UserInvitation>,
     @InjectRepository(PasswordResetToken)
     private readonly passwordResetRepository: Repository<PasswordResetToken>,
+    @InjectDataSource()
+    private readonly dataSource: DataSource,
   ) {}
 
   async register(dto: RegisterDto): Promise<AuthResponse> {
@@ -153,36 +155,113 @@ export class AuthService {
    * diferencia de acceptInvitation, no hace login automático (ver
    * docs/admin-backend.md) — el frontend redirige a /login después de un
    * reset exitoso.
+   *
+   * F03 (fix de atomicidad): antes, el consumo del token (`usedAt`) y el cambio de credenciales
+   * (`UsersService.updatePassword`) eran dos escrituras independientes, cada una en su propia
+   * transacción implícita — sin nada que impidiera que dos requests concurrentes con el MISMO
+   * token pasaran ambas el chequeo `usedAt IS NULL` (leído antes de que cualquiera escribiera
+   * nada) y las dos terminaran cambiando la contraseña. Ahora las dos escrituras viven en la
+   * MISMA transacción, con el `SELECT` del token bajo `lock: 'pessimistic_write'`
+   * (`SELECT ... FOR UPDATE`): la segunda transacción que intenta tomar la fila queda bloqueada
+   * hasta que la primera confirme o revierta — y si la primera confirmó, la segunda vuelve a
+   * evaluar el `WHERE` (`usedAt IS NULL`) contra la fila ya actualizada y no la encuentra, sin
+   * necesitar ningún chequeo extra en el código.
+   *
+   * `bcrypt.hash` es CPU-bound (~50-100ms con SALT_ROUNDS=10) — se calcula ANTES de abrir la
+   * transacción (y por lo tanto antes de tomar el lock de fila), para no retener ese lock más de
+   * lo estrictamente necesario: dos requests para el MISMO token deben serializarse (es la carrera
+   * real que se está cerrando), pero solo por el tiempo de un puñado de sentencias SQL, no por el
+   * costo del hash. El chequeo inicial (no transaccional) sigue existiendo como antes, como
+   * fast-path: evita pagar el costo de bcrypt para el caso común de un token ya inválido/vencido
+   * de entrada — no es la garantía real (esa la da el lock dentro de la transacción), solo una
+   * optimización que preserva el comportamiento previo a esta ficha.
    */
   async resetPassword(
     dto: ResetPasswordDto,
     requestMeta: RequestAuditMeta = {},
   ): Promise<{ message: string }> {
     const tokenHash = hashToken(dto.token);
+    const invalidTokenMessage =
+      'El link de recuperación no es válido o ya expiró.';
 
-    const resetToken = await this.passwordResetRepository.findOne({
+    const tokenLooksValid = await this.passwordResetRepository.findOne({
       where: { tokenHash, usedAt: IsNull(), expiresAt: MoreThan(new Date()) },
     });
 
-    if (!resetToken) {
-      throw new BadRequestException('El link de recuperación no es válido o ya expiró.');
+    if (!tokenLooksValid) {
+      throw new BadRequestException(invalidTokenMessage);
     }
 
     const passwordHash = await bcrypt.hash(dto.password, SALT_ROUNDS);
-    await this.usersService.updatePassword(resetToken.userId, passwordHash);
 
-    resetToken.usedAt = new Date();
-    await this.passwordResetRepository.save(resetToken);
+    const consumedUserId = await this.dataSource.transaction(
+      async (manager): Promise<string> => {
+        const resetToken = await manager
+          .getRepository(PasswordResetToken)
+          .findOne({
+            where: {
+              tokenHash,
+              usedAt: IsNull(),
+              expiresAt: MoreThan(new Date()),
+            },
+            lock: { mode: 'pessimistic_write' },
+          });
 
+        if (!resetToken) {
+          // Ganó otra transacción concurrente (ya consumió el token y confirmó antes de que esta
+          // pudiera tomar el lock), o el token expiró/no existe. Mismo mensaje genérico en ambos
+          // casos — no le da a un atacante información sobre cuál de los dos pasó. Lanzar acá
+          // adentro revierte la transacción completa: ninguna escritura de este intento llega a
+          // aplicarse.
+          throw new BadRequestException(invalidTokenMessage);
+        }
+
+        resetToken.usedAt = new Date();
+        await manager.getRepository(PasswordResetToken).save(resetToken);
+
+        // F03: `updateResult.affected === 0` significa que `resetToken.userId` no matchea ningún
+        // User — no debería ser alcanzable en la práctica (password_reset_tokens.userId es FK NOT
+        // NULL con onDelete CASCADE hacia users, ver la entidad y la migración
+        // 1786026385139-CreatePasswordResetTokens: si el usuario se borrara, el token se borra
+        // con él), pero si algún día se rompiera esa garantía, mejor revertir todo con un error
+        // explícito que dejar el token consumido para un usuario fantasma sin haber cambiado
+        // ninguna credencial real.
+        const updateResult = await this.usersService.updatePassword(
+          resetToken.userId,
+          passwordHash,
+          manager,
+        );
+
+        if (!updateResult.affected) {
+          throw new BadRequestException(invalidTokenMessage);
+        }
+
+        return resetToken.userId;
+      },
+    );
+
+    // F03: la auditoría corre DESPUÉS de que la transacción de arriba confirmó — nunca antes. Si
+    // la transacción falla o revierte, el `throw` de adentro sale de este método sin llegar acá,
+    // así que nunca se registra un "auth.password_reset.completed" para un reset que no ocurrió
+    // de verdad.
+    //
+    // A la inversa: si ESTE `record()` fallara, se propaga sin capturar — mismo criterio, sin
+    // try/catch, que acceptInvitation ya usa en este archivo (no es una omisión nueva de esta
+    // ficha). El resultado es que el request respondería con un error aunque la contraseña YA
+    // cambió con éxito en DB — un fallo de auditoría nunca revierte (ni puede revertir, el commit
+    // ya ocurrió) las credenciales. Preservar esta política existente está dentro de las
+    // restricciones de esta ficha; endurecerla (ej. try/catch best-effort acá) sería un cambio de
+    // comportamiento transversal, no algo local a resetPassword — queda documentado como riesgo
+    // preexistente en la entrega, no corregido acá.
     await this.auditLogService.record({
       actor: {
-        actorUserId: resetToken.userId,
+        actorUserId: consumedUserId,
         ip: requestMeta.ip,
         userAgent: requestMeta.userAgent,
       },
       action: 'auth.password_reset.completed',
       targetType: 'user',
-      targetId: resetToken.userId,
+      targetId: consumedUserId,
     });
 
     return { message: 'Contraseña actualizada correctamente.' };
@@ -201,10 +280,15 @@ export class AuthService {
   private buildAuthResponse(user: User): AuthResponse {
     const publicUser = this.usersService.toPublicUser(user);
 
+    // F03: incluye tokenVersion en todo token emitido (login/register/acceptInvitation también
+    // pasan por acá) — sin esto, un login posterior a un resetPassword emitiría un token cuyo
+    // claim (ausente, tratado como 0 por JwtStrategy) ya no coincidiría con el tokenVersion que
+    // resetPassword acaba de incrementar, dejando al propio usuario deslogueado por su reset.
     const accessToken = this.jwtService.sign({
       sub: publicUser.id,
       email: publicUser.email,
       role: publicUser.role,
+      tokenVersion: user.tokenVersion,
     });
 
     return { user: publicUser, accessToken };

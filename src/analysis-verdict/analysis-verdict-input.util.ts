@@ -45,6 +45,15 @@ function hasZoneData(resultJson: WorkerResultJson | null): boolean {
 }
 
 /**
+ * F01: ver ScoreDataAvailability en python-worker/types.ts. `dataAvailability` ausente (análisis
+ * previos a este fix) se trata como "hay evidencia suficiente" — mismo criterio de compatibilidad
+ * hacia atrás que hasZoneData/isSoilClimateAvailable.
+ */
+function hasSufficientVigorData(resultJson: WorkerResultJson | null): boolean {
+  return resultJson?.dataAvailability?.globalScore !== false;
+}
+
+/**
  * Traduce un Analysis 'Finalizado' a la entrada del generador determinístico. Nunca dispara
  * cálculo nuevo — solo lee columnas ya pobladas por AnalysisService.processFieldAnalysisInBackground
  * y el resultJson que el worker devolvió.
@@ -58,6 +67,7 @@ export function buildVerdictGeneratorInput(
     ndviAverageMax: analysis.ndviAverageMax,
     ndviVariability: analysis.ndviVariability,
     ndmiMean: extractNdmiMean(analysis.resultJson),
+    hasSufficientVigorData: hasSufficientVigorData(analysis.resultJson),
     analysisId: analysis.id,
   };
 }

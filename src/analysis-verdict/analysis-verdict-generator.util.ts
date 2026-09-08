@@ -17,6 +17,14 @@ export interface VerdictGeneratorInput {
   /** null si el resultJson no trae NDMI_mean utilizable (ver extractNdmiMean). */
   ndmiMean: number | null;
   /**
+   * F01: false si resultJson.dataAvailability.globalScore del worker es false (sin observaciones
+   * satelitales válidas del índice de vigor) — ver
+   * agro-score-worker/app/pipeline/response_mapper.py y buildVerdictGeneratorInput. true para
+   * análisis previos a ese fix (resultJson sin esta clave todavía), igual criterio de
+   * compatibilidad hacia atrás que ya usa hasZoneData/isSoilClimateAvailable.
+   */
+  hasSufficientVigorData: boolean;
+  /**
    * PR 17: opcional, solo para logging local (ver ClaudeTechnicalVerdictGenerator y su retry
    * correctivo) — nunca viaja a Anthropic. buildClaudeUserMessage arma su propio objeto explícito
    * (score/hasZoneData/ndvi/ndmi) en vez de spread(input), así que agregar este campo acá no
@@ -45,7 +53,11 @@ const FAVORABLE_SCORE_THRESHOLD = 75;
 const ATTENTION_SCORE_THRESHOLD = 50;
 
 function classifyVerdict(input: VerdictGeneratorInput): AnalysisVerdictLabel {
-  if (!input.hasZoneData) {
+  // F01: mismo gate que hasZoneData, ahora también por falta de evidencia satelital del índice de
+  // vigor — sin esto, un análisis con zonas detectadas pero sin observaciones válidas de vigor
+  // (el escenario reportado en la auditoría) llegaba a clasificarse por globalScore como si fuera
+  // un resultado real, en vez de "insufficient_data".
+  if (!input.hasZoneData || !input.hasSufficientVigorData) {
     return 'insufficient_data';
   }
 

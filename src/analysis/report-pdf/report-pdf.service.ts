@@ -34,6 +34,7 @@ import {
   LotNdviCampaignSeries,
   MonthlyImage,
   isSoilClimateAvailable,
+  isVigorDataAvailable,
   safeText,
   scoreInterpretation,
   verdictBadgeStyle,
@@ -383,6 +384,14 @@ export class ReportPdfService {
   // --- Secciones ---
 
   private buildCoverPage(analysis: Analysis, field: Field): Content[] {
+    // F01 (pendiente detectado en la revisión independiente): esta portada seguía imprimiendo
+    // `${analysis.globalScore}/100` tal cual aunque resultJson.dataAvailability.globalScore fuera
+    // false — la corrección del texto interpretativo (scoreInterpretation) y de la limitación
+    // metodológica no alcanzaba, porque ninguna de las dos toca este nodo numérico. Misma señal
+    // que ya usa buildResumenEjecutivo/buildConclusion (isVigorDataAvailable), ausente en
+    // resultJson de análisis previos a ese fix del worker → se trata como disponible.
+    const globalScoreAvailable = isVigorDataAvailable(analysis.resultJson);
+
     // pdfmake solo pinta `fillColor` cuando el nodo es una celda de tabla — en un `stack`
     // suelto lo ignora silenciosamente. Por eso la portada se envuelve en una tabla de una
     // sola celda (mismo truco que emptyNote()/badge()) en vez de aplicar fillColor directo.
@@ -491,10 +500,10 @@ export class ReportPdfService {
                   alignment: 'right',
                 },
                 {
-                  text: `${analysis.globalScore}/100`,
+                  text: globalScoreAvailable ? `${analysis.globalScore}/100` : 'No disponible',
                   color: '#ffffff',
                   bold: true,
-                  fontSize: 30,
+                  fontSize: globalScoreAvailable ? 30 : 18,
                   alignment: 'right',
                   margin: [0, 2, 0, 0],
                 },
@@ -538,13 +547,18 @@ export class ReportPdfService {
       this.glued(
         this.sectionTitle('01. Resumen ejecutivo'),
         this.mutedText(
-          scoreInterpretation(analysis.globalScore),
+          scoreInterpretation(analysis.globalScore, isVigorDataAvailable(resultJson)),
           [0, 0, 0, 10],
         ),
       ),
       {
         columns: [
-          this.metricCard('Score productivo', `${analysis.globalScore}/100`),
+          // F01 (pendiente detectado en la revisión independiente): este metricCard seguía
+          // imprimiendo el mismo placeholder "0/100" que la portada, con el mismo fix.
+          this.metricCard(
+            'Score productivo',
+            isVigorDataAvailable(resultJson) ? `${analysis.globalScore}/100` : 'No disponible',
+          ),
           this.metricCard('Superficie analizada', formatHa(analyzedAreaHa)),
           this.metricCard('Lotes internos', String(lotsCount)),
           this.metricCard(
@@ -1430,7 +1444,9 @@ export class ReportPdfService {
     const analyzedAreaHa = getAnalyzedAreaHa(resultJson);
     const lotsCount = getLotsCount(resultJson);
 
-    const bullets: string[] = [scoreInterpretation(analysis.globalScore)];
+    const bullets: string[] = [
+      scoreInterpretation(analysis.globalScore, isVigorDataAvailable(resultJson)),
+    ];
 
     if (topZone) {
       bullets.push(
@@ -1486,6 +1502,15 @@ export class ReportPdfService {
     if (!isSoilClimateAvailable(resultJson)) {
       items.push(
         'Suelo y clima no están incluidos en el cálculo del score en este diagnóstico.',
+      );
+    }
+
+    // F01: mismo criterio que la limitación de suelo/clima de arriba — declarar explícitamente
+    // cuando el score general no tuvo evidencia satelital suficiente, en vez de dejar que el
+    // lector infiera un diagnóstico real a partir de un número que no lo es.
+    if (!isVigorDataAvailable(resultJson)) {
+      items.push(
+        'No hubo observaciones satelitales válidas del índice de vigor en el período analizado: el score general y sus componentes no reflejan una condición evaluada del lote/campo.',
       );
     }
 

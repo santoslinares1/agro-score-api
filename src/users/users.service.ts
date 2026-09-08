@@ -1,11 +1,14 @@
 import { ConflictException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Not, Repository } from 'typeorm';
+import { EntityManager, In, Not, Repository, UpdateResult } from 'typeorm';
 
 import { User } from './user.entity';
 import { UserRole } from './user-role.enum';
 
-export type PublicUser = Omit<User, 'passwordHash'>;
+// F03: tokenVersion se excluye del shape público igual que passwordHash —
+// es un detalle interno de invalidación de JWT, no algo que el frontend
+// necesite leer.
+export type PublicUser = Omit<User, 'passwordHash' | 'tokenVersion'>;
 
 export type ListUsersParams = {
   page: number;
@@ -148,12 +151,31 @@ export class UsersService {
   /**
    * ADMIN-3: dedicado y separado de `update()`/`UpdateUserFields` a
    * propósito — ese tipo nunca debe aceptar `passwordHash` (así el
-   * ValidationPipe global de un DTO admin no puede colarlo por error). Solo
-   * lo llama AuthService.resetPassword, después de validar el token de
-   * reset contra la DB.
+   * ValidationPipe global de un DTO admin no puede colarlo por error).
+   *
+   * F03: además incrementa `tokenVersion` atómicamente en la misma UPDATE — cualquier reset de
+   * password debe invalidar los JWT emitidos con la password anterior. Lo llama
+   * AuthService.resetPassword.
+   *
+   * F03: `manager` opcional — cuando se pasa (AuthService.resetPassword, dentro de su propia
+   * transacción con el PasswordResetToken), este UPDATE corre en ESA transacción en vez de en su
+   * propia conexión implícita, para que el cambio de password y el consumo del token confirmen o
+   * reviertan juntos. Sin `manager`, el comportamiento es una sola UPDATE atómica en su propia
+   * transacción implícita de una sentencia.
    */
-  async updatePassword(id: string, passwordHash: string): Promise<void> {
-    await this.usersRepository.update(id, { passwordHash });
+  async updatePassword(
+    id: string,
+    passwordHash: string,
+    manager?: EntityManager,
+  ): Promise<UpdateResult> {
+    const repository = manager
+      ? manager.getRepository(User)
+      : this.usersRepository;
+
+    return repository.update(id, {
+      passwordHash,
+      tokenVersion: () => '"tokenVersion" + 1',
+    });
   }
 
   async count(): Promise<number> {
@@ -178,7 +200,7 @@ export class UsersService {
   }
 
   toPublicUser(user: User): PublicUser {
-    const { passwordHash: _passwordHash, ...publicUser } = user;
+    const { passwordHash: _passwordHash, tokenVersion: _tokenVersion, ...publicUser } = user;
 
     return publicUser;
   }

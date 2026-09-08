@@ -25,8 +25,15 @@ import { VerdictSafetyValidationReason } from './claude-output.validator';
  * "generated" con promptVersion=v1.2 puede haber pasado por ese segundo turno, uno con v1.1 nunca
  * pudo. Igual que en PR 14A, versión menor (no v2) porque el contrato de salida no cambió; los
  * veredictos ya persistidos con "technical-verdict-v1.1" no se regeneran retroactivamente.
+ *
+ * F01: v1.2 → v1.3. Tampoco cambia el contrato/schema de la tool. El mensaje de usuario
+ * (buildClaudeUserMessage) ahora incluye hasSufficientVigorData, y la regla de "datos
+ * insuficientes" del system prompt la menciona explícitamente — antes de esto, Claude podía
+ * recibir score=0 sin ninguna señal de que era por falta de evidencia satelital (en vez de un
+ * resultado real) y clasificarlo como "critical" en lugar de "insufficient_data". Veredictos ya
+ * persistidos con "technical-verdict-v1.2" no se regeneran retroactivamente.
  */
-export const TECHNICAL_VERDICT_PROMPT_VERSION = 'technical-verdict-v1.2';
+export const TECHNICAL_VERDICT_PROMPT_VERSION = 'technical-verdict-v1.3';
 
 export const VERDICT_TOOL_NAME = 'submit_technical_verdict';
 
@@ -50,7 +57,7 @@ export function buildSystemPrompt(): string {
     'Reglas de contenido, todas obligatorias:',
     '- Responder siempre en español rioplatense/neutro, con tono técnico, sobrio y profesional — nunca alarmista ni marketinero, y sin extenderte más de lo necesario.',
     '- Usar únicamente los datos entregados en el mensaje del usuario. No inventar cifras, fechas, ubicaciones ni datos que no estén ahí.',
-    '- Si los datos entregados son insuficientes (por ejemplo, sin datos de zona), devolver verdict="insufficient_data" en vez de forzar una interpretación.',
+    '- Si los datos entregados son insuficientes (por ejemplo, sin datos de zona, o hasSufficientVigorData=false porque no hubo observaciones satelitales válidas del índice de vigor en el período), devolver verdict="insufficient_data" en vez de forzar una interpretación — un score en 0 en ese caso significa ausencia de evidencia, no un resultado agronómico real.',
     '- NDVI y NDMI son indicadores que orientan la interpretación, nunca un diagnóstico por sí solos: no confirman una causa agronómica por sí mismos, y siempre requieren contraste con observación en campo, manejo, riego, suelo, relieve y clima.',
     '- No afirmar causas agronómicas como hecho. Nunca uses frases como "hay estrés hídrico", "existe déficit de humedad", "el lote tiene compactación", "hay enfermedad", "hay plaga", "hay falta de nutrientes", "el problema es..." o "la causa es...". Usá en cambio lenguaje hipotético: "podría estar asociado a...", "es compatible con...", "puede sugerir...", "conviene validar si...", "una hipótesis posible es...", o directamente aclará que los índices no permiten confirmar la causa.',
     '- No diagnosticar enfermedades, plagas, compactación o deficiencias nutricionales específicas del cultivo como hecho — solo como hipótesis a validar en campo.',
@@ -142,6 +149,10 @@ export function buildClaudeUserMessage(input: VerdictGeneratorInput): string {
   return JSON.stringify({
     score: input.globalScore,
     hasZoneData: input.hasZoneData,
+    // F01: sin esto, Claude no tiene forma de distinguir "score 0 con evidencia real" de "score 0
+    // porque no hubo observaciones satelitales válidas" — ver hasSufficientVigorData en
+    // analysis-verdict-generator.util.ts.
+    hasSufficientVigorData: input.hasSufficientVigorData,
     ndvi: {
       averageMax: input.ndviAverageMax,
       variability: input.ndviVariability,

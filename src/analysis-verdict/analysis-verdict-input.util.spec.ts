@@ -89,6 +89,65 @@ describe('buildVerdictGeneratorInput', () => {
     expect(input.ndmiMean).toBeNull();
   });
 
+  // F01: hasSufficientVigorData — mismo criterio de compatibilidad hacia atrás que hasZoneData.
+  it('hasSufficientVigorData=true si resultJson es null (compatibilidad con análisis previos a F01)', () => {
+    const input = buildVerdictGeneratorInput(buildAnalysis({ resultJson: null }));
+
+    expect(input.hasSufficientVigorData).toBe(true);
+  });
+
+  it('hasSufficientVigorData=true si resultJson no trae dataAvailability (análisis previos al fix del worker)', () => {
+    const input = buildVerdictGeneratorInput(
+      buildAnalysis({
+        resultJson: { mode: 'python-worker-v2', message: '', totalsByZone: [] } as any,
+      }),
+    );
+
+    expect(input.hasSufficientVigorData).toBe(true);
+  });
+
+  it('hasSufficientVigorData=false si dataAvailability.globalScore es false', () => {
+    const input = buildVerdictGeneratorInput(
+      buildAnalysis({
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          totalsByZone: [],
+          dataAvailability: {
+            productivity: false,
+            stability: false,
+            confidence: false,
+            ndviAverageMax: false,
+            globalScore: false,
+          },
+        } as any,
+      }),
+    );
+
+    expect(input.hasSufficientVigorData).toBe(false);
+  });
+
+  it('hasSufficientVigorData=true si dataAvailability.globalScore es true', () => {
+    const input = buildVerdictGeneratorInput(
+      buildAnalysis({
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          totalsByZone: [{ zone: 0, name: 'Alta', hectares: 10, percent: 100 }],
+          dataAvailability: {
+            productivity: true,
+            stability: true,
+            confidence: true,
+            ndviAverageMax: true,
+            globalScore: true,
+          },
+        } as any,
+      }),
+    );
+
+    expect(input.hasSufficientVigorData).toBe(true);
+  });
+
   it('propaga globalScore/ndviAverageMax/ndviVariability tal cual desde Analysis', () => {
     const input = buildVerdictGeneratorInput(
       buildAnalysis({

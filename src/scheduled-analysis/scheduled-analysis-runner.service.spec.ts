@@ -23,6 +23,32 @@ import { WeeklyTechnicalVerdictService } from '../weekly-technical-verdict/weekl
 import { WeeklyTechnicalVerdict } from '../weekly-technical-verdict/entities/weekly-technical-verdict.entity';
 import { WeeklyTechnicalVerdictResponse } from '../weekly-technical-verdict/dto/weekly-technical-verdict.dto';
 
+/**
+ * Barrera de sincronización real (no un truco de awaits consecutivos): `n` llamadas concurrentes
+ * a `arrive()` quedan todas suspendidas hasta que la n-ésima llega, y solo entonces las `n`
+ * continúan juntas. Se usa para forzar una intercalación genuina entre dos reconcileRun() del
+ * mismo run — ambos deben leer "no existe snapshot" ANTES de que cualquiera de los dos intente
+ * crearlo (la ventana TOCTOU real que la reconciliación puede sufrir en producción), en vez de
+ * simular la carrera con dos `await` consecutivos sobre un único objeto mutable compartido.
+ */
+function createBarrier(n: number): { arrive: () => Promise<void> } {
+  let arrived = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  return {
+    async arrive() {
+      arrived += 1;
+      if (arrived >= n) {
+        release();
+      }
+      await gate;
+    },
+  };
+}
+
 describe('ScheduledAnalysisRunnerService', () => {
   let service: ScheduledAnalysisRunnerService;
   let scheduleRepository: {
@@ -1112,7 +1138,13 @@ describe('ScheduledAnalysisRunnerService', () => {
       );
     });
 
-    it('FASE 5: no manda email si todavía no hay snapshot para esta corrida (se reintenta después)', async () => {
+    it('FASE 5 (ampliado por el FIX de snapshot faltante): si falla la recuperación del snapshot en este ciclo, no manda email — pero SÍ la intenta usando el Analysis persistido', async () => {
+      // Antes del FIX, este test solo comprobaba "no email" para un run 'completed' sin
+      // snapshot, sin verificar que el sistema intentara resolverlo — un run así se quedaba
+      // huérfano para siempre (ver docstring de la clase). Ahora se verifica explícitamente que
+      // SÍ se reintenta (createFromAnalysis es llamado, con el Analysis re-leído por
+      // analysisService.findOne) y que, si ese intento también falla, el run sigue 'completed'
+      // (nunca se lo convierte en 'failed' por esto — es recuperable en el próximo ciclo).
       const run = buildRun({
         status: 'completed',
         analysisId: 'analysis-1',
@@ -1120,10 +1152,25 @@ describe('ScheduledAnalysisRunnerService', () => {
       });
       runRepository.find.mockResolvedValue([run]);
       weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      analysisService.findOne.mockResolvedValue(
+        buildAnalysis({ status: 'Finalizado' }),
+      );
+      weeklySnapshotService.createFromAnalysis.mockRejectedValue(
+        new Error('DB caída'),
+      );
 
       await service.reconcilePendingRuns();
 
+      expect(analysisService.findOne).toHaveBeenCalledWith('analysis-1');
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'run-1' }),
+        expect.objectContaining({ id: 'analysis-1', status: 'Finalizado' }),
+      );
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
       expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+      expect(runRepository.save).not.toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'failed' }),
+      );
     });
 
     it('no envía email si el Analysis falló (status=Error)', async () => {
@@ -1425,6 +1472,607 @@ describe('ScheduledAnalysisRunnerService', () => {
       await expect(service.reconcilePendingRuns()).resolves.toBeUndefined();
 
       expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // FIX: recuperación de snapshot faltante después de una falla transitoria de
+  // createFromAnalysis. Ver docstring de la clase para el detalle del bug original: un run que
+  // pasaba a 'completed' antes de que el snapshot terminara de crearse quedaba huérfano para
+  // siempre, porque la creación solo vivía dentro de la rama 'processing' de reconcileRun.
+  describe('FIX: recuperación de snapshot faltante entre ciclos de reconciliación', () => {
+    it('CASO 1/9 — dos ciclos reales: processing+Finalizado con falla inicial del snapshot, el segundo ciclo lo recupera y manda el email sin volver a llamar a runFieldAnalysis', async () => {
+      const run = buildRun({ status: 'processing', analysisId: 'analysis-1' });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const recoveredSnapshot = buildSnapshot({ id: 'snapshot-recovered' });
+
+      runRepository.find.mockResolvedValue([run]);
+      analysisService.findOne.mockResolvedValue(analysis);
+      fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+      usersService.findById.mockResolvedValue(buildUser());
+      emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+        sent: true,
+        provider: 'resend',
+        dryRun: false,
+      });
+
+      // Ciclo 1: el Analysis ya está Finalizado, pero createFromAnalysis falla transitoriamente
+      // (ej. DB caída un instante) — no hay snapshot todavía visible para nadie.
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      weeklySnapshotService.createFromAnalysis.mockRejectedValueOnce(
+        new Error('DB caída'),
+      );
+
+      await service.reconcilePendingRuns();
+
+      // Estado realista tras el ciclo 1 — el mismo objeto `run` que reconcileRun mutó
+      // directamente, no un estado inventado a mano para el ciclo 2.
+      expect(run.status).toBe('completed');
+      expect(run.emailSentAt).toBeNull();
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+
+      // Ciclo 2: mismo run, ya persistido 'completed' — reconcilePendingRuns vuelve a encontrarlo
+      // (el query de arriba incluye 'completed'). createFromAnalysis ahora funciona. El chequeo de
+      // existencia de ensureSnapshot (primera llamada de este ciclo) todavía debe ver "no existe"
+      // — recién después de crearlo, la lectura de sendCompletionEmail lo debe ver disponible.
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.createFromAnalysis.mockResolvedValueOnce(
+        recoveredSnapshot,
+      );
+      weeklySnapshotService.findByScheduledRunId
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(recoveredSnapshot);
+
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledTimes(2);
+      // La recuperación usa el Analysis YA persistido (mismo id, releído dos veces por
+      // analysisService.findOne) — nunca dispara un análisis satelital nuevo.
+      expect(analysisService.findOne).toHaveBeenCalledTimes(2);
+      expect(analysisService.findOne).toHaveBeenLastCalledWith('analysis-1');
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+      expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledTimes(1);
+      expect(run.status).toBe('completed');
+      expect(run.emailSentAt).toBeInstanceOf(Date);
+    });
+
+    it('CASO 2 — run ya persistido como completed sin snapshot (equivalente a un reinicio del proceso): recupera usando el Analysis persistido', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        completedAt: new Date('2026-08-24T12:00:00Z'),
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const snapshot = buildSnapshot({ id: 'snapshot-restart' });
+
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId
+        .mockResolvedValueOnce(null) // ensureSnapshot: todavía no existe
+        .mockResolvedValue(snapshot); // sendCompletionEmail: ya se acaba de crear
+      analysisService.findOne.mockResolvedValue(analysis);
+      weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+      fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+      usersService.findById.mockResolvedValue(buildUser());
+      emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+        sent: true,
+        provider: 'resend',
+        dryRun: false,
+      });
+
+      await service.reconcilePendingRuns();
+
+      expect(analysisService.findOne).toHaveBeenCalledWith('analysis-1');
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'run-1' }),
+        analysis,
+      );
+      expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('CASO 3 — si el snapshot ya existe para esta corrida, se reutiliza y no se vuelve a crear ni a releer el Analysis', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const existingSnapshot = buildSnapshot({ id: 'snapshot-existing' });
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(
+        existingSnapshot,
+      );
+      fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+      usersService.findById.mockResolvedValue(buildUser());
+      emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+        sent: true,
+        provider: 'resend',
+        dryRun: false,
+      });
+
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).not.toHaveBeenCalled();
+      expect(analysisService.findOne).not.toHaveBeenCalled();
+      expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledWith(
+        'user@example.com',
+        expect.objectContaining({ weekStart: existingSnapshot.weekStart }),
+      );
+    });
+
+    it('CASO 4 — falla persistente de createFromAnalysis a través de varios ciclos: nunca manda el email de éxito ni reintenta el análisis satelital', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      analysisService.findOne.mockResolvedValue(analysis);
+      weeklySnapshotService.createFromAnalysis.mockRejectedValue(
+        new Error('DB caída permanentemente'),
+      );
+
+      await service.reconcilePendingRuns();
+      await service.reconcilePendingRuns();
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledTimes(3);
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+      // El Analysis exitoso no se convierte en Error por esto, y la corrida sigue siendo
+      // recuperable en el próximo ciclo (no se la marca 'failed').
+      expect(run.status).toBe('completed');
+    });
+
+    it('CASO 5a — dos ciclos SECUENCIALES (no concurrentes) para la misma corrida no duplican la creación del snapshot', async () => {
+      // Este test corre dos reconcilePendingRuns() uno detrás del otro (await consecutivos) — NO
+      // demuestra concurrencia real, solo que el segundo ciclo reutiliza lo que el primero ya
+      // creó. La intercalación genuina de dos reconciliaciones REALMENTE solapadas (con la ventana
+      // TOCTOU real de "ambas ven 'no existe' antes de que cualquiera cree") está en CASO 9 más
+      // abajo, con una barrera de sincronización — no con awaits consecutivos sobre un único
+      // objeto mutable compartido.
+      //
+      // La protección exacta contra la carrera a nivel fila (unique(fieldId, weekStart, weekEnd)
+      // + catch de 23505) vive en WeeklyAnalysisSnapshotService.createFromAnalysis y ya está
+      // cubierta en weekly-analysis-snapshot.service.spec.ts; también se reprodujo el error 23505
+      // real contra PostgreSQL en una transacción aislada (ver entrega) — eso prueba que el índice
+      // único rechaza filas duplicadas, no que la reconciliación completa (snapshot + diagnóstico +
+      // email) sea libre de duplicados bajo concurrencia real: ver CASO 9 para esa distinción.
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const snapshot = buildSnapshot({ id: 'snapshot-race' });
+
+      runRepository.find.mockResolvedValue([run]);
+      analysisService.findOne.mockResolvedValue(analysis);
+      weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+      fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+      usersService.findById.mockResolvedValue(buildUser());
+      emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+        sent: true,
+        provider: 'resend',
+        dryRun: false,
+      });
+
+      // Ciclo "1": todavía no hay snapshot en ninguna de las dos lecturas de este mismo tick.
+      weeklySnapshotService.findByScheduledRunId
+        .mockResolvedValueOnce(null) // ensureSnapshot
+        .mockResolvedValueOnce(null) // sendCompletionEmail (simula que la escritura del create
+        //   todavía no es visible para esta lectura — mismo tick, sin reordenar mágicamente)
+        .mockResolvedValue(snapshot); // desde acá en adelante, ya visible.
+
+      await service.reconcilePendingRuns();
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+
+      // Ciclo "2" (siguiente, secuencial): el snapshot ya está visible.
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledTimes(1);
+      expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('CASO 9 — dos reconciliaciones REALMENTE solapadas (barrera de sincronización, dos instancias independientes de la misma fila) con schedule ACTIVO: la creación y el diagnóstico se disparan dos veces (idempotentes por su cuenta, no por el runner) y el email SÍ puede duplicarse — riesgo preexistente, no introducido ni ampliado por este fix', async () => {
+      // "Dos instancias independientes de la misma fila" — rowA y rowB NO son el mismo objeto: así
+      // como dos SELECTs concurrentes en Postgres devolverían dos copias independientes de la
+      // misma fila, este test no comparte un único run mutable entre las dos reconciliaciones, así
+      // que ninguna mutación de un lado se filtra mágicamente al otro.
+      const rowA = buildRun({
+        id: 'run-1',
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const rowB = buildRun({
+        id: 'run-1',
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const snapshot = buildSnapshot({ id: 'snapshot-concurrent' });
+
+      analysisService.findOne.mockResolvedValue(analysis);
+      // createFromAnalysis mockeado como éxito para AMBAS llamadas (nunca como un 23505 crudo):
+      // así se comporta la implementación real bajo una carrera — el "perdedor" no ve un error,
+      // WeeklyAnalysisSnapshotService.createFromAnalysis atrapa el 23505 y vuelve a leer la fila
+      // ganadora (ver su propio catch, cubierto en weekly-analysis-snapshot.service.spec.ts) — acá
+      // se mockea directamente ese resultado final en vez de reimplementar ese catch en este spec.
+      weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+      fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+      usersService.findById.mockResolvedValue(buildUser());
+      emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+        sent: true,
+        provider: 'resend',
+        dryRun: false,
+      });
+
+      // Barrera real: las DOS primeras llamadas a findByScheduledRunId (el chequeo de existencia
+      // de ensureSnapshot, una por cada reconciliación) quedan suspendidas hasta que ambas
+      // lleguen — ninguna ve el snapshot creado por la otra todavía. Llamadas posteriores (las de
+      // sendCompletionEmail, después de que ambas ya crearon/confirmaron el snapshot) sí lo ven.
+      const existenceCheckBarrier = createBarrier(2);
+      let findByScheduledRunIdCalls = 0;
+      weeklySnapshotService.findByScheduledRunId.mockImplementation(
+        async () => {
+          findByScheduledRunIdCalls += 1;
+          if (findByScheduledRunIdCalls <= 2) {
+            await existenceCheckBarrier.arrive();
+            return null;
+          }
+          return snapshot;
+        },
+      );
+
+      runRepository.find
+        .mockImplementationOnce(() => Promise.resolve([rowA]))
+        .mockImplementationOnce(() => Promise.resolve([rowB]));
+
+      await Promise.all([
+        service.reconcilePendingRuns(),
+        service.reconcilePendingRuns(),
+      ]);
+
+      // Ambas reconciliaciones vieron "no existe" antes de que cualquiera creara — el runner NO
+      // deduplica esto por su cuenta (no hay un chequeo adicional entre el existence-check y el
+      // create), así que createFromAnalysis se llama dos veces. Que esto no produzca dos filas
+      // reales es una garantía de WeeklyAnalysisSnapshotService (unique(fieldId, weekStart,
+      // weekEnd) + catch de 23505), no de este método — no se reafirma acá, ya está cubierta por
+      // separado (ver comentario de CASO 5a).
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledTimes(2);
+
+      // El diagnóstico semanal también se dispara dos veces por la misma razón. No se duplica en
+      // la fila real porque WeeklyTechnicalVerdictService.generateAndPersist es un find-then-merge
+      // idempotente por unique(snapshotId) (ver su propio docstring) — una garantía preexistente y
+      // ajena a este fix, no algo que el runner deduplique.
+      expect(
+        weeklyTechnicalVerdictService.generateAndPersist,
+      ).toHaveBeenCalledTimes(2);
+
+      // Riesgo preexistente, NO introducido ni ampliado por este fix: sendCompletionEmail no tiene
+      // ninguna escritura atómica tipo "UPDATE ... WHERE emailSentAt IS NULL" — solo lee
+      // emailSentAt en memoria y escribe después. Dos instancias independientes de la misma fila
+      // que llegan a este punto en paralelo pueden, ambas, ver emailSentAt=null y mandar el email.
+      // Este test lo hace visible en vez de esconderlo: documenta el estado ACTUAL (sin cambios de
+      // este fix), no una garantía nueva. Ver entrega: "riesgos preexistentes".
+      expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledTimes(2);
+    });
+
+    it('CASO 9b — dos reconciliaciones REALMENTE solapadas con schedule DESHABILITADO: el snapshot histórico se recupera en ambas, pero el email NUNCA se envía bajo ninguna intercalación', async () => {
+      const rowA = buildRun({
+        id: 'run-1',
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const rowB = buildRun({
+        id: 'run-1',
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const snapshot = buildSnapshot({ id: 'snapshot-concurrent-disabled' });
+
+      analysisService.findOne.mockResolvedValue(analysis);
+      weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+      scheduleRepository.findOne.mockResolvedValue(
+        buildSchedule({ enabled: false }),
+      );
+
+      const existenceCheckBarrier = createBarrier(2);
+      let findByScheduledRunIdCalls = 0;
+      weeklySnapshotService.findByScheduledRunId.mockImplementation(
+        async () => {
+          findByScheduledRunIdCalls += 1;
+          if (findByScheduledRunIdCalls <= 2) {
+            await existenceCheckBarrier.arrive();
+            return null;
+          }
+          return snapshot;
+        },
+      );
+
+      runRepository.find
+        .mockImplementationOnce(() => Promise.resolve([rowA]))
+        .mockImplementationOnce(() => Promise.resolve([rowB]));
+
+      await Promise.all([
+        service.reconcilePendingRuns(),
+        service.reconcilePendingRuns(),
+      ]);
+
+      // La garantía que SÍ aporta este fix: sin importar la intercalación, con el schedule
+      // deshabilitado nunca se llega a sendCompletionEmail — a diferencia del riesgo de CASO 9,
+      // acá no hay ninguna ventana de doble envío posible porque directamente no hay envío.
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+
+      // Ambas instancias recuperaron (o confirmaron) el snapshot histórico igual, a pesar del
+      // schedule desactivado — el objetivo central de este fix.
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledTimes(2);
+
+      // Ambas instancias, al ver el snapshot resuelto y el schedule desactivado, se retiran de
+      // reconciliación futura — no queda nada más pendiente para esta corrida.
+      expect(rowA.status).toBe('failed');
+      expect(rowB.status).toBe('failed');
+    });
+
+    it('CASO 6a — Analysis inexistente para el analysisId persistido: tratamiento explícito, no crashea, no manda email, y SIGUE consultándose en el ciclo siguiente (no se deja de reintentar)', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-borrado',
+        emailSentAt: null,
+      });
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      analysisService.findOne.mockRejectedValue(
+        new NotFoundException('Análisis no encontrado.'),
+      );
+
+      await expect(service.reconcilePendingRuns()).resolves.toBeUndefined();
+
+      expect(weeklySnapshotService.createFromAnalysis).not.toHaveBeenCalled();
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+      expect(run.status).toBe('completed');
+      expect(analysisService.findOne).toHaveBeenCalledTimes(1);
+
+      // No hay ninguna marca en el run que lo excluya de reconcilePendingRuns por esto — sigue
+      // 'completed', así que el ciclo siguiente vuelve a intentarlo. Se demuestra en vez de
+      // afirmarlo: la dependencia inexistente se sigue consultando, con el mismo costo que
+      // cualquier otra dependencia todavía sin resolver (no hay "dejar de reintentar" real, solo
+      // un mensaje de log más explícito que el de una falla transitoria genérica).
+      await service.reconcilePendingRuns();
+      expect(analysisService.findOne).toHaveBeenCalledTimes(2);
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+    });
+
+    it('CASO 6b — Analysis persistido en un estado incompatible (no Finalizado): tratamiento explícito (mensaje propio, distinto del genérico de falla transitoria), sin convertir el run en failed', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      analysisService.findOne.mockResolvedValue(
+        buildAnalysis({ status: 'Error', errorMessage: 'Fallo worker' }),
+      );
+
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).not.toHaveBeenCalled();
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+      // ScheduledAnalysisRun.status y Analysis.status son máquinas de estado distintas (ver
+      // 13-weekly-monitoring.md) — esto no "corrige" retroactivamente un run ya completado.
+      expect(run.status).toBe('completed');
+    });
+
+    it('CASO 7 — schedule deshabilitado: conserva la política de no enviar email, pero igual crea el snapshot como registro histórico del Analysis', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const snapshot = buildSnapshot({ id: 'snapshot-disabled-schedule' });
+
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      analysisService.findOne.mockResolvedValue(analysis);
+      weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+      scheduleRepository.findOne.mockResolvedValue(
+        buildSchedule({ enabled: false }),
+      );
+
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'run-1' }),
+        analysis,
+      );
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+      expect(runRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'failed',
+          errorMessage: expect.stringContaining('desactivado'),
+        }),
+      );
+    });
+
+    it('CASO 7b — schedule deshabilitado + falla inicial del snapshot: el run NO se marca failed en el primer ciclo (repetiría el bug original encubierto por el schedule apagado), y el segundo ciclo recupera el snapshot histórico sin mandar nunca el email', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const snapshot = buildSnapshot({ id: 'snapshot-disabled-recovered' });
+
+      analysisService.findOne.mockResolvedValue(analysis);
+      scheduleRepository.findOne.mockResolvedValue(
+        buildSchedule({ enabled: false }),
+      );
+      fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+
+      // Ciclo 1: schedule ya deshabilitado, y createFromAnalysis falla transitoriamente.
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      weeklySnapshotService.createFromAnalysis.mockRejectedValueOnce(
+        new Error('DB caída'),
+      );
+
+      await service.reconcilePendingRuns();
+
+      // ANTES de este fix, esta rama marcaba 'failed' sin importar si ensureSnapshot había
+      // conseguido el snapshot — eso sacaba el run para siempre de reconcilePendingRuns y el
+      // registro histórico quedaba huérfano. Ahora, sin snapshot todavía, el run se conserva
+      // 'completed' para poder reintentarlo.
+      expect(run.status).toBe('completed');
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+
+      // Ciclo 2: mismo run, ya persistido 'completed' (mutado directamente en el ciclo 1, estado
+      // realista entre ciclos) — createFromAnalysis ahora funciona.
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.createFromAnalysis.mockResolvedValueOnce(snapshot);
+
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledTimes(2);
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+      // El snapshot histórico se recuperó — ya no queda nada pendiente para este run, así que
+      // recién ahora es seguro sacarlo de reconciliación futura.
+      expect(run.status).toBe('failed');
+      // En NINGÚN momento, en ninguno de los dos ciclos, se mandó el email.
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+    });
+
+    it('CASO 7c — el schedule se deshabilita ENTRE el primer y el segundo ciclo: el snapshot se recupera en el segundo pero el email nunca sale', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const snapshot = buildSnapshot({ id: 'snapshot-disabled-mid-flight' });
+
+      analysisService.findOne.mockResolvedValue(analysis);
+      fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+
+      // Ciclo 1: schedule TODAVÍA activo, pero createFromAnalysis falla transitoriamente (el
+      // usuario ni siquiera desactivó nada todavía — la falla es independiente de eso).
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      weeklySnapshotService.createFromAnalysis.mockRejectedValueOnce(
+        new Error('DB caída'),
+      );
+      scheduleRepository.findOne.mockResolvedValueOnce(
+        buildSchedule({ enabled: true }),
+      );
+
+      await service.reconcilePendingRuns();
+
+      expect(run.status).toBe('completed');
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+
+      // Entre ciclo 1 y ciclo 2, el usuario desactiva el seguimiento semanal. Ciclo 2:
+      // createFromAnalysis ahora funciona, pero el schedule ya está desactivado.
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.createFromAnalysis.mockResolvedValueOnce(snapshot);
+      scheduleRepository.findOne.mockResolvedValue(
+        buildSchedule({ enabled: false }),
+      );
+
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'run-1' }),
+        analysis,
+      );
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+      expect(run.status).toBe('failed');
+      expect(run.errorMessage).toContain('desactivado');
+    });
+
+    it('CASO 7d — falla persistente de createFromAnalysis con schedule deshabilitado a través de varios ciclos: nunca se marca failed (conserva la posibilidad de recuperación) y nunca envía email', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId.mockResolvedValue(null);
+      analysisService.findOne.mockResolvedValue(analysis);
+      weeklySnapshotService.createFromAnalysis.mockRejectedValue(
+        new Error('DB caída permanentemente'),
+      );
+      scheduleRepository.findOne.mockResolvedValue(
+        buildSchedule({ enabled: false }),
+      );
+
+      await service.reconcilePendingRuns();
+      await service.reconcilePendingRuns();
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledTimes(3);
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+      // Sigue 'completed' — nunca se la marca 'failed' mientras el snapshot siga sin resolverse,
+      // así que la posibilidad de recuperación se conserva indefinidamente.
+      expect(run.status).toBe('completed');
+    });
+
+    it('CASO 8 — si el diagnóstico semanal falla durante la recuperación, el snapshot igual queda disponible y el email sale con normalidad', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: null,
+      });
+      const analysis = buildAnalysis({ status: 'Finalizado' });
+      const snapshot = buildSnapshot({ id: 'snapshot-diag-fails' });
+
+      runRepository.find.mockResolvedValue([run]);
+      weeklySnapshotService.findByScheduledRunId
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(snapshot);
+      analysisService.findOne.mockResolvedValue(analysis);
+      weeklySnapshotService.createFromAnalysis.mockResolvedValue(snapshot);
+      weeklyTechnicalVerdictService.generateAndPersist.mockRejectedValue(
+        new Error('falló la generación'),
+      );
+      fieldsService.findByIdOrFail.mockResolvedValue(buildField());
+      usersService.findById.mockResolvedValue(buildUser());
+      emailService.sendScheduledAnalysisEmail.mockResolvedValue({
+        sent: true,
+        provider: 'resend',
+        dryRun: false,
+      });
+
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.createFromAnalysis).toHaveBeenCalledTimes(1);
+      expect(emailService.sendScheduledAnalysisEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('CASO 10 — si el email ya se mandó, no vuelve a chequear/crear el snapshot ni a releer el Analysis (nunca una segunda oportunidad de envío)', async () => {
+      const run = buildRun({
+        status: 'completed',
+        analysisId: 'analysis-1',
+        emailSentAt: new Date(),
+      });
+      runRepository.find.mockResolvedValue([run]);
+
+      await service.reconcilePendingRuns();
+
+      expect(weeklySnapshotService.findByScheduledRunId).not.toHaveBeenCalled();
+      expect(weeklySnapshotService.createFromAnalysis).not.toHaveBeenCalled();
+      expect(analysisService.findOne).not.toHaveBeenCalled();
+      expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
     });
   });
 

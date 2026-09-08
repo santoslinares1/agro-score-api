@@ -20,6 +20,7 @@ import {
   getNdviEvolutionByCampaign,
   getTopZoneByHectares,
   confidenceLabel,
+  isVigorDataAvailable,
   safeText,
   scoreInterpretation,
   slugify,
@@ -84,6 +85,50 @@ describe('report-pdf.helpers', () => {
 
     it('banda baja (<40): menor desempeño relativo', () => {
       expect(scoreInterpretation(20)).toMatch(/menor desempeño/);
+    });
+
+    // F01: dataAvailable=false debe primar sobre cualquier banda numérica — un score en 0 sin
+    // evidencia no es "menor desempeño relativo", es ausencia de observación.
+    it('F01: dataAvailable=false anula la interpretación por banda, sin importar el score', () => {
+      expect(scoreInterpretation(0, false)).toMatch(/no hay evidencia satelital suficiente/i);
+      expect(scoreInterpretation(85, false)).toMatch(/no hay evidencia satelital suficiente/i);
+      expect(scoreInterpretation(0, false)).not.toMatch(/menor desempeño/);
+    });
+
+    it('F01: dataAvailable=true (o sin pasar el argumento) preserva el comportamiento anterior', () => {
+      expect(scoreInterpretation(85, true)).toMatch(/favorable/);
+      expect(scoreInterpretation(85)).toBe(scoreInterpretation(85, true));
+    });
+  });
+
+  describe('isVigorDataAvailable (F01)', () => {
+    it('true si resultJson es null/undefined (compatibilidad con análisis previos al fix)', () => {
+      expect(isVigorDataAvailable(null)).toBe(true);
+      expect(isVigorDataAvailable(undefined)).toBe(true);
+    });
+
+    it('true si resultJson no trae dataAvailability (análisis previos al fix del worker)', () => {
+      expect(isVigorDataAvailable({ mode: 'python-worker-v2', message: '' })).toBe(true);
+    });
+
+    it('false si dataAvailability.globalScore es false', () => {
+      expect(
+        isVigorDataAvailable({
+          mode: 'python-worker-v2',
+          message: '',
+          dataAvailability: { globalScore: false },
+        }),
+      ).toBe(false);
+    });
+
+    it('true si dataAvailability.globalScore es true', () => {
+      expect(
+        isVigorDataAvailable({
+          mode: 'python-worker-v2',
+          message: '',
+          dataAvailability: { globalScore: true },
+        }),
+      ).toBe(true);
     });
   });
 

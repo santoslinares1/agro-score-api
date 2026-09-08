@@ -8,6 +8,7 @@ import {
   ANALYSIS_STALE_THRESHOLD_MS,
   isAnalysisStale,
 } from '../analysis/analysis-stale.util';
+import { Analysis } from '../analysis/entities/analysis.entity';
 import { AnalysisVerdictService } from '../analysis-verdict/analysis-verdict.service';
 import { EmailService } from '../email/email.service';
 import { FieldsService } from '../fields/fields.service';
@@ -40,6 +41,28 @@ const VERDICT_WAIT_WINDOW_MS = 10 * 60 * 1000;
  * POST /analysis/field/:fieldId) con los flags del "informe visual completo", y a
  * AnalysisService.findOne para observar cuándo ese Analysis (fire-and-forget, igual que en el
  * flujo manual) termina. No modifica analysis.service.ts.
+ *
+ * FIX (recuperación de snapshot faltante): antes, la creación del WeeklyAnalysisSnapshot vivía
+ * únicamente dentro de la rama `run.status === 'processing'` de reconcileRun — el único momento en
+ * que se tenía el Analysis 'Finalizado' a mano. Si WeeklyAnalysisSnapshotService.createFromAnalysis
+ * fallaba transitoriamente ahí (DB caída un instante, etc.), el run ya había sido persistido como
+ * 'completed' un par de líneas antes, así que el próximo tick de reconciliación nunca volvía a
+ * entrar a esa rama (el run ya no está 'processing') y quedaba huérfano para siempre: sin
+ * snapshot, sin diagnóstico semanal, sin email (sendCompletionEmail encuentra el snapshot nulo y
+ * se resigna en silencio cada tick). Ahora ensureSnapshot/resolveFinalizedAnalysis reintentan esa
+ * dependencia en cualquier tick donde el run ya esté 'completed' sin snapshot — releyendo el
+ * Analysis persistido vía AnalysisService.findOne, nunca disparando AnalysisService.runFieldAnalysis
+ * de nuevo — y son idempotentes si el snapshot ya existe.
+ *
+ * FIX (recuperación bajo schedule deshabilitado): la corrección anterior seguía teniendo un borde
+ * sin cubrir — si el schedule estaba deshabilitado (o, defensivamente, si no se lo encontraba) Y
+ * ensureSnapshot fallaba en ese mismo tick, reconcileRun marcaba la corrida 'failed' de todos
+ * modos, sacándola para siempre de reconcilePendingRuns y dejando el snapshot histórico huérfano
+ * — el mismo bug original, esta vez encubierto por la desactivación en vez de por la falla
+ * transitoria sola. Ahora esa transición a 'failed' se pospone hasta que ensureSnapshot devuelva
+ * un snapshot resuelto (recién creado o ya existente): mientras no lo haga, la corrida permanece
+ * 'completed' y se reintenta en cada tick — sin abrir NUNCA una ventana de envío de email mientras
+ * el schedule siga deshabilitado.
  */
 @Injectable()
 export class ScheduledAnalysisRunnerService {
@@ -297,6 +320,13 @@ export class ScheduledAnalysisRunnerService {
   }
 
   private async reconcileRun(run: ScheduledAnalysisRun): Promise<void> {
+    // Analysis ya resuelto a 'Finalizado' EN ESTE MISMO tick (rama 'processing' de abajo) — se
+    // pasa tal cual a ensureSnapshot para no volver a leerlo. Si queda undefined (el run YA
+    // estaba 'completed' al empezar este tick, típicamente porque createFromAnalysis falló en un
+    // tick anterior — ver FIX de snapshot faltante más abajo), ensureSnapshot lo vuelve a
+    // resolver el mismo desde analysisId.
+    let finalizedAnalysis: Analysis | undefined;
+
     if (run.status === 'processing') {
       if (!run.analysisId) {
         return;
@@ -314,55 +344,7 @@ export class ScheduledAnalysisRunnerService {
           lastErrorMessage: null,
         });
 
-        // Fase 5: snapshot semanal comparativo — se crea siempre que el análisis llega a
-        // Finalizado (incluso con datos parciales/insuficientes, ver classifyDataQuality), nunca
-        // para un análisis que falló. Idempotente por unique(fieldId, weekStart, weekEnd), así
-        // que un tick de reconciliación que se solape con otro no duplica el snapshot.
-        let snapshot: WeeklyAnalysisSnapshot | null = null;
-        try {
-          snapshot = await this.weeklySnapshotService.createFromAnalysis(
-            run,
-            analysis,
-          );
-        } catch (error) {
-          this.logger.error(
-            `[scheduled-analysis] No se pudo crear el snapshot semanal (runId=${run.id}): ${this.describe(error)}`,
-          );
-        }
-
-        // PR 16B: diagnóstico semanal (weeklyTechnicalVerdict) — best-effort, propio try/catch
-        // separado del snapshot de arriba: si el snapshot se creó bien pero esto falla, el
-        // snapshot ya se creó igual (no se revierte) y el flujo sigue hacia el envío del email más
-        // abajo, en el mismo tick (ver PR 16A, sección 8). Nunca depende de que el technicalVerdict
-        // individual exista o haya salido 'generated' — se lee best-effort como contexto opcional,
-        // nunca se espera a que termine (evita heredar la ventana de espera de 10 min que ya tiene
-        // el veredicto individual, ver isWithinVerdictWaitWindow más abajo).
-        if (snapshot) {
-          try {
-            const [field, individualVerdict] = await Promise.all([
-              this.fieldsService.findByIdOrFail(run.fieldId),
-              this.analysisVerdictService.findResponseByAnalysisId(analysis.id),
-            ]);
-
-            await this.weeklyTechnicalVerdictService.generateAndPersist(
-              snapshot,
-              {
-                fieldName: field.name,
-                individualVerdict: individualVerdict
-                  ? {
-                      verdict: individualVerdict.verdict,
-                      confidence: individualVerdict.confidence,
-                      summary: individualVerdict.summary,
-                    }
-                  : null,
-              },
-            );
-          } catch (error) {
-            this.logger.error(
-              `[scheduled-analysis] No se pudo generar el diagnóstico semanal (runId=${run.id}, snapshotId=${snapshot.id}): ${this.describe(error)}`,
-            );
-          }
-        }
+        finalizedAnalysis = analysis;
       } else if (analysis.status === 'Error') {
         run.status = 'failed';
         run.failedAt = new Date();
@@ -381,18 +363,54 @@ export class ScheduledAnalysisRunnerService {
     }
 
     if (run.status === 'completed' && !run.emailSentAt) {
+      // FIX (recuperación de snapshot faltante — ver docstring de la clase): un run 'completed'
+      // puede llegar acá sin snapshot todavía, sea porque recién pasó a 'completed' arriba en
+      // este mismo tick, o porque quedó así de un tick anterior en el que createFromAnalysis
+      // falló transitoriamente — antes, esa segunda situación nunca se reintentaba (el bloque de
+      // creación vivía solo dentro de la rama 'processing' de arriba, que un run ya 'completed'
+      // nunca vuelve a atravesar). ensureSnapshot reintenta usando el Analysis YA persistido
+      // (analysisService.findOne, nunca AnalysisService.runFieldAnalysis) y es idempotente si el
+      // snapshot ya existe. Se hace ANTES de mirar si el schedule sigue activo, mismo criterio
+      // que la creación original: es un registro histórico del Analysis, no depende de si el
+      // usuario desactivó el seguimiento futuro. Se guarda el resultado porque el bloque de abajo
+      // lo necesita para decidir si ya es seguro dar por perdida esta corrida (ver FIX siguiente).
+      const snapshot = await this.ensureSnapshot(run, finalizedAnalysis);
+
       // FIX (auditoría predeploy): si el usuario desactivó el seguimiento semanal mientras esta
       // corrida seguía 'processing', el análisis igual puede terminar bien — pero ya no
-      // corresponde mandar el email. Releemos el schedule (no confiamos en un valor cacheado) y,
-      // si está desactivado, resolvemos la corrida como 'failed' con un motivo claro para que el
-      // próximo tick de reconciliación no la vuelva a intentar (el query de arriba solo busca
-      // 'processing'/'completed' — 'failed' queda afuera para siempre, sin necesitar una columna
-      // nueva). schedule.lastStatus no se toca: el análisis en sí terminó bien.
+      // corresponde mandar el email. Releemos el schedule (no confiamos en un valor cacheado).
       const schedule = await this.scheduleRepository.findOne({
         where: { id: run.scheduleId },
       });
 
       if (!schedule || !schedule.enabled) {
+        if (!snapshot) {
+          // FIX (recuperación bajo schedule deshabilitado): el snapshot histórico todavía no se
+          // pudo recuperar en este tick (createFromAnalysis sigue fallando, o el Analysis
+          // persistido sigue sin ser compatible — ver resolveFinalizedAnalysis). Marcar esta
+          // corrida 'failed' ACÁ, como hacía antes esta rama, repetiría el bug original: 'failed'
+          // sale para siempre de reconcilePendingRuns (solo mira processing/completed), así que el
+          // registro histórico quedaría huérfano igual que antes — esta vez encubierto por el
+          // schedule desactivado en vez de por la falla transitoria sola. La corrida queda
+          // 'completed' sin emailSentAt: el próximo tick vuelve a intentar ensureSnapshot Y a leer
+          // el schedule de nuevo (si sigue desactivado, la política de no mandar email se
+          // mantiene idéntica — no se abre ninguna ventana nueva de envío).
+          return;
+        }
+
+        // El snapshot histórico ya está resuelto (recién creado en este tick, o ya existía de
+        // antes) — no queda ninguna dependencia pendiente para esta corrida, así que recién ACÁ es
+        // seguro sacarla de reconciliación futura marcándola 'failed' con un motivo claro.
+        // schedule.lastStatus no se toca: el análisis en sí terminó bien.
+        //
+        // `!schedule` (a diferencia de `!schedule.enabled`) es defensivo, no un caso real
+        // esperado: ScheduledAnalysisRun.scheduleId es FK NOT NULL con
+        // onDelete: CASCADE hacia FieldAnalysisSchedule (ver la entidad y la migración
+        // 1787403339340-CreateScheduledAnalysis), y "desactivar" un schedule es siempre un UPDATE
+        // enabled=false (FieldAnalysisScheduleService, upsert sobre la única fila del campo),
+        // nunca un delete — un run ya persistido no debería poder sobrevivir a un schedule borrado.
+        // Se conserva el mismo tratamiento que `!schedule.enabled` por si esa garantía se rompe
+        // alguna vez (ej. una intervención manual en la base), en vez de dejar el run atascado.
         run.status = 'failed';
         run.errorMessage =
           'Envío de email omitido: el seguimiento semanal fue desactivado antes de poder enviarlo.';
@@ -402,6 +420,145 @@ export class ScheduledAnalysisRunnerService {
 
       await this.sendCompletionEmail(run);
     }
+  }
+
+  /**
+   * Resuelve el snapshot semanal de `run`, creándolo si todavía no existe. `finalizedAnalysis`
+   * viene seteado solo en el camino rápido (mismo tick en que reconcileRun detectó Analysis
+   * 'Finalizado' arriba) — ahí se va directo a crear, igual que antes, confiando en el unique
+   * (fieldId, weekStart, weekEnd) de WeeklyAnalysisSnapshotService.createFromAnalysis para el raro
+   * caso de que otro tick concurrente haya ganado la carrera (ver su propio catch de 23505).
+   *
+   * Sin `finalizedAnalysis` (run que YA estaba 'completed' al empezar este tick) es el camino de
+   * recuperación: se chequea primero si el snapshot ya existe (evita repetir el fetch+create en
+   * cada tick de reconciliación una vez resuelto) y, si no, se vuelve a resolver el Analysis desde
+   * `run.analysisId` antes de reintentar la creación — nunca se dispara un análisis nuevo.
+   */
+  private async ensureSnapshot(
+    run: ScheduledAnalysisRun,
+    finalizedAnalysis?: Analysis,
+  ): Promise<WeeklyAnalysisSnapshot | null> {
+    if (finalizedAnalysis) {
+      return this.createSnapshotAndDiagnosis(run, finalizedAnalysis);
+    }
+
+    const existing = await this.weeklySnapshotService.findByScheduledRunId(
+      run.id,
+    );
+    if (existing) {
+      return existing;
+    }
+
+    const analysis = await this.resolveFinalizedAnalysis(run);
+    if (!analysis) {
+      return null;
+    }
+
+    return this.createSnapshotAndDiagnosis(run, analysis);
+  }
+
+  /**
+   * Vuelve a leer (nunca recalcula) el Analysis de un run 'completed' sin snapshot. Solo verifica
+   * existencia y `status === 'Finalizado'` — NUNCA valida que `resultJson` tenga una forma
+   * compatible con lo que createFromAnalysis/extractSnapshotMetrics esperan. Eso es deliberado:
+   * extractSnapshotMetrics ya es tolerante con resultJson parcial/legacy/null (degrada a métricas
+   * "sin datos", nunca lanza por forma inesperada — ver weekly-analysis-snapshot-metrics.util.ts),
+   * así que agregar un chequeo de compatibilidad acá sería validación redundante con riesgo real de
+   * rechazar análisis legítimos más viejos. Si `resultJson` tuviera un problema que
+   * extractSnapshotMetrics no absorbe (ej. columnas NOT NULL del snapshot como weekStart/weekEnd
+   * quedando null en un Analysis muy viejo), esa falla ocurre recién dentro de
+   * createSnapshotAndDiagnosis/createFromAnalysis — indistinguible en el log de una falla
+   * transitoria de infraestructura. Riesgo preexistente conocido, no corregido acá (ver entrega).
+   *
+   * Un Analysis inexistente o que ya no está 'Finalizado' sí se distingue con su propio mensaje de
+   * log explícito en vez de uno genérico de "no se pudo crear" — pero esto NO significa que se deje
+   * de consultar: nada en el estado del run evita que el próximo tick de reconcilePendingRuns
+   * vuelva a llamar a este método y repita exactamente la misma llamada a analysisService.findOne
+   * (mismo costo que cualquier otra dependencia todavía sin resolver, ver CASO 6a/6b en el spec).
+   */
+  private async resolveFinalizedAnalysis(
+    run: ScheduledAnalysisRun,
+  ): Promise<Analysis | null> {
+    if (!run.analysisId) {
+      this.logger.error(
+        `[scheduled-analysis] No se puede recuperar el snapshot semanal: run ${run.id} está 'completed' sin analysisId.`,
+      );
+      return null;
+    }
+
+    let analysis: Analysis;
+    try {
+      analysis = await this.analysisService.findOne(run.analysisId);
+    } catch (error) {
+      this.logger.error(
+        `[scheduled-analysis] No se puede recuperar el snapshot semanal (runId=${run.id}): no se pudo obtener el Analysis ${run.analysisId}. ${this.describe(error)}`,
+      );
+      return null;
+    }
+
+    if (analysis.status !== 'Finalizado') {
+      this.logger.error(
+        `[scheduled-analysis] No se puede recuperar el snapshot semanal (runId=${run.id}): el Analysis ${run.analysisId} está en estado '${analysis.status}', no 'Finalizado' — dependencia irrecuperable sin reejecutar el análisis.`,
+      );
+      return null;
+    }
+
+    return analysis;
+  }
+
+  /**
+   * Fase 5: snapshot semanal comparativo — se crea siempre que el análisis llega a Finalizado
+   * (incluso con datos parciales/insuficientes, ver classifyDataQuality), nunca para un análisis
+   * que falló. Idempotente por unique(fieldId, weekStart, weekEnd), así que un tick de
+   * reconciliación que se solape con otro no duplica el snapshot.
+   */
+  private async createSnapshotAndDiagnosis(
+    run: ScheduledAnalysisRun,
+    analysis: Analysis,
+  ): Promise<WeeklyAnalysisSnapshot | null> {
+    let snapshot: WeeklyAnalysisSnapshot;
+    try {
+      snapshot = await this.weeklySnapshotService.createFromAnalysis(
+        run,
+        analysis,
+      );
+    } catch (error) {
+      this.logger.error(
+        `[scheduled-analysis] No se pudo crear el snapshot semanal (runId=${run.id}): ${this.describe(error)}`,
+      );
+      return null;
+    }
+
+    // PR 16B: diagnóstico semanal (weeklyTechnicalVerdict) — best-effort, propio try/catch
+    // separado del snapshot de arriba: si el snapshot se creó bien pero esto falla, el snapshot ya
+    // se creó igual (no se revierte) y el flujo sigue hacia el envío del email (ver PR 16A, sección
+    // 8). Nunca depende de que el technicalVerdict individual exista o haya salido 'generated' — se
+    // lee best-effort como contexto opcional, nunca se espera a que termine (evita heredar la
+    // ventana de espera de 10 min que ya tiene el veredicto individual, ver
+    // isWithinVerdictWaitWindow más abajo).
+    try {
+      const [field, individualVerdict] = await Promise.all([
+        this.fieldsService.findByIdOrFail(run.fieldId),
+        this.analysisVerdictService.findResponseByAnalysisId(analysis.id),
+      ]);
+
+      await this.weeklyTechnicalVerdictService.generateAndPersist(snapshot, {
+        fieldName: field.name,
+        individualVerdict: individualVerdict
+          ? {
+              verdict: individualVerdict.verdict,
+              confidence: individualVerdict.confidence,
+              summary: individualVerdict.summary,
+            }
+          : null,
+      });
+    } catch (error) {
+      this.logger.error(
+        `[scheduled-analysis] No se pudo generar el diagnóstico semanal (runId=${run.id}, snapshotId=${snapshot.id}): ${this.describe(error)}`,
+      );
+    }
+
+    return snapshot;
   }
 
   private async sendCompletionEmail(run: ScheduledAnalysisRun): Promise<void> {

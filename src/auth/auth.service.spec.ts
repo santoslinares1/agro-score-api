@@ -1,6 +1,6 @@
 import { BadRequestException, ConflictException, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { getRepositoryToken } from '@nestjs/typeorm';
+import { getDataSourceToken, getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 import * as bcrypt from 'bcryptjs';
 
@@ -47,6 +47,14 @@ describe('AuthService', () => {
   let auditLogService: jest.Mocked<AuditLogService>;
   let invitationRepo: { findOne: jest.Mock; save: jest.Mock };
   let passwordResetRepo: { findOne: jest.Mock; save: jest.Mock };
+  // F03: repositorio de PasswordResetToken TAL COMO lo vería
+  // manager.getRepository(PasswordResetToken) dentro de la transacción de
+  // AuthService.resetPassword — distinto de `passwordResetRepo` de arriba, que
+  // es el repositorio "normal" (no transaccional) usado solo para el
+  // fast-path inicial. Un test que quiera ejercitar el camino real de
+  // consumo del token debe mockear ESTE, no `passwordResetRepo`.
+  let managerPasswordResetRepo: { findOne: jest.Mock; save: jest.Mock };
+  let dataSourceTransaction: jest.Mock;
 
   const buildUser = (overrides: Partial<User> = {}): User => ({
     id: 'user-1',
@@ -55,6 +63,7 @@ describe('AuthService', () => {
     fullName: 'User A',
     companyName: 'Acme',
     role: 'owner',
+    tokenVersion: 0,
     createdAt: new Date('2026-01-01'),
     updatedAt: new Date('2026-01-01'),
     ...overrides,
@@ -63,6 +72,33 @@ describe('AuthService', () => {
   beforeEach(async () => {
     invitationRepo = { findOne: jest.fn(), save: jest.fn() };
     passwordResetRepo = { findOne: jest.fn(), save: jest.fn() };
+    managerPasswordResetRepo = { findOne: jest.fn(), save: jest.fn() };
+
+    // F03: DataSource mockeado — `transaction()` ejecuta el callback real de
+    // AuthService.resetPassword pasándole un EntityManager falso cuyo único método usado,
+    // getRepository(PasswordResetToken), devuelve managerPasswordResetRepo. Esto SÍ atraviesa la
+    // lógica real de resetPassword (incluida la decisión de qué hacer si el manager no encuentra
+    // el token, o si updatePassword no afecta filas) — lo único mockeado es la mecánica de
+    // apertura/commit/rollback de la transacción en sí, que un test unitario con repos en memoria
+    // no puede ejercitar de verdad (esa garantía se verifica aparte, contra PostgreSQL real).
+    dataSourceTransaction = jest.fn(
+      async (
+        work: (manager: { getRepository: jest.Mock }) => Promise<unknown>,
+      ) => {
+        const fakeManager = {
+          getRepository: jest.fn((entity: unknown) => {
+            if (entity === PasswordResetToken) {
+              return managerPasswordResetRepo;
+            }
+            throw new Error(
+              `dataSourceTransaction mock: entidad inesperada ${String(entity)} — el test necesita mockearla explícitamente.`,
+            );
+          }),
+        };
+
+        return work(fakeManager);
+      },
+    );
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -73,9 +109,12 @@ describe('AuthService', () => {
             findByEmail: jest.fn(),
             findById: jest.fn(),
             create: jest.fn(),
-            updatePassword: jest.fn().mockResolvedValue(undefined),
+            // F03: updatePassword ahora devuelve UpdateResult (antes void) — { affected: 1 } es
+            // el default "feliz" para no tener que mockearlo en cada test que no es sobre esto en
+            // particular (mismo criterio que el resto de los defaults de este bloque).
+            updatePassword: jest.fn().mockResolvedValue({ affected: 1 }),
             toPublicUser: jest.fn((user: User) => {
-              const { passwordHash: _passwordHash, ...rest } = user;
+              const { passwordHash: _passwordHash, tokenVersion: _tokenVersion, ...rest } = user;
               return rest;
             }),
           },
@@ -92,6 +131,10 @@ describe('AuthService', () => {
         },
         { provide: getRepositoryToken(UserInvitation), useValue: invitationRepo },
         { provide: getRepositoryToken(PasswordResetToken), useValue: passwordResetRepo },
+        {
+          provide: getDataSourceToken(),
+          useValue: { transaction: dataSourceTransaction },
+        },
       ],
     }).compile();
 
@@ -294,8 +337,14 @@ describe('AuthService', () => {
   describe('resetPassword', () => {
     it('actualiza la password, marca usedAt, audita y nunca devuelve hash/token', async () => {
       const resetToken = buildResetToken();
+      // Fast-path (no transaccional, ver docstring del método): solo decide si vale la pena
+      // pagar el costo de bcrypt. El chequeo real que importa para la garantía de atomicidad es
+      // el de managerPasswordResetRepo, dentro de la transacción — ver el resto de este describe.
       passwordResetRepo.findOne.mockResolvedValue(resetToken);
-      passwordResetRepo.save.mockImplementation((v: unknown) => Promise.resolve(v));
+      managerPasswordResetRepo.findOne.mockResolvedValue(resetToken);
+      managerPasswordResetRepo.save.mockImplementation((v: unknown) =>
+        Promise.resolve(v),
+      );
 
       const result = await service.resetPassword({
         token: 'raw-reset-token',
@@ -306,17 +355,27 @@ describe('AuthService', () => {
       expect(result).not.toHaveProperty('passwordHash');
       expect(result).not.toHaveProperty('tokenHash');
 
+      // F03: la transacción se abrió, y updatePassword se llamó CON el manager transaccional
+      // (tercer argumento) — no con el repositorio "normal" de UsersService.
+      expect(dataSourceTransaction).toHaveBeenCalledTimes(1);
       expect(usersService.updatePassword).toHaveBeenCalledWith(
         resetToken.userId,
         expect.any(String),
+        expect.objectContaining({ getRepository: expect.any(Function) }),
       );
       const passwordHashArg = usersService.updatePassword.mock.calls[0][1];
       expect(passwordHashArg).not.toBe('newpassword123');
       expect(bcrypt.compareSync('newpassword123', passwordHashArg)).toBe(true);
 
-      expect(passwordResetRepo.save).toHaveBeenCalledWith(
+      // El consumo del token (usedAt) se hizo a través del manager transaccional, nunca del
+      // repositorio "normal" — si esto se hubiera hecho mal (ej. usando passwordResetRepo.save
+      // directo), esa escritura viviría FUERA de la transacción, exactamente el bug que esta
+      // ficha corrige.
+      expect(managerPasswordResetRepo.save).toHaveBeenCalledWith(
         expect.objectContaining({ usedAt: expect.any(Date) }),
       );
+      expect(passwordResetRepo.save).not.toHaveBeenCalled();
+
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({
           action: 'auth.password_reset.completed',
@@ -327,14 +386,19 @@ describe('AuthService', () => {
       );
     });
 
-    it('rechaza un token que no matchea ningún reset pendiente', async () => {
+    it('rechaza un token que no matchea ningún reset pendiente (fast-path, nunca abre transacción)', async () => {
       passwordResetRepo.findOne.mockResolvedValue(null);
 
       await expect(
-        service.resetPassword({ token: 'token-invalido', password: 'newpassword123' }),
+        service.resetPassword({
+          token: 'token-invalido',
+          password: 'newpassword123',
+        }),
       ).rejects.toBeInstanceOf(BadRequestException);
 
+      expect(dataSourceTransaction).not.toHaveBeenCalled();
       expect(usersService.updatePassword).not.toHaveBeenCalled();
+      expect(auditLogService.record).not.toHaveBeenCalled();
     });
 
     it('busca el token con el mismo criterio que acceptInvitation (hash, usedAt IS NULL, expiresAt > now)', async () => {
@@ -347,15 +411,109 @@ describe('AuthService', () => {
       passwordResetRepo.findOne.mockResolvedValue(null);
 
       await expect(
-        service.resetPassword({ token: 'usado-o-vencido', password: 'newpassword123' }),
+        service.resetPassword({
+          token: 'usado-o-vencido',
+          password: 'newpassword123',
+        }),
       ).rejects.toBeInstanceOf(BadRequestException);
 
       expect(passwordResetRepo.findOne).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: expect.objectContaining({ tokenHash: hashToken('usado-o-vencido') }),
+          where: expect.objectContaining({
+            tokenHash: hashToken('usado-o-vencido'),
+          }),
         }),
       );
       expect(usersService.updatePassword).not.toHaveBeenCalled();
+    });
+
+    it('F03: rechaza dentro de la transacción con lock (mode: pessimistic_write) — el fast-path pasó pero la fila ya no matchea al tomar el lock (perdedor de una carrera)', async () => {
+      // Simula el caso real de dos requests concurrentes: el chequeo inicial no transaccional
+      // (passwordResetRepo.findOne) vio el token disponible, pero para cuando esta transacción
+      // toma el lock, otra ya lo consumió y confirmó — managerPasswordResetRepo.findOne (el
+      // SELECT ... FOR UPDATE real) ya no lo encuentra.
+      const resetToken = buildResetToken();
+      passwordResetRepo.findOne.mockResolvedValue(resetToken);
+      managerPasswordResetRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.resetPassword({
+          token: 'raw-reset-token',
+          password: 'newpassword123',
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(managerPasswordResetRepo.findOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          lock: { mode: 'pessimistic_write' },
+        }),
+      );
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
+      expect(auditLogService.record).not.toHaveBeenCalled();
+    });
+
+    it('F03: si updatePassword no afecta ninguna fila (usuario inexistente para el token), revierte todo sin auditar', async () => {
+      // Caso defensivo — password_reset_tokens.userId es FK NOT NULL con onDelete CASCADE hacia
+      // users (ver la entidad y la migración), así que en la práctica esto no debería ser
+      // alcanzable; el código igual lo trata explícitamente en vez de dejar el token consumido
+      // para un usuario fantasma.
+      const resetToken = buildResetToken();
+      passwordResetRepo.findOne.mockResolvedValue(resetToken);
+      managerPasswordResetRepo.findOne.mockResolvedValue(resetToken);
+      managerPasswordResetRepo.save.mockImplementation((v: unknown) =>
+        Promise.resolve(v),
+      );
+      usersService.updatePassword.mockResolvedValueOnce({
+        affected: 0,
+      } as never);
+
+      await expect(
+        service.resetPassword({
+          token: 'raw-reset-token',
+          password: 'newpassword123',
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(auditLogService.record).not.toHaveBeenCalled();
+    });
+
+    it('F03: si falla una escritura dentro de la transacción, el error se propaga y NO se audita (la auditoría nunca se ejecuta para una operación revertida)', async () => {
+      // Test a nivel de control de flujo: confirma que el `throw` dentro del callback de
+      // transacción evita que el código llegue al auditLogService.record de más abajo. La
+      // garantía de que Postgres realmente deshace passwordHash/usedAt ante esta misma falla se
+      // verifica aparte, contra PostgreSQL real (ver entrega) — un repo mockeado no puede
+      // demostrar un rollback real.
+      const resetToken = buildResetToken();
+      passwordResetRepo.findOne.mockResolvedValue(resetToken);
+      managerPasswordResetRepo.findOne.mockResolvedValue(resetToken);
+      managerPasswordResetRepo.save.mockRejectedValue(new Error('DB caída'));
+
+      await expect(
+        service.resetPassword({
+          token: 'raw-reset-token',
+          password: 'newpassword123',
+        }),
+      ).rejects.toThrow('DB caída');
+
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
+      expect(auditLogService.record).not.toHaveBeenCalled();
+    });
+
+    it('F03: nunca devuelve el token crudo ni el hash en el mensaje de error de un token inválido', async () => {
+      passwordResetRepo.findOne.mockResolvedValue(null);
+
+      try {
+        await service.resetPassword({
+          token: 'token-secreto-cualquiera',
+          password: 'newpassword123',
+        });
+        throw new Error('debería haber rechazado');
+      } catch (error) {
+        expect(error).toBeInstanceOf(BadRequestException);
+        const message = (error as BadRequestException).message;
+        expect(message).not.toContain('token-secreto-cualquiera');
+        expect(message).not.toContain(hashToken('token-secreto-cualquiera'));
+      }
     });
   });
 });

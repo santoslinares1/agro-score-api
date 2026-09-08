@@ -4,6 +4,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 
 import { FieldsService } from '../fields/fields.service';
 import { Field } from '../fields/entities/field.entity';
+import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { AnalysisService } from './analysis.service';
 import { Analysis } from './entities/analysis.entity';
@@ -16,7 +17,20 @@ type MockRepo = {
   create: jest.Mock;
   save: jest.Mock;
   createQueryBuilder: jest.Mock;
+  query: jest.Mock;
 };
+
+/**
+ * F02: verificación INDEPENDIENTE de la duración de un fixture de fecha, deliberadamente
+ * separada de `daysBetweenIsoDates` (analysis-constraints.ts, la función productiva que este
+ * archivo ejercita vía AnalysisService.runFieldAnalysis) — sirve para blindar contra fixtures mal
+ * etiquetados (ver la deficiencia de "366 días" corregida en esta ficha: un test decía "366 días"
+ * con un rango que en realidad eran 365), no para volver a validar la función bajo prueba.
+ */
+function _actualDaysBetween(startDate: string, endDate: string): number {
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  return Math.round((new Date(endDate).getTime() - new Date(startDate).getTime()) / MS_PER_DAY);
+}
 
 describe('AnalysisService', () => {
   let service: AnalysisService;
@@ -83,9 +97,19 @@ describe('AnalysisService', () => {
     orderBy: jest.Mock;
     getMany: jest.Mock;
     getOne: jest.Mock;
+    insert: jest.Mock;
+    into: jest.Mock;
+    values: jest.Mock;
+    getQueryAndParameters: jest.Mock;
   };
+  /** F04: última carga pasada a queryBuilderMock.values({...}) — permite que el mock de
+   * analysisRepository.query "eco" esos mismos campos en la fila devuelta, igual que el viejo
+   * mock de save((entity) => ({ id, ...entity })) hacía. No es SQL real: solo mantiene el
+   * contrato (forma de los datos) que el resto de estos tests unitarios ya asumía. */
+  let lastInsertValues: Record<string, unknown> = {};
 
   beforeEach(async () => {
+    lastInsertValues = {};
     queryBuilderMock = {
       innerJoin: jest.fn().mockReturnThis(),
       select: jest.fn().mockReturnThis(),
@@ -93,6 +117,13 @@ describe('AnalysisService', () => {
       orderBy: jest.fn().mockReturnThis(),
       getMany: jest.fn().mockResolvedValue([]),
       getOne: jest.fn().mockResolvedValue(null),
+      insert: jest.fn().mockReturnThis(),
+      into: jest.fn().mockReturnThis(),
+      values: jest.fn((values: Record<string, unknown>) => {
+        lastInsertValues = values;
+        return queryBuilderMock;
+      }),
+      getQueryAndParameters: jest.fn(() => ['INSERT INTO "analysis" (...) VALUES (...)', []]),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -108,6 +139,16 @@ describe('AnalysisService', () => {
               Promise.resolve({ id: entity.id ?? 'analysis-1', ...entity }),
             ),
             createQueryBuilder: jest.fn(() => queryBuilderMock),
+            // F04: runFieldAnalysis ya no hace create()+save() para la fila nueva — hace un solo
+            // INSERT ... ON CONFLICT ... RETURNING atómico vía query(). Por default simula un
+            // INSERT exitoso (inserted=true), ecoando los mismos campos que se le pasaron a
+            // .values(...) — igual forma de datos que el viejo mock de save(), para no romper los
+            // tests que no están probando la deduplicación de F04 en sí (ver
+            // analysis-dedup-race.e2e-spec.ts para la evidencia real de esa carrera, con
+            // PostgreSQL real). Los tests de F04 específicos pisan esto con mockResolvedValueOnce.
+            query: jest.fn(() =>
+              Promise.resolve([{ id: 'analysis-1', ...lastInsertValues, inserted: true }]),
+            ),
           },
         },
         {
@@ -405,6 +446,79 @@ describe('AnalysisService', () => {
 
       expect(fieldsService.findOne).toHaveBeenCalledWith('field-1', 'user-A');
       expect(result).toHaveLength(1);
+    });
+
+    // F01 (pendiente de la revisión independiente): field-detail.component.ts consume este
+    // resumen liviano (sin resultJson) para el historial de un campo — sin esta señal, no había
+    // forma de que Web supiera si un globalScore=0 era una ausencia de evidencia o un cero real.
+    it('F01: globalScoreAvailable=true si resultJson es null (compatibilidad con análisis previos)', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisRepository.find.mockResolvedValue([buildAnalysis({ resultJson: null })]);
+
+      const [summary] = await service.findByField('field-1', 'user-A');
+
+      expect(summary.globalScoreAvailable).toBe(true);
+    });
+
+    it('F01: globalScoreAvailable=true si resultJson no trae dataAvailability (análisis previos al fix del worker)', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisRepository.find.mockResolvedValue([
+        buildAnalysis({ resultJson: { mode: 'python-worker-v2', message: '' } }),
+      ]);
+
+      const [summary] = await service.findByField('field-1', 'user-A');
+
+      expect(summary.globalScoreAvailable).toBe(true);
+    });
+
+    it('F01: globalScoreAvailable=false si resultJson.dataAvailability.globalScore es false', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisRepository.find.mockResolvedValue([
+        buildAnalysis({
+          globalScore: 0,
+          resultJson: {
+            mode: 'python-worker-v2',
+            message: '',
+            dataAvailability: {
+              productivity: false,
+              stability: false,
+              confidence: false,
+              ndviAverageMax: false,
+              globalScore: false,
+            },
+          },
+        }),
+      ]);
+
+      const [summary] = await service.findByField('field-1', 'user-A');
+
+      expect(summary.globalScoreAvailable).toBe(false);
+      expect(summary.globalScore).toBe(0);
+    });
+
+    it('F01: globalScoreAvailable=true si resultJson.dataAvailability.globalScore es true (cero legítimo incluido)', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisRepository.find.mockResolvedValue([
+        buildAnalysis({
+          globalScore: 0,
+          resultJson: {
+            mode: 'python-worker-v2',
+            message: '',
+            dataAvailability: {
+              productivity: true,
+              stability: true,
+              confidence: true,
+              ndviAverageMax: true,
+              globalScore: true,
+            },
+          },
+        }),
+      ]);
+
+      const [summary] = await service.findByField('field-1', 'user-A');
+
+      expect(summary.globalScoreAvailable).toBe(true);
+      expect(summary.globalScore).toBe(0);
     });
 
     it('propaga NotFoundException si el Field es ajeno, sin consultar el historial', async () => {
@@ -834,7 +948,215 @@ describe('AnalysisService', () => {
       );
 
       expect(result).toBeDefined();
-      expect(analysisRepository.save).toHaveBeenCalled();
+      // F04: la creación ya no pasa por save() — es un INSERT ... ON CONFLICT ... RETURNING
+      // atómico vía query() (ver analysis.service.ts). save() sigue existiendo para otras
+      // escrituras (marcar Error un stale, actualizar a Finalizado en background), pero no para
+      // esta.
+      expect(analysisRepository.query).toHaveBeenCalled();
+    });
+  });
+
+  describe('runFieldAnalysis — validación de duración máxima del rango (F02)', () => {
+    const pipelineInputStub = {
+      fieldId: 'field-1',
+      name: 'Campo A',
+      lots: [
+        {
+          id: 'lot-1',
+          name: 'Lote 1',
+          geojson: {},
+          areaHa: 10,
+          includeInProductivityClassification: true,
+        },
+      ],
+    } as any;
+
+    it('reproduce el bug reportado: 2024-09-05 → 2026-09-05 (730 días, el recorrido de defaults de 24 meses de Web) se rechaza sin crear Analysis ni consultar el dedupe', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate: '2024-09-05', endDate: '2026-09-05', maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toThrow(
+        'El rango entre la fecha de inicio y la fecha de fin no puede superar 366 días (elegido: 730 días). Elegí un rango más corto.',
+      );
+
+      expect(analysisRepository.findOne).not.toHaveBeenCalled();
+      expect(analysisRepository.save).not.toHaveBeenCalled();
+      expect(pythonWorkerService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+
+    it('acepta exactamente 365 días', async () => {
+      // Deficiencia detectada en la evidencia previa: este fixture (2025-01-01 → 2026-01-01)
+      // estaba antes en un test titulado "acepta exactamente 366 días", pero 2025 no es bisiesto:
+      // son 365 días, no 366. `_actualDaysBetween` de acá abajo NO es la función productiva bajo
+      // prueba (`daysBetweenIsoDates` de analysis-constraints.ts) — es un cálculo independiente
+      // con `Date` nativo, justo para que un mislabeling de fixture como este no vuelva a pasar
+      // desapercibido (si dependiera de la misma función que valida, un bug ahí "confirmaría" la
+      // duración incorrecta en vez de detectarla).
+      const startDate = '2025-01-01';
+      const endDate = '2026-01-01';
+      expect(_actualDaysBetween(startDate, endDate)).toBe(365);
+
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(pipelineInputStub);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate, endDate, maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toBeDefined();
+      // F04: la creación ya no pasa por save() — es un INSERT ... ON CONFLICT ... RETURNING
+      // atómico vía query() (ver analysis.service.ts). save() sigue existiendo para otras
+      // escrituras (marcar Error un stale, actualizar a Finalizado en background), pero no para
+      // esta.
+      expect(analysisRepository.query).toHaveBeenCalled();
+    });
+
+    it('acepta exactamente 366 días (límite inclusive, mismo criterio que limits.py del Worker: `> MAX_DATE_RANGE_DAYS` rechaza, no `>=`)', async () => {
+      // Mismo startDate que el caso de 365 días, un día más de rango.
+      const startDate = '2025-01-01';
+      const endDate = '2026-01-02';
+      expect(_actualDaysBetween(startDate, endDate)).toBe(366);
+
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(pipelineInputStub);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate, endDate, maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toBeDefined();
+      // F04: la creación ya no pasa por save() — es un INSERT ... ON CONFLICT ... RETURNING
+      // atómico vía query() (ver analysis.service.ts). save() sigue existiendo para otras
+      // escrituras (marcar Error un stale, actualizar a Finalizado en background), pero no para
+      // esta.
+      expect(analysisRepository.query).toHaveBeenCalled();
+    });
+
+    it('rechaza 367 días — un día por encima del límite', async () => {
+      const startDate = '2025-01-01';
+      const endDate = '2026-01-03';
+      expect(_actualDaysBetween(startDate, endDate)).toBe(367);
+
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate, endDate, maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(analysisRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('año bisiesto: un rango de 12 meses calendario que atraviesa un 29 de febrero da exactamente 366 días y se acepta', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(pipelineInputStub);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      // 2023-03-01 → 2024-03-01 atraviesa el 29/2/2024 (2024 es bisiesto) → 366 días exactos.
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2023-03-01', endDate: '2024-03-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toBeDefined();
+    });
+
+    it('año bisiesto: el mismo rango de 12 meses calendario un día después (2023-03-02 → 2024-03-02) sigue dando 366 días y se acepta (no se corre por el bisiesto)', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(pipelineInputStub);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2023-03-02', endDate: '2024-03-02', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toBeDefined();
+    });
+
+    it('cambio de año calendario sin bisiesto de por medio: 2025-06-15 → 2026-06-15 da 365 días y se acepta', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(pipelineInputStub);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2025-06-15', endDate: '2026-06-15', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toBeDefined();
+    });
+
+    it('un rango personalizado válido (dentro del límite) llega al Worker con las MISMAS fechas que eligió el usuario, sin recortarlas', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(pipelineInputStub);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2025-05-10', endDate: '2025-11-20', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      // F04: la creación ya no pasa por save() — el INSERT atómico arma sus valores vía
+      // queryBuilder.insert().values({...}) (ver analysis.service.ts). El mock de
+      // queryBuilderMock.values captura exactamente lo que runFieldAnalysis le pasó.
+      expect(queryBuilderMock.values).toHaveBeenCalledWith(
+        expect.objectContaining({
+          startDate: '2025-05-10',
+          endDate: '2025-11-20',
+        }),
+      );
+    });
+  });
+
+  describe('runFieldAnalysis — scheduled-analysis (F05: ventana móvil de 7 días) no se ve afectado por el límite de F02 (regresión)', () => {
+    it('un rango de 7 días (el que usa siempre scheduled-analysis) nunca se acerca al límite de 366 días', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue({
+        fieldId: 'field-1',
+        name: 'Campo A',
+        lots: [
+          {
+            id: 'lot-1',
+            name: 'Lote 1',
+            geojson: {},
+            areaHa: 10,
+            includeInProductivityClassification: true,
+          },
+        ],
+      } as any);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2026-08-25', endDate: '2026-09-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toBeDefined();
+      // F04: la creación ya no pasa por save() — es un INSERT ... ON CONFLICT ... RETURNING
+      // atómico vía query() (ver analysis.service.ts). save() sigue existiendo para otras
+      // escrituras (marcar Error un stale, actualizar a Finalizado en background), pero no para
+      // esta.
+      expect(analysisRepository.query).toHaveBeenCalled();
     });
   });
 
@@ -934,6 +1256,292 @@ describe('AnalysisService', () => {
       expect(fieldsService.getPipelineInput).toHaveBeenCalledWith('field-1');
       expect(result.id).not.toBe('stale-analysis-1');
     });
+  });
+
+  /**
+   * F04: estos tests son UNITARIOS (repositorio mockeado) — verifican la lógica de
+   * catch-y-reutilización de runFieldAnalysis en aislamiento (isUniqueViolation, el refetch, no
+   * disparar background en la rama perdedora), no la carrera real de Postgres. La evidencia de
+   * concurrencia real (dos conexiones, contención genuina en el índice único, observada vía
+   * pg_stat_activity) vive en test/analysis-dedup-race.e2e-spec.ts, contra una base PostgreSQL
+   * real y descartable — un mock no puede demostrar que Postgres serializa dos INSERT que compiten
+   * por el mismo índice único, solo que el código de este archivo reacciona correctamente SI eso
+   * pasa.
+   */
+  describe('runFieldAnalysis — F04 (revisión independiente): pierde la carrera contra UQ_analysis_running_per_field (INSERT ... ON CONFLICT ... RETURNING simulado)', () => {
+    const buildFieldInput = () => ({
+      fieldId: 'field-1',
+      name: 'Campo A',
+      lots: [
+        {
+          id: 'lot-1',
+          name: 'Lote 1',
+          geojson: {},
+          areaHa: 10,
+          includeInProductivityClassification: true,
+        },
+      ],
+    });
+
+    it('query() devuelve inserted=false: reutiliza la fila ganadora ya existente, no lanza y no dispara un segundo procesamiento', async () => {
+      // El mecanismo nuevo (ver analysis.service.ts) no lanza ante la carrera: el propio INSERT
+      // ... ON CONFLICT ... DO UPDATE ... RETURNING (xmax = 0) AS inserted resuelve, en UNA sola
+      // sentencia atómica, si esta request insertó la fila (inserted=true) o si otra ya la había
+      // insertado y esta solo "tocó" la existente vía el DO UPDATE no-op (inserted=false). No hay
+      // save() ni un catch+refetch por separado que simular acá.
+      const winner = buildAnalysis({ id: 'winner-analysis-1', status: 'Procesando' });
+
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(buildFieldInput() as any);
+      analysisRepository.findOne.mockResolvedValueOnce(null); // fast-path: "¿hay uno corriendo?" — no, todavía no (la carrera real ocurre después, en el query() atómico).
+      analysisRepository.query.mockResolvedValueOnce([{ ...winner, inserted: false }]);
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result).toEqual(winner);
+      expect(pythonWorkerService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+
+    it('query() rechaza con un error que NO es la carrera de deduplicación: se propaga tal cual', async () => {
+      // A diferencia del mecanismo viejo, acá no hay ningún código (23505 vs. otro) que
+      // discriminar en JS: la discriminación "¿es específicamente el conflicto de
+      // UQ_analysis_running_per_field?" ya la hace Postgres en la propia sentencia, vía el WHERE
+      // de la inference specification del ON CONFLICT — esa cláusula solo dispara el DO UPDATE
+      // (y por lo tanto un resultado con inserted=false, sin rechazo) para ESE índice puntual.
+      // Cualquier otro rechazo de query() (constraint distinta, NOT NULL, columna inexistente,
+      // lo que sea) nunca pasa por esa rama y llega acá como un rechazo crudo de la promesa, que
+      // runFieldAnalysis no atrapa ni reinterpreta.
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue(buildFieldInput() as any);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+      const notNullViolation = Object.assign(new Error('null value in column "lotName"'), {
+        code: '23502',
+      });
+      analysisRepository.query.mockRejectedValueOnce(notNullViolation);
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toBe(notNullViolation);
+
+      expect(pythonWorkerService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+
+    it('a. gana el slot (inserted=true) pero getPipelineInput lanza porque el campo se quedó sin lotes cargados: excepción REAL de FieldsService (no simulada), marca la fila como Error y propaga la excepción original', async () => {
+      // F04 (revisión independiente, ronda 3): a diferencia de los demás tests de este archivo
+      // (FieldsService completamente mockeado), acá se usa una instancia REAL de FieldsService —
+      // con solo su Repository<Field>/Repository<FieldLot> mockeados — para que la excepción que
+      // se propaga sea la que getPipelineInput() efectivamente lanza en producción
+      // ('El campo no tiene lotes internos cargados.', NotFoundException), no una imitación con
+      // el mismo texto tipeada a mano en el test.
+      const fieldRepoMock = {
+        findOne: jest
+          .fn()
+          .mockResolvedValue({ id: 'field-1', userId: 'user-A', name: 'Campo A', lots: [] }),
+      };
+      const realFieldsService = new FieldsService(
+        fieldRepoMock as any,
+        {} as any, // FieldLotRepository: getPipelineInput/findOne no lo tocan directamente.
+      );
+      const realService = new AnalysisService(
+        analysisRepository as any,
+        pythonWorkerService as any,
+        realFieldsService,
+        reportPdfService as any,
+        analysisVerdictService as any,
+      );
+
+      analysisRepository.findOne.mockResolvedValueOnce(null); // fast-path: nada corriendo todavía.
+
+      const failedCall = realService.runFieldAnalysis(
+        'field-1',
+        { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      await expect(failedCall).rejects.toBeInstanceOf(NotFoundException);
+      await expect(failedCall).rejects.toThrow('El campo no tiene lotes internos cargados.');
+
+      // Ganó el slot vía el INSERT atómico — no vía save().
+      expect(analysisRepository.query).toHaveBeenCalled();
+
+      // El slot se liberó: la fila recién creada quedó Error, con el mensaje REAL de la excepción
+      // que efectivamente se propagó (no un texto aparte) — estado persistido, no solo la llamada.
+      expect(analysisRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'Error',
+          errorMessage: 'El campo no tiene lotes internos cargados.',
+          failedAt: expect.any(Date),
+          durationMs: expect.any(Number),
+        }),
+      );
+
+      expect(pythonWorkerService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+
+    it('b. gana el slot (inserted=true) pero getPipelineInput falla por un error de lectura/preparación genérico (no por falta de lotes): marca la fila como Error, propaga la excepción original SIN modificarla, y si la propia compensación también fallara lo registraría sin ocultar la causa original', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      const preparationError = new Error('Timeout leyendo el campo desde Postgres.');
+      fieldsService.getPipelineInput.mockRejectedValueOnce(preparationError);
+      analysisRepository.findOne.mockResolvedValueOnce(null); // fast-path.
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toBe(preparationError); // la excepción ORIGINAL, sin envolver ni reemplazar.
+
+      expect(analysisRepository.query).toHaveBeenCalled();
+      expect(analysisRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'Error',
+          errorMessage: 'Timeout leyendo el campo desde Postgres.',
+          category: 'Error al procesar análisis de campo',
+        }),
+      );
+      expect(pythonWorkerService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+
+    it('b (límite). si la propia escritura compensatoria TAMBIÉN falla, se registra ese segundo fallo pero la excepción que llega al caller sigue siendo la ORIGINAL, no la del save() fallido', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      const preparationError = new Error('El campo no tiene lotes internos cargados.');
+      fieldsService.getPipelineInput.mockRejectedValueOnce(preparationError);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+      const compensationSaveError = new Error('DB caída también al intentar marcar Error.');
+      analysisRepository.save.mockRejectedValueOnce(compensationSaveError);
+
+      const loggerErrorSpy = jest.spyOn((service as any).logger, 'error');
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toBe(preparationError); // NUNCA el compensationSaveError.
+
+      // El fallo de la propia compensación queda registrado (no silenciado), mencionando AMBAS
+      // causas — pero sin sustituir la excepción que efectivamente llega al caller.
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('El campo no tiene lotes internos cargados.'),
+      );
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('DB caída también al intentar marcar Error.'),
+      );
+
+      expect(pythonWorkerService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+
+    it('d. tras un fallo de preparación (a o b), un pedido posterior para el MISMO campo puede crear un análisis nuevo y dispararlo con normalidad (el slot quedó liberado, no bloqueado)', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput
+        .mockRejectedValueOnce(new Error('Fallo de preparación transitorio.'))
+        .mockResolvedValueOnce(buildFieldInput() as any);
+      analysisRepository.findOne.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toThrow('Fallo de preparación transitorio.');
+
+      // El primer intento quedó Error (liberó el slot) — se verifica ANTES del segundo intento,
+      // no solo "se llamó a save()".
+      expect(analysisRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'Error' }),
+      );
+
+      const result = await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(result.status).toBe('Procesando');
+      expect(pythonWorkerService.runFieldAnalysis).toHaveBeenCalledTimes(1);
+    });
+
+    it('c. gana el slot (inserted=true) pero hasIncludedLot es false (lotes existentes, ninguno habilitado): marca la fila recién creada como Error (no la deja como reserva permanente) y propaga el BadRequestException de siempre', async () => {
+      // F04 (revisión independiente, ronda 2): desde esa ronda, el INSERT atómico se ejecuta ANTES
+      // de getPipelineInput (para achicar la ventana de carrera) — así que para cuando se descubre
+      // que el campo no tiene lotes habilitados, esta request YA ganó el slot (existe una fila
+      // 'Procesando' propia). Dejarla así sería la reserva permanente que F04 prohíbe.
+      // F04 (revisión independiente, ronda 3): la compensación ahora pasa por
+      // markPreparationFailureOnWonSlot, el mismo mecanismo unificado que cubre CUALQUIER fallo de
+      // preparación (no solo este) — el errorMessage persistido es el mensaje real de la excepción
+      // (vía summarizeError), no un texto aparte hardcodeado.
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue({
+        fieldId: 'field-1',
+        name: 'Campo A',
+        lots: [
+          {
+            id: 'lot-1',
+            name: 'Lote 1',
+            geojson: {},
+            areaHa: 10,
+            includeInProductivityClassification: false, // ningún lote habilitado
+          },
+        ],
+      } as any);
+      analysisRepository.findOne.mockResolvedValueOnce(null); // fast-path: nada corriendo todavía.
+
+      await expect(
+        service.runFieldAnalysis(
+          'field-1',
+          { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+          'user-A',
+        ),
+      ).rejects.toThrow(
+        'El campo no tiene ningún lote incluido en la clasificación productiva. Habilitá al menos un lote antes de analizar.',
+      );
+
+      // Ganó el slot vía el INSERT atómico (query()) — no vía save().
+      expect(analysisRepository.query).toHaveBeenCalled();
+
+      // Y la fila recién creada se marcó Error de inmediato, liberando el slot — no queda
+      // colgada como 'Procesando' bloqueando al próximo intento. Verifica el ESTADO persistido
+      // (no solo que save() se llamó): status, errorMessage con el texto real de la excepción,
+      // failedAt/durationMs poblados y el slot correctamente liberado.
+      expect(analysisRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'Error',
+          errorMessage:
+            'El campo no tiene ningún lote incluido en la clasificación productiva. Habilitá al menos un lote antes de analizar.',
+          failedAt: expect.any(Date),
+          durationMs: expect.any(Number),
+        }),
+      );
+
+      expect(pythonWorkerService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+
+    /**
+     * F04 (revisión independiente): acá existía un tercer test — "save() rechaza con 23505 pero
+     * el refetch no encuentra ninguna fila Procesando (caso límite)" — que probaba un escenario
+     * específico del mecanismo VIEJO: un catch de save() seguido de un refetch por separado que,
+     * en teoría, podía no encontrar nada (p. ej. si la ganadora ya había sido borrada o corría
+     * contra una réplica desincronizada).
+     *
+     * Ese escenario ya no es alcanzable con el mecanismo nuevo, y no por un descuido: es
+     * justamente lo que el fix elimina. RETURNING no es un paso separado que pueda "no
+     * encontrar" nada — es parte de la MISMA sentencia atómica que generó el conflicto. Por
+     * construcción, si `inserted=false`, `rows[0]` existe siempre (fue la propia base la que lo
+     * devolvió al resolver el conflicto). No hay ventana entre "hubo conflicto" y "leer qué lo
+     * causó" que dejar sin cubrir. Se elimina el test en vez de forzar una reinterpretación
+     * artificial de un caso que ya no existe.
+     */
   });
 
   describe('reconcileStaleAnalyses (OPS-1)', () => {

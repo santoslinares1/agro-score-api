@@ -13,6 +13,7 @@ describe('DeterministicTechnicalVerdictGenerator', () => {
     ndviAverageMax: 0.7,
     ndviVariability: 'Media',
     ndmiMean: 0.3,
+    hasSufficientVigorData: true,
   };
 
   it('expone generatorName=deterministic-v1, promptVersion=null y modelId=null', () => {

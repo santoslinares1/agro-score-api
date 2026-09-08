@@ -12,6 +12,7 @@ describe('generateTechnicalVerdict', () => {
     ndviAverageMax: 0.7,
     ndviVariability: 'Media',
     ndmiMean: 0.3,
+    hasSufficientVigorData: true,
     ...overrides,
   });
 
@@ -39,6 +40,39 @@ describe('generateTechnicalVerdict', () => {
     );
 
     expect(result.verdict).toBe('insufficient_data');
+  });
+
+  // F01: sin evidencia satelital del índice de vigor (el worker marcó
+  // dataAvailability.globalScore=false porque no hubo observaciones válidas) — un score alto acá
+  // sería 0 "por default", no una evaluación real, así que debe clasificar igual que sin zonas.
+  it('sin evidencia satelital suficiente (hasSufficientVigorData=false) → insufficient_data sin importar el score', () => {
+    const result = generateTechnicalVerdict(
+      buildInput({ globalScore: 95, hasSufficientVigorData: false }),
+    );
+
+    expect(result.verdict).toBe('insufficient_data');
+  });
+
+  it('con zonas Y evidencia de vigor, un score alto sigue clasificando favorable (no se contamina por defecto)', () => {
+    const result = generateTechnicalVerdict(
+      buildInput({ globalScore: 95, hasZoneData: true, hasSufficientVigorData: true }),
+    );
+
+    expect(result.verdict).toBe('favorable');
+  });
+
+  it('insufficient_data por falta de evidencia de vigor también tiene confidence=low', () => {
+    const result = generateTechnicalVerdict(
+      buildInput({ hasSufficientVigorData: false, ndmiMean: 0.5 }),
+    );
+
+    expect(result.confidence).toBe('low');
+  });
+
+  it('insufficient_data por falta de evidencia de vigor tampoco inventa causas', () => {
+    const result = generateTechnicalVerdict(buildInput({ hasSufficientVigorData: false }));
+
+    expect(result.possibleCauses).toEqual([]);
   });
 
   it('insufficient_data siempre tiene confidence=low', () => {

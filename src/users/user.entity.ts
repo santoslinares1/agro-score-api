@@ -44,6 +44,20 @@ export class User {
   @Column({ type: 'boolean', default: true })
   isActive: boolean;
 
+  /**
+   * PROFILE-SEC-1: contador de invalidación de JWT. Se incrementa al cambiar
+   * la password (changePassword/resetPassword) o al pedir "cerrar otras
+   * sesiones" (revokeOtherSessions). JwtStrategy compara este valor contra
+   * el que trae el token (payload.tokenVersion ?? 0 para tokens emitidos
+   * antes de esta ficha) — un mismatch rechaza el request aunque el JWT no
+   * haya expirado. No hay tabla de sesiones: AgroScore es JWT stateless sin
+   * revocación server-side (ver 15-auth-access-and-roles.md), así que este
+   * contador es el cambio mínimo compatible con esa arquitectura — mismo
+   * principio que `isActive`, que ya revalida en cada request.
+   */
+  @Column({ type: 'int', default: 0 })
+  tokenVersion: number;
+
   @CreateDateColumn()
   createdAt: Date;
 

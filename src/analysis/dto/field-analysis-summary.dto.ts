@@ -19,4 +19,11 @@ export type FieldAnalysisSummary = {
   endDate: string;
   classificationScope: string | null;
   indexUsed: string | null;
+  /**
+   * F01: este resumen no trae resultJson completo (por diseño, ver el comentario de arriba), así
+   * que se propaga esta única señal booleana en vez del objeto dataAvailability completo — mismo
+   * criterio de compatibilidad hacia atrás que resultJson.dataAvailability ausente: true para
+   * análisis previos a ese fix del worker (ver AnalysisService.findByField).
+   */
+  globalScoreAvailable: boolean;
 };

@@ -999,4 +999,191 @@ describe('ReportPdfService', () => {
       );
     });
   });
+
+  describe('F01: limitación explícita cuando no hay evidencia satelital suficiente', () => {
+    it('no agrega la limitación de evidencia insuficiente cuando dataAvailability.globalScore es true (o está ausente)', () => {
+      const analysis = buildAnalysis();
+      const limitaciones = (service as any).buildLimitaciones(analysis.resultJson);
+      const serialized = JSON.stringify(limitaciones);
+
+      expect(serialized).not.toContain('No hubo observaciones satelitales válidas');
+    });
+
+    it('agrega la limitación de evidencia insuficiente cuando dataAvailability.globalScore es false', () => {
+      const analysis = buildAnalysis({
+        globalScore: 0,
+        category: 'Evidencia satelital insuficiente',
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          dataAvailability: {
+            productivity: false,
+            stability: false,
+            confidence: false,
+            ndviAverageMax: false,
+            globalScore: false,
+          },
+        } as any,
+      });
+      const limitaciones = (service as any).buildLimitaciones(analysis.resultJson);
+      const serialized = JSON.stringify(limitaciones);
+
+      expect(serialized).toContain('No hubo observaciones satelitales válidas');
+    });
+
+    it('el resumen ejecutivo y la conclusión usan la interpretación de "sin evidencia" en vez de una banda de score', () => {
+      const analysis = buildAnalysis({
+        globalScore: 0,
+        category: 'Evidencia satelital insuficiente',
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          fieldId: 'field-1',
+          fieldLots: [],
+          totalsByZone: [],
+          zones: [],
+          timeseries: [],
+          dataAvailability: {
+            productivity: false,
+            stability: false,
+            confidence: false,
+            ndviAverageMax: false,
+            globalScore: false,
+          },
+        } as any,
+      });
+
+      const resumen = (service as any).buildResumenEjecutivo(analysis, analysis.resultJson);
+      const conclusion = (service as any).buildConclusion(analysis, analysis.resultJson);
+
+      expect(JSON.stringify(resumen)).toMatch(/no hay evidencia satelital suficiente/i);
+      expect(JSON.stringify(conclusion)).toMatch(/no hay evidencia satelital suficiente/i);
+    });
+  });
+
+  /**
+   * F01 — pendiente detectado en una revisión independiente posterior a la entrega anterior: esa
+   * entrega solo había verificado que el texto interpretativo (scoreInterpretation) y la
+   * limitación metodológica mencionaran "evidencia insuficiente", pero NINGUNO de los dos toca el
+   * nodo numérico de la portada (`${analysis.globalScore}/100` en buildCoverPage) ni el
+   * metricCard "Score productivo" del resumen ejecutivo (buildResumenEjecutivo) — ambos seguían
+   * imprimiendo "0/100" tal cual. No alcanza con buscar el texto explicativo en el documento
+   * serializado completo: eso pasa aunque el nodo del score en sí siga mostrando el placeholder.
+   * findScorePresentationNode navega el árbol real de pdfmake y devuelve el nodo que
+   * efectivamente imprime el valor (el siguiente, en el mismo array, a la etiqueta "SCORE
+   * PRODUCTIVO" — metricCard() hace label.toUpperCase(), así que la portada y el resumen
+   * ejecutivo terminan con la misma etiqueta en el árbol final).
+   */
+  describe('F01: portada y resumen ejecutivo no imprimen el placeholder como si fuera una puntuación', () => {
+    function findScorePresentationNode(content: unknown): { text?: unknown; fontSize?: unknown } | null {
+      if (Array.isArray(content)) {
+        const idx = content.findIndex(
+          (item) => item && typeof item === 'object' && (item as any).text === 'SCORE PRODUCTIVO',
+        );
+        if (idx !== -1 && content[idx + 1]) {
+          return content[idx + 1] as any;
+        }
+        for (const item of content) {
+          const found = findScorePresentationNode(item);
+          if (found) return found;
+        }
+        return null;
+      }
+      if (content && typeof content === 'object') {
+        for (const value of Object.values(content)) {
+          const found = findScorePresentationNode(value);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+
+    it('1. sin evidencia (dataAvailability.globalScore=false): el nodo de score dice "No disponible", no "0/100"', () => {
+      const analysis = buildAnalysis({
+        globalScore: 0,
+        category: 'Evidencia satelital insuficiente',
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          dataAvailability: {
+            productivity: false,
+            stability: false,
+            confidence: false,
+            ndviAverageMax: false,
+            globalScore: false,
+          },
+        } as any,
+      });
+      const field = buildField();
+
+      const coverNode = findScorePresentationNode((service as any).buildCoverPage(analysis, field));
+      expect(coverNode?.text).toBe('No disponible');
+      expect(coverNode?.text).not.toContain('/100');
+      expect(coverNode?.fontSize).toBe(18);
+
+      const resumenNode = findScorePresentationNode(
+        (service as any).buildResumenEjecutivo(analysis, analysis.resultJson),
+      );
+      expect(resumenNode?.text).toBe('No disponible');
+      expect(resumenNode?.text).not.toContain('/100');
+    });
+
+    it('2. cero legítimo (dataAvailability.globalScore=true): el nodo de score muestra "0/100"', () => {
+      const analysis = buildAnalysis({
+        globalScore: 0,
+        category: 'Aptitud baja con limitantes significativas',
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: '',
+          dataAvailability: {
+            productivity: true,
+            stability: true,
+            confidence: true,
+            ndviAverageMax: true,
+            globalScore: true,
+          },
+        } as any,
+      });
+      const field = buildField();
+
+      const coverNode = findScorePresentationNode((service as any).buildCoverPage(analysis, field));
+      expect(coverNode?.text).toBe('0/100');
+      expect(coverNode?.fontSize).toBe(30);
+
+      const resumenNode = findScorePresentationNode(
+        (service as any).buildResumenEjecutivo(analysis, analysis.resultJson),
+      );
+      expect(resumenNode?.text).toBe('0/100');
+    });
+
+    it('3. registro histórico sin dataAvailability: conserva el score numérico', () => {
+      const analysis = buildAnalysis({
+        globalScore: 62,
+        resultJson: { mode: 'python-worker-v2', message: '' } as any, // sin dataAvailability.
+      });
+      const field = buildField();
+
+      const coverNode = findScorePresentationNode((service as any).buildCoverPage(analysis, field));
+      expect(coverNode?.text).toBe('62/100');
+
+      const resumenNode = findScorePresentationNode(
+        (service as any).buildResumenEjecutivo(analysis, analysis.resultJson),
+      );
+      expect(resumenNode?.text).toBe('62/100');
+    });
+
+    it('4. score positivo disponible: conserva su presentación normal, sin regresión', () => {
+      const analysis = buildAnalysis({ globalScore: 85 }); // fixture default: sin dataAvailability -> disponible.
+      const field = buildField();
+
+      const coverNode = findScorePresentationNode((service as any).buildCoverPage(analysis, field));
+      expect(coverNode?.text).toBe('85/100');
+      expect(coverNode?.fontSize).toBe(30);
+
+      const resumenNode = findScorePresentationNode(
+        (service as any).buildResumenEjecutivo(analysis, analysis.resultJson),
+      );
+      expect(resumenNode?.text).toBe('85/100');
+    });
+  });
 });
