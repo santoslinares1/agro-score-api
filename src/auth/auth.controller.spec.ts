@@ -27,6 +27,9 @@ describe('AuthController — rate limiting (SEC-003)', () => {
             me: jest.fn(),
             acceptInvitation: jest.fn(),
             resetPassword: jest.fn(),
+            changePassword: jest.fn(),
+            revokeOtherSessions: jest.fn(),
+            deactivateAccount: jest.fn(),
           },
         },
       ],
@@ -40,6 +43,12 @@ describe('AuthController — rate limiting (SEC-003)', () => {
     ['register', 5],
     ['acceptInvitation', 5],
     ['resetPassword', 5],
+    // PROFILE-SEC-1: change-password y deactivate-account verifican una
+    // password contra el hash existente — mismo riesgo de fuerza bruta que
+    // login/reset-password, aunque acá el atacante ya necesite un JWT
+    // robado.
+    ['changePassword', 5],
+    ['deactivateAccount', 5],
   ])('%s tiene ThrottlerGuard con límite de %i req/min', (method, limit) => {
     const handler = (controller as unknown as Record<string, () => unknown>)[
       method
@@ -61,5 +70,16 @@ describe('AuthController — rate limiting (SEC-003)', () => {
       | unknown[]
       | undefined;
     expect(logoutGuards ?? []).not.toContain(ThrottlerGuard);
+  });
+
+  // PROFILE-SEC-1: no verifica ninguna password, no hay superficie de
+  // fuerza bruta que limitar — mismo criterio que /auth/me.
+  it('/auth/revoke-other-sessions no lleva ThrottlerGuard', () => {
+    const handler = (controller as unknown as Record<string, () => unknown>)
+      .revokeOtherSessions;
+    const guards = Reflect.getMetadata(GUARDS_METADATA, handler) as
+      | unknown[]
+      | undefined;
+    expect(guards ?? []).not.toContain(ThrottlerGuard);
   });
 });

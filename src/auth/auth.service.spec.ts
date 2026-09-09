@@ -63,6 +63,7 @@ describe('AuthService', () => {
     fullName: 'User A',
     companyName: 'Acme',
     role: 'owner',
+    isActive: true,
     tokenVersion: 0,
     createdAt: new Date('2026-01-01'),
     updatedAt: new Date('2026-01-01'),
@@ -109,10 +110,13 @@ describe('AuthService', () => {
             findByEmail: jest.fn(),
             findById: jest.fn(),
             create: jest.fn(),
+            update: jest.fn(),
             // F03: updatePassword ahora devuelve UpdateResult (antes void) — { affected: 1 } es
             // el default "feliz" para no tener que mockearlo en cada test que no es sobre esto en
             // particular (mismo criterio que el resto de los defaults de este bloque).
             updatePassword: jest.fn().mockResolvedValue({ affected: 1 }),
+            incrementTokenVersion: jest.fn().mockResolvedValue(undefined),
+            countActiveByRole: jest.fn().mockResolvedValue(1),
             toPublicUser: jest.fn((user: User) => {
               const { passwordHash: _passwordHash, tokenVersion: _tokenVersion, ...rest } = user;
               return rest;
@@ -252,6 +256,17 @@ describe('AuthService', () => {
       await expect(
         service.login({ email: 'usera@example.com', password: 'wrong' }),
       ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    // PROFILE-SEC-1: cierra RISK "Inactive login" — un usuario desactivado
+    // (por admin o por deactivateAccount propio) no debe recibir un JWT ni
+    // siquiera aunque la password sea correcta.
+    it('rechaza con el mismo mensaje genérico a un usuario con isActive=false, aunque la password sea correcta', async () => {
+      usersService.findByEmail.mockResolvedValue(buildUser({ isActive: false }));
+
+      await expect(
+        service.login({ email: 'usera@example.com', password: 'password123' }),
+      ).rejects.toMatchObject({ message: 'Credenciales inválidas.' });
     });
   });
 
@@ -480,9 +495,9 @@ describe('AuthService', () => {
     it('F03: si falla una escritura dentro de la transacción, el error se propaga y NO se audita (la auditoría nunca se ejecuta para una operación revertida)', async () => {
       // Test a nivel de control de flujo: confirma que el `throw` dentro del callback de
       // transacción evita que el código llegue al auditLogService.record de más abajo. La
-      // garantía de que Postgres realmente deshace passwordHash/usedAt ante esta misma falla se
-      // verifica aparte, contra PostgreSQL real (ver entrega) — un repo mockeado no puede
-      // demostrar un rollback real.
+      // garantía de que Postgres realmente deshace passwordHash/tokenVersion/usedAt ante esta
+      // misma falla se verifica aparte, contra PostgreSQL real (ver entrega) — un repo mockeado
+      // no puede demostrar un rollback real.
       const resetToken = buildResetToken();
       passwordResetRepo.findOne.mockResolvedValue(resetToken);
       managerPasswordResetRepo.findOne.mockResolvedValue(resetToken);
@@ -514,6 +529,158 @@ describe('AuthService', () => {
         expect(message).not.toContain('token-secreto-cualquiera');
         expect(message).not.toContain(hashToken('token-secreto-cualquiera'));
       }
+    });
+  });
+
+  // PROFILE-SEC-1
+  describe('changePassword', () => {
+    it('rechaza si la contraseña actual no coincide, sin tocar updatePassword', async () => {
+      usersService.findById.mockResolvedValue(buildUser());
+
+      await expect(
+        service.changePassword('user-1', {
+          currentPassword: 'wrong-password',
+          newPassword: 'newpassword123',
+        }),
+      ).rejects.toMatchObject({ message: 'La contraseña actual no es correcta.' });
+
+      expect(usersService.updatePassword).not.toHaveBeenCalled();
+    });
+
+    it('con la contraseña actual correcta, hashea la nueva y llama updatePassword (que invalida tokens previos)', async () => {
+      usersService.findById.mockResolvedValueOnce(buildUser());
+      usersService.findById.mockResolvedValueOnce(buildUser({ tokenVersion: 1 }));
+
+      await service.changePassword('user-1', {
+        currentPassword: 'password123',
+        newPassword: 'newpassword123',
+      });
+
+      expect(usersService.updatePassword).toHaveBeenCalledWith('user-1', expect.any(String));
+      const passwordHashArg = usersService.updatePassword.mock.calls[0][1];
+      expect(passwordHashArg).not.toBe('newpassword123');
+      expect(bcrypt.compareSync('newpassword123', passwordHashArg)).toBe(true);
+    });
+
+    it('reemite un accessToken con el tokenVersion actualizado — la sesión actual sigue funcionando', async () => {
+      usersService.findById.mockResolvedValueOnce(buildUser({ tokenVersion: 0 }));
+      usersService.findById.mockResolvedValueOnce(buildUser({ tokenVersion: 1 }));
+
+      const result = await service.changePassword('user-1', {
+        currentPassword: 'password123',
+        newPassword: 'newpassword123',
+      });
+
+      expect(result.accessToken).toBe('signed.jwt.token');
+      expect(jwtService.sign).toHaveBeenCalledWith(
+        expect.objectContaining({ sub: 'user-1', tokenVersion: 1 }),
+      );
+    });
+
+    it('audita auth.password_changed con el propio usuario como actor', async () => {
+      usersService.findById.mockResolvedValue(buildUser());
+
+      await service.changePassword(
+        'user-1',
+        { currentPassword: 'password123', newPassword: 'newpassword123' },
+        { ip: '1.2.3.4', userAgent: 'jest' },
+      );
+
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.password_changed',
+          targetType: 'user',
+          targetId: 'user-1',
+          actor: expect.objectContaining({ actorUserId: 'user-1', ip: '1.2.3.4' }),
+        }),
+      );
+    });
+  });
+
+  // PROFILE-SEC-1
+  describe('revokeOtherSessions', () => {
+    it('incrementa tokenVersion y reemite un accessToken fresco (la sesión actual sigue funcionando)', async () => {
+      usersService.findById.mockResolvedValue(buildUser({ tokenVersion: 3 }));
+
+      const result = await service.revokeOtherSessions('user-1');
+
+      expect(usersService.incrementTokenVersion).toHaveBeenCalledWith('user-1');
+      expect(result.accessToken).toBe('signed.jwt.token');
+      expect(jwtService.sign).toHaveBeenCalledWith(
+        expect.objectContaining({ sub: 'user-1', tokenVersion: 3 }),
+      );
+    });
+
+    it('audita auth.sessions_revoked', async () => {
+      usersService.findById.mockResolvedValue(buildUser());
+
+      await service.revokeOtherSessions('user-1', { ip: '1.2.3.4' });
+
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.sessions_revoked',
+          targetType: 'user',
+          targetId: 'user-1',
+        }),
+      );
+    });
+  });
+
+  // PROFILE-SEC-1
+  describe('deactivateAccount', () => {
+    it('rechaza con password incorrecta y no desactiva la cuenta', async () => {
+      usersService.findById.mockResolvedValue(buildUser({ role: 'user' }));
+
+      await expect(
+        service.deactivateAccount('user-1', { password: 'wrong-password' }),
+      ).rejects.toMatchObject({ message: 'La contraseña no es correcta.' });
+
+      expect(usersService.update).not.toHaveBeenCalled();
+    });
+
+    it('con password correcta, desactiva la cuenta (isActive=false) sin tocar otros campos', async () => {
+      usersService.findById.mockResolvedValue(buildUser({ role: 'user' }));
+
+      const result = await service.deactivateAccount('user-1', { password: 'password123' });
+
+      expect(usersService.update).toHaveBeenCalledWith('user-1', { isActive: false });
+      expect(result).toEqual({ message: expect.any(String) });
+    });
+
+    it('un owner que es el último owner activo no puede autodesactivarse', async () => {
+      usersService.findById.mockResolvedValue(buildUser({ role: 'owner' }));
+      usersService.countActiveByRole.mockResolvedValue(0);
+
+      await expect(
+        service.deactivateAccount('user-1', { password: 'password123' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(usersService.update).not.toHaveBeenCalled();
+    });
+
+    it('un owner que NO es el último owner activo sí puede autodesactivarse', async () => {
+      usersService.findById.mockResolvedValue(buildUser({ role: 'owner' }));
+      usersService.countActiveByRole.mockResolvedValue(1);
+
+      await service.deactivateAccount('user-1', { password: 'password123' });
+
+      expect(usersService.update).toHaveBeenCalledWith('user-1', { isActive: false });
+    });
+
+    it('audita auth.account_deactivated', async () => {
+      usersService.findById.mockResolvedValue(buildUser({ role: 'user' }));
+
+      await service.deactivateAccount('user-1', { password: 'password123' }, { ip: '1.2.3.4' });
+
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.account_deactivated',
+          targetType: 'user',
+          targetId: 'user-1',
+          before: { isActive: true },
+          after: { isActive: false },
+        }),
+      );
     });
   });
 });

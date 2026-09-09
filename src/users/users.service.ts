@@ -5,9 +5,9 @@ import { EntityManager, In, Not, Repository, UpdateResult } from 'typeorm';
 import { User } from './user.entity';
 import { UserRole } from './user-role.enum';
 
-// F03: tokenVersion se excluye del shape público igual que passwordHash —
-// es un detalle interno de invalidación de JWT, no algo que el frontend
-// necesite leer.
+// PROFILE-SEC-1: tokenVersion se excluye del shape público igual que
+// passwordHash — es un detalle interno de invalidación de JWT, no algo que
+// el frontend necesite leer.
 export type PublicUser = Omit<User, 'passwordHash' | 'tokenVersion'>;
 
 export type ListUsersParams = {
@@ -153,15 +153,18 @@ export class UsersService {
    * propósito — ese tipo nunca debe aceptar `passwordHash` (así el
    * ValidationPipe global de un DTO admin no puede colarlo por error).
    *
-   * F03: además incrementa `tokenVersion` atómicamente en la misma UPDATE — cualquier reset de
-   * password debe invalidar los JWT emitidos con la password anterior. Lo llama
-   * AuthService.resetPassword.
+   * PROFILE-SEC-1: además incrementa `tokenVersion` atómicamente en la misma
+   * UPDATE — cualquier cambio real de password (reset por token o cambio
+   * autenticado desde /app/profile) debe invalidar los JWT emitidos con la
+   * password anterior. Lo llaman AuthService.resetPassword y
+   * AuthService.changePassword.
    *
    * F03: `manager` opcional — cuando se pasa (AuthService.resetPassword, dentro de su propia
    * transacción con el PasswordResetToken), este UPDATE corre en ESA transacción en vez de en su
    * propia conexión implícita, para que el cambio de password y el consumo del token confirmen o
-   * reviertan juntos. Sin `manager`, el comportamiento es una sola UPDATE atómica en su propia
-   * transacción implícita de una sentencia.
+   * reviertan juntos. Sin `manager` (changePassword, y cualquier otro caller futuro), el
+   * comportamiento es IDÉNTICO al de antes: una sola UPDATE atómica en su propia transacción
+   * implícita de una sentencia — no hay ningún cambio observable para esos callers.
    */
   async updatePassword(
     id: string,
@@ -174,6 +177,18 @@ export class UsersService {
 
     return repository.update(id, {
       passwordHash,
+      tokenVersion: () => '"tokenVersion" + 1',
+    });
+  }
+
+  /**
+   * PROFILE-SEC-1: "cerrar otras sesiones" desde /app/profile — invalida
+   * todo JWT emitido antes de este momento sin tocar la password. El caller
+   * (AuthService.revokeOtherSessions) reemite un token fresco para que la
+   * sesión actual (la que pidió la acción) siga funcionando.
+   */
+  async incrementTokenVersion(id: string): Promise<void> {
+    await this.usersRepository.update(id, {
       tokenVersion: () => '"tokenVersion" + 1',
     });
   }

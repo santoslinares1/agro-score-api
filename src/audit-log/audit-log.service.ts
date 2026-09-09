@@ -31,7 +31,12 @@ export type AdminAuditAction =
   // AdminModule). El "actor" en estos dos casos es el propio usuario que
   // acaba de crear su cuenta o resetear su password.
   | 'auth.invitation.accepted'
-  | 'auth.password_reset.completed';
+  | 'auth.password_reset.completed'
+  // PROFILE-SEC-1: acciones de Seguridad en /app/profile — mismo criterio
+  // que las dos de arriba, el actor es el propio usuario autenticado.
+  | 'auth.password_changed'
+  | 'auth.sessions_revoked'
+  | 'auth.account_deactivated';
 
 export type AuditActorContext = {
   actorUserId: string;

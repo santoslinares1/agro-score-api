@@ -12,9 +12,12 @@ import { DataSource, IsNull, MoreThan, Repository } from 'typeorm';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
+import { UserRole } from '../users/user-role.enum';
 import { PublicUser, UsersService } from '../users/users.service';
 import { User } from '../users/user.entity';
 import { AcceptInvitationDto } from './dto/accept-invitation.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import { DeactivateAccountDto } from './dto/deactivate-account.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
@@ -90,6 +93,16 @@ export class AuthService {
       throw new UnauthorizedException('Credenciales inválidas.');
     }
 
+    // PROFILE-SEC-1: cierra RISK-conocido "Inactive login" de
+    // 15-auth-access-and-roles.md — antes de esta ficha, un usuario
+    // desactivado (por admin o por deactivateAccount propio) recibía un JWT
+    // igual, que quedaba inerte recién en el primer request protegido
+    // (JwtStrategy). Mismo mensaje genérico que credenciales inválidas —
+    // no reveal si el email pertenece a una cuenta desactivada.
+    if (!user.isActive) {
+      throw new UnauthorizedException('Credenciales inválidas.');
+    }
+
     return this.buildAuthResponse(user);
   }
 
@@ -157,15 +170,16 @@ export class AuthService {
    * reset exitoso.
    *
    * F03 (fix de atomicidad): antes, el consumo del token (`usedAt`) y el cambio de credenciales
-   * (`UsersService.updatePassword`) eran dos escrituras independientes, cada una en su propia
-   * transacción implícita — sin nada que impidiera que dos requests concurrentes con el MISMO
-   * token pasaran ambas el chequeo `usedAt IS NULL` (leído antes de que cualquiera escribiera
-   * nada) y las dos terminaran cambiando la contraseña. Ahora las dos escrituras viven en la
-   * MISMA transacción, con el `SELECT` del token bajo `lock: 'pessimistic_write'`
-   * (`SELECT ... FOR UPDATE`): la segunda transacción que intenta tomar la fila queda bloqueada
-   * hasta que la primera confirme o revierta — y si la primera confirmó, la segunda vuelve a
-   * evaluar el `WHERE` (`usedAt IS NULL`) contra la fila ya actualizada y no la encuentra, sin
-   * necesitar ningún chequeo extra en el código.
+   * (`UsersService.updatePassword`, que a su vez cambia `passwordHash` e incrementa
+   * `tokenVersion`) eran dos escrituras independientes, cada una en su propia transacción
+   * implícita — sin nada que impidiera que dos requests concurrentes con el MISMO token pasaran
+   * ambas el chequeo `usedAt IS NULL` (leído antes de que cualquiera escribiera nada) y las dos
+   * terminaran cambiando la contraseña, incrementando `tokenVersion` dos veces. Ahora las dos
+   * escrituras viven en la MISMA transacción, con el `SELECT` del token bajo
+   * `lock: 'pessimistic_write'` (`SELECT ... FOR UPDATE`): la segunda transacción que intenta
+   * tomar la fila queda bloqueada hasta que la primera confirme o revierta — y si la primera
+   * confirmó, la segunda vuelve a evaluar el `WHERE` (`usedAt IS NULL`) contra la fila ya
+   * actualizada y no la encuentra, sin necesitar ningún chequeo extra en el código.
    *
    * `bcrypt.hash` es CPU-bound (~50-100ms con SALT_ROUNDS=10) — se calcula ANTES de abrir la
    * transacción (y por lo tanto antes de tomar el lock de fila), para no retener ese lock más de
@@ -246,13 +260,14 @@ export class AuthService {
     // de verdad.
     //
     // A la inversa: si ESTE `record()` fallara, se propaga sin capturar — mismo criterio, sin
-    // try/catch, que acceptInvitation ya usa en este archivo (no es una omisión nueva de esta
-    // ficha). El resultado es que el request respondería con un error aunque la contraseña YA
-    // cambió con éxito en DB — un fallo de auditoría nunca revierte (ni puede revertir, el commit
-    // ya ocurrió) las credenciales. Preservar esta política existente está dentro de las
-    // restricciones de esta ficha; endurecerla (ej. try/catch best-effort acá) sería un cambio de
-    // comportamiento transversal, no algo local a resetPassword — queda documentado como riesgo
-    // preexistente en la entrega, no corregido acá.
+    // try/catch, que acceptInvitation/changePassword/revokeOtherSessions/deactivateAccount ya
+    // usan en este archivo (no es una omisión nueva de esta ficha). El resultado es que el
+    // request respondería con un error aunque la contraseña YA cambió con éxito en DB — un
+    // fallo de auditoría nunca revierte (ni puede revertir, el commit ya ocurrió) las
+    // credenciales. Preservar esta política existente está dentro de las restricciones de esta
+    // ficha; endurecerla (ej. try/catch best-effort acá) sería un cambio de comportamiento
+    // transversal a los otros cuatro métodos, no algo local a resetPassword — queda documentado
+    // como riesgo preexistente en la entrega, no corregido acá.
     await this.auditLogService.record({
       actor: {
         actorUserId: consumedUserId,
@@ -277,13 +292,146 @@ export class AuthService {
     return this.usersService.toPublicUser(user);
   }
 
+  /**
+   * PROFILE-SEC-1: cambio de password autenticado (distinto de
+   * resetPassword, que es el flujo público por token/email). Verifica la
+   * password actual, hashea la nueva con el mismo criterio que el resto de
+   * AgroScore y reusa updatePassword() — que además incrementa
+   * `tokenVersion`, invalidando cualquier JWT emitido con la password
+   * anterior. Para que la sesión actual (la que acaba de cambiar su propia
+   * password) no quede deslogueada por su propio cambio, se reemite un
+   * accessToken fresco con el tokenVersion nuevo — mismo shape que
+   * login/register, así el frontend puede reusar storeSession().
+   */
+  async changePassword(
+    userId: string,
+    dto: ChangePasswordDto,
+    requestMeta: RequestAuditMeta = {},
+  ): Promise<AuthResponse> {
+    const user = await this.usersService.findById(userId);
+
+    if (!user) {
+      throw new UnauthorizedException('Usuario no encontrado.');
+    }
+
+    const currentMatches = await bcrypt.compare(
+      dto.currentPassword,
+      user.passwordHash,
+    );
+
+    if (!currentMatches) {
+      throw new UnauthorizedException('La contraseña actual no es correcta.');
+    }
+
+    const passwordHash = await bcrypt.hash(dto.newPassword, SALT_ROUNDS);
+    await this.usersService.updatePassword(userId, passwordHash);
+
+    const updated = await this.usersService.findById(userId);
+
+    if (!updated) {
+      throw new UnauthorizedException('Usuario no encontrado.');
+    }
+
+    await this.auditLogService.record({
+      actor: { actorUserId: userId, ip: requestMeta.ip, userAgent: requestMeta.userAgent },
+      action: 'auth.password_changed',
+      targetType: 'user',
+      targetId: userId,
+    });
+
+    return this.buildAuthResponse(updated);
+  }
+
+  /**
+   * PROFILE-SEC-1: "cerrar otras sesiones" — no hay tabla de sesiones en
+   * AgroScore (JWT stateless, ver 15-auth-access-and-roles.md), así que
+   * "otras sesiones" son, en la práctica, "cualquier otro JWT ya emitido".
+   * Incrementar tokenVersion los invalida a todos sin distinguir cuál es
+   * "otro" — por eso, igual que changePassword, se reemite un token fresco
+   * para que la sesión que pidió la acción siga funcionando.
+   */
+  async revokeOtherSessions(
+    userId: string,
+    requestMeta: RequestAuditMeta = {},
+  ): Promise<AuthResponse> {
+    await this.usersService.incrementTokenVersion(userId);
+
+    const updated = await this.usersService.findById(userId);
+
+    if (!updated) {
+      throw new UnauthorizedException('Usuario no encontrado.');
+    }
+
+    await this.auditLogService.record({
+      actor: { actorUserId: userId, ip: requestMeta.ip, userAgent: requestMeta.userAgent },
+      action: 'auth.sessions_revoked',
+      targetType: 'user',
+      targetId: userId,
+    });
+
+    return this.buildAuthResponse(updated);
+  }
+
+  /**
+   * PROFILE-SEC-1: "eliminar cuenta" real = desactivación, no hard delete —
+   * reusa `isActive` (mismo mecanismo que AdminService.deactivateUser),
+   * nunca toca Field/FieldLot/Analysis/reportes del usuario. JwtStrategy ya
+   * rechaza cualquier request de un usuario con isActive=false en el
+   * próximo request, así que no hace falta tocar tokenVersion acá. Mismo
+   * chequeo de "no dejar el sistema sin ningún owner activo" que ya aplica
+   * AdminService — un owner no puede autodesactivarse si es el último owner
+   * activo.
+   */
+  async deactivateAccount(
+    userId: string,
+    dto: DeactivateAccountDto,
+    requestMeta: RequestAuditMeta = {},
+  ): Promise<{ message: string }> {
+    const user = await this.usersService.findById(userId);
+
+    if (!user) {
+      throw new UnauthorizedException('Usuario no encontrado.');
+    }
+
+    const passwordMatches = await bcrypt.compare(
+      dto.password,
+      user.passwordHash,
+    );
+
+    if (!passwordMatches) {
+      throw new UnauthorizedException('La contraseña no es correcta.');
+    }
+
+    if (user.role === UserRole.OWNER && user.isActive) {
+      const otherActiveOwners = await this.usersService.countActiveByRole(
+        UserRole.OWNER,
+        user.id,
+      );
+
+      if (otherActiveOwners === 0) {
+        throw new BadRequestException(
+          'No se puede completar la operación: dejaría el sistema sin ningún owner activo.',
+        );
+      }
+    }
+
+    await this.usersService.update(userId, { isActive: false });
+
+    await this.auditLogService.record({
+      actor: { actorUserId: userId, ip: requestMeta.ip, userAgent: requestMeta.userAgent },
+      action: 'auth.account_deactivated',
+      targetType: 'user',
+      targetId: userId,
+      before: { isActive: true },
+      after: { isActive: false },
+    });
+
+    return { message: 'Tu cuenta fue desactivada correctamente.' };
+  }
+
   private buildAuthResponse(user: User): AuthResponse {
     const publicUser = this.usersService.toPublicUser(user);
 
-    // F03: incluye tokenVersion en todo token emitido (login/register/acceptInvitation también
-    // pasan por acá) — sin esto, un login posterior a un resetPassword emitiría un token cuyo
-    // claim (ausente, tratado como 0 por JwtStrategy) ya no coincidiría con el tokenVersion que
-    // resetPassword acaba de incrementar, dejando al propio usuario deslogueado por su reset.
     const accessToken = this.jwtService.sign({
       sub: publicUser.id,
       email: publicUser.email,
