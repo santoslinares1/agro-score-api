@@ -66,7 +66,13 @@ describe('ScheduledAnalysisRunnerService', () => {
     Pick<FieldsService, 'findOne' | 'findByIdOrFail'>
   >;
   let analysisService: jest.Mocked<
-    Pick<AnalysisService, 'runFieldAnalysis' | 'findOne' | 'findByField'>
+    Pick<
+      AnalysisService,
+      | 'runFieldAnalysis'
+      | 'findOne'
+      | 'findByField'
+      | 'assertUserBelowConcurrencyCeiling'
+    >
   >;
   let usersService: jest.Mocked<Pick<UsersService, 'findById'>>;
   let emailService: jest.Mocked<
@@ -296,6 +302,11 @@ describe('ScheduledAnalysisRunnerService', () => {
             runFieldAnalysis: jest.fn(),
             findOne: jest.fn(),
             findByField: jest.fn(),
+            // SEC-008: default resuelto (no lanza) — los tests de runNow preexistentes no son
+            // sobre el techo de concurrencia en sí; los que sí lo son pisan esto explícitamente.
+            assertUserBelowConcurrencyCeiling: jest
+              .fn()
+              .mockResolvedValue(undefined),
           },
         },
         { provide: UsersService, useValue: { findById: jest.fn() } },
@@ -2174,6 +2185,63 @@ describe('ScheduledAnalysisRunnerService', () => {
 
       expect(result).toBe(existingRun);
       expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+
+    // SEC-008: "Ejecutar ahora" es un disparo manual — comparte el mismo techo de concurrencia por
+    // usuario que POST /analysis/field/:fieldId.
+    describe('techo de concurrencia por usuario (SEC-008)', () => {
+      it('llama a assertUserBelowConcurrencyCeiling(userId) antes de triggerRun', async () => {
+        fieldsService.findOne.mockResolvedValue(buildField());
+        scheduleRepository.findOne.mockResolvedValue(buildSchedule());
+        runRepository.findOne.mockResolvedValue(null);
+        analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
+
+        await service.runNow('field-1', 'user-A');
+
+        expect(
+          analysisService.assertUserBelowConcurrencyCeiling,
+        ).toHaveBeenCalledWith('user-A');
+      });
+
+      it('propaga el rechazo del techo sin llegar a triggerRun/runFieldAnalysis', async () => {
+        fieldsService.findOne.mockResolvedValue(buildField());
+        scheduleRepository.findOne.mockResolvedValue(buildSchedule());
+        const rejection = new Error('429 simulado');
+        analysisService.assertUserBelowConcurrencyCeiling.mockRejectedValueOnce(
+          rejection,
+        );
+
+        await expect(service.runNow('field-1', 'user-A')).rejects.toBe(
+          rejection,
+        );
+
+        expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+        expect(runRepository.create).not.toHaveBeenCalled();
+        expect(runRepository.save).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  // SEC-008: crítico — el dispatcher automático (processDueSchedules/triggerRun) NUNCA debe
+  // consultar el techo de concurrencia manual. Si lo hiciera, una cuenta con más campos
+  // programados que MAX_CONCURRENT_ANALYSES_PER_USER vería sus propios schedules automáticos
+  // fallar entre sí la misma noche — una regresión funcional real, no abuso. runNow() (arriba) SÍ
+  // lo llama porque es un disparo manual; triggerRun/processDueSchedules nunca deben hacerlo.
+  describe('SEC-008 — regresión: el dispatcher automático nunca consulta el techo manual', () => {
+    it('processDueSchedules no llama a assertUserBelowConcurrencyCeiling ni una vez', async () => {
+      scheduleRepository.find.mockResolvedValue([
+        buildSchedule({ userId: 'user-A' }),
+      ]);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      runRepository.findOne.mockResolvedValue(null);
+      analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
+
+      await service.processDueSchedules(new Date('2026-08-24T12:05:00Z'));
+
+      expect(
+        analysisService.assertUserBelowConcurrencyCeiling,
+      ).not.toHaveBeenCalled();
+      expect(analysisService.runFieldAnalysis).toHaveBeenCalledTimes(1);
     });
   });
 });

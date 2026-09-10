@@ -11,10 +11,12 @@ import {
   Res,
   UseGuards,
 } from '@nestjs/common';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { createReadStream, existsSync } from 'fs';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AuthenticatedUser } from '../auth/jwt.strategy';
+import { UserComputeThrottlerGuard } from '../common/guards/user-compute-throttler.guard';
 import { AnalysisService } from './analysis.service';
 import { RunFieldAnalysisDto } from './dto/run-field-analysis.dto';
 
@@ -150,13 +152,22 @@ export class AnalysisController {
 
   // Ruta histórica. El alias 'analysis/field/:fieldId' es el nombre preferido
   // hacia adelante; se mantienen ambas para no romper clientes existentes.
-  @UseGuards(JwtAuthGuard)
+  //
+  // SEC-008: rate limit por usuario COMPARTIDO con run-now/weekly-reports (ver
+  // UserComputeThrottlerGuard, bucket 'compute') + techo de análisis concurrentes por usuario (ver
+  // AnalysisService.assertUserBelowConcurrencyCeiling). @SkipThrottle({default:true}) evita que el
+  // bucket 'default' (SEC-003, keyeado por IP) también se evalúe acá — esta ruta usa un único
+  // bucket, 'compute', keyeado por usuario.
+  @UseGuards(JwtAuthGuard, UserComputeThrottlerGuard)
+  @SkipThrottle({ default: true })
+  @Throttle({ compute: { limit: 10, ttl: 600_000 } })
   @Post(['field/:fieldId', 'analysis/field/:fieldId'])
-  runFieldAnalysis(
+  async runFieldAnalysis(
     @Param('fieldId', ParseUUIDPipe) fieldId: string,
     @Body() body: RunFieldAnalysisDto,
     @Req() req: AuthenticatedRequest,
   ) {
+    await this.analysisService.assertUserBelowConcurrencyCeiling(req.user.sub);
     return this.analysisService.runFieldAnalysis(fieldId, body, req.user.sub);
   }
 }

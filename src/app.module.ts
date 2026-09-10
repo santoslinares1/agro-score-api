@@ -42,6 +42,16 @@ import { AppService } from './app.service';
         ttl: 60_000,
         limit: 20,
       },
+      // SEC-008: bucket separado, compartido por usuario, para los 3 endpoints que disparan
+      // cómputo caro (análisis manual, run-now, weekly-reports) — ver UserComputeThrottlerGuard.
+      // Los límites reales van en @Throttle({ compute: {...} }) por ruta (mismo patrón que
+      // 'default' en SEC-003); esto solo declara que el throttler existe. Igual que 'default',
+      // almacenamiento en memoria del proceso — deuda conocida para multi-instancia, no nueva.
+      {
+        name: 'compute',
+        ttl: 600_000,
+        limit: 10,
+      },
     ]),
 
     TypeOrmModule.forRootAsync({

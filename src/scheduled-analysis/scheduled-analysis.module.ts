@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { AnalysisModule } from '../analysis/analysis.module';
 import { AnalysisVerdictModule } from '../analysis-verdict/analysis-verdict.module';
+import { UserComputeThrottlerGuard } from '../common/guards/user-compute-throttler.guard';
 import { EmailModule } from '../email/email.module';
 import { FieldsModule } from '../fields/fields.module';
 import { UsersModule } from '../users/users.module';
@@ -47,6 +48,7 @@ import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.servic
     ScheduledAnalysisRunnerService,
     ScheduledAnalysisScheduler,
     WeeklyAnalysisSnapshotService,
+    UserComputeThrottlerGuard,
   ],
   exports: [
     FieldAnalysisScheduleService,

@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { FieldsModule } from '../fields/fields.module';
 import { PythonWorkerModule } from '../python-worker/python-worker.module';
+import { UserComputeThrottlerGuard } from '../common/guards/user-compute-throttler.guard';
 import { WeeklyFieldReport } from './entities/weekly-field-report.entity';
 import { WeeklyLotIndexObservation } from './entities/weekly-lot-index-observation.entity';
 import { WeeklyReportsController } from './weekly-reports.controller';
@@ -15,6 +16,6 @@ import { WeeklyReportsService } from './weekly-reports.service';
     PythonWorkerModule,
   ],
   controllers: [WeeklyReportsController],
-  providers: [WeeklyReportsService],
+  providers: [WeeklyReportsService, UserComputeThrottlerGuard],
 })
 export class WeeklyReportsModule {}

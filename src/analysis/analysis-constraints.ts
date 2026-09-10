@@ -46,6 +46,21 @@ export const MAX_ANALYSIS_CLOUDINESS = 80;
 export const MAX_ANALYSIS_DATE_RANGE_DAYS = 366;
 
 /**
+ * SEC-008: techo de análisis 'Procesando' simultáneos por usuario, contados a través de TODOS sus
+ * Fields (Analysis no tiene columna userId propia — ver
+ * AnalysisService.assertUserBelowConcurrencyCeiling). Cierra lo que UQ_analysis_running_per_field
+ * NO cubre: ese índice evita más de un 'Procesando' POR CAMPO, nunca supo ni necesitó saber cuántos
+ * campos distintos tiene el mismo dueño — un usuario con muchos Fields podía (antes de esto)
+ * disparar un análisis concurrente por cada uno, sin ningún techo.
+ *
+ * 3 es provisorio, no medido contra uso real — no hay datos de cuántos campos gestiona una cuenta
+ * típica hoy ni de cuántos diagnósticos simultáneos son "normales". Pensado para no interferir con
+ * revisar unos pocos campos a la vez, acotando el abuso a un número chico y explícito. Revisar con
+ * datos reales de piloto antes de tratarlo como definitivo.
+ */
+export const MAX_CONCURRENT_ANALYSES_PER_USER = 3;
+
+/**
  * Cantidad de días calendario entre dos fechas ISO (`YYYY-MM-DD`), calculada exactamente igual
  * que el Worker (`(end - start).days` en Python: ambas fechas puras, sin componente horario). Se
  * asume `end >= start`; el llamador es responsable de rechazar el orden inválido por separado

@@ -1,6 +1,9 @@
+import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test, TestingModule } from '@nestjs/testing';
+import { ThrottlerModule } from '@nestjs/throttler';
 
 import { AuthenticatedUser } from '../auth/jwt.strategy';
+import { UserComputeThrottlerGuard } from '../common/guards/user-compute-throttler.guard';
 import { WeeklyReportsController } from './weekly-reports.controller';
 import { WeeklyReportsService } from './weekly-reports.service';
 
@@ -18,8 +21,17 @@ describe('WeeklyReportsController', () => {
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
+      // SEC-008: create ahora lleva @UseGuards(JwtAuthGuard, UserComputeThrottlerGuard) — ver el
+      // mismo comentario en analysis.controller.spec.ts.
+      imports: [
+        ThrottlerModule.forRoot([
+          { name: 'default', ttl: 60_000, limit: 20 },
+          { name: 'compute', ttl: 600_000, limit: 10 },
+        ]),
+      ],
       controllers: [WeeklyReportsController],
       providers: [
+        UserComputeThrottlerGuard,
         {
           provide: WeeklyReportsService,
           useValue: {
@@ -63,5 +75,24 @@ describe('WeeklyReportsController', () => {
     const query = { index: 'NDVI' } as any;
     controller.findObservations('field-1', query, req);
     expect(service.findObservations).toHaveBeenCalledWith('field-1', 'user-A', query);
+  });
+
+  describe('SEC-008: rate limiting por usuario en create', () => {
+    it('lleva UserComputeThrottlerGuard además de JwtAuthGuard', () => {
+      const guards = Reflect.getMetadata(
+        GUARDS_METADATA,
+        (controller as any).create,
+      ) as unknown[] | undefined;
+
+      expect(guards).toContain(UserComputeThrottlerGuard);
+    });
+
+    it('usa el throttler "compute" (10 req / 10 min) — mismo bucket que analysis/run-now, no el "default"', () => {
+      const handler = (controller as any).create;
+
+      expect(Reflect.getMetadata('THROTTLER:LIMITcompute', handler)).toBe(10);
+      expect(Reflect.getMetadata('THROTTLER:TTLcompute', handler)).toBe(600_000);
+      expect(Reflect.getMetadata('THROTTLER:SKIPdefault', handler)).toBe(true);
+    });
   });
 });

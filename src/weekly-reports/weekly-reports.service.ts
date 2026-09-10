@@ -1,4 +1,11 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { FindOptionsWhere, IsNull, LessThan, Not, Repository } from 'typeorm';
 
@@ -18,6 +25,18 @@ const METHODOLOGY_VERSION = 'weekly-v1';
 const DEFAULT_STEP_DAYS = 7;
 const DEFAULT_INDICES = ['NDVI', 'NDMI'];
 const ERROR_MESSAGE_MAX_LENGTH = 500;
+/**
+ * SEC-008: techo de WeeklyFieldReport 'processing' simultáneos por usuario — mismo concepto que
+ * MAX_CONCURRENT_ANALYSES_PER_USER (analysis-constraints.ts), pero deliberadamente un techo
+ * INDEPENDIENTE, no una cuenta combinada con Analysis: weekly-reports mantiene "ninguna
+ * dependencia cruzada" con el resto del pipeline (ver el comentario de ScheduledAnalysisModule) y
+ * WeeklyFieldReport.userId es una columna propia e indexada (a diferencia de Analysis, que
+ * resuelve ownership vía Field), así que no hace falta ningún join acá.
+ *
+ * 3 es provisorio, mismo criterio y misma falta de datos reales que su equivalente de Analysis —
+ * revisar con uso real de piloto.
+ */
+const MAX_CONCURRENT_WEEKLY_REPORTS_PER_USER = 3;
 
 @Injectable()
 export class WeeklyReportsService {
@@ -103,6 +122,11 @@ export class WeeklyReportsService {
 
       return existing;
     }
+
+    // SEC-008: chequeado DESPUÉS del fast-path de arriba (que reutiliza un reporte existente sin
+    // crear nada nuevo) — no rechazar un request que de todos modos no iba a consumir un slot
+    // nuevo. Ver assertUserBelowConcurrencyCeiling más abajo.
+    await this.assertUserBelowConcurrencyCeiling(userId);
 
     const report = this.weeklyReportRepository.create({
       fieldId,
@@ -394,5 +418,25 @@ export class WeeklyReportsService {
     return text.length > ERROR_MESSAGE_MAX_LENGTH
       ? `${text.slice(0, ERROR_MESSAGE_MAX_LENGTH)}…`
       : text;
+  }
+
+  /**
+   * SEC-008: mismo concepto que AnalysisService.assertUserBelowConcurrencyCeiling, pero sin join —
+   * WeeklyFieldReport tiene userId propio (columna directa, indexada). Misma discusión de
+   * atomicidad/severidad que la versión de Analysis (carrera de baja severidad, aceptada, acotada
+   * además por el rate limit por usuario en el mismo endpoint, compartido con analysis/run-now vía
+   * UserComputeThrottlerGuard) — no repetida acá en detalle.
+   */
+  private async assertUserBelowConcurrencyCeiling(userId: string): Promise<void> {
+    const runningCount = await this.weeklyReportRepository.count({
+      where: { userId, status: 'processing' },
+    });
+
+    if (runningCount >= MAX_CONCURRENT_WEEKLY_REPORTS_PER_USER) {
+      throw new HttpException(
+        'Ya tenés varios reportes semanales en curso. Esperá a que alguno termine antes de iniciar otro.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
   }
 }

@@ -1,4 +1,10 @@
-import { BadRequestException, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
+import {
+  BadRequestException,
+  HttpException,
+  HttpStatus,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 import { LessThan } from 'typeorm';
@@ -86,6 +92,10 @@ describe('WeeklyReportsService', () => {
             save: jest.fn((data) => Promise.resolve({ id: 'report-1', ...data })),
             findOne: jest.fn(),
             find: jest.fn().mockResolvedValue([]),
+            // SEC-008: assertUserBelowConcurrencyCeiling — 0 por default (por debajo del techo),
+            // así los tests de create() preexistentes que no son sobre este chequeo en particular
+            // siguen pasando sin tocar cada uno individualmente.
+            count: jest.fn().mockResolvedValue(0),
             update: jest.fn().mockResolvedValue(undefined),
             createQueryBuilder: jest.fn(() => queryBuilderMock),
           },
@@ -229,6 +239,84 @@ describe('WeeklyReportsService', () => {
 
       expect(result).toBe(existing);
       expect(weeklyReportRepository.save).not.toHaveBeenCalled();
+    });
+
+    // SEC-008: techo de reportes semanales 'processing' simultáneos por usuario — ver
+    // MAX_CONCURRENT_WEEKLY_REPORTS_PER_USER. Chequeado DESPUÉS del fast-path de reutilización de
+    // arriba (no rechaza un request que de todos modos no iba a crear nada nuevo).
+    describe('techo de concurrencia por usuario (SEC-008)', () => {
+      async function captureError(promise: Promise<unknown>): Promise<any> {
+        try {
+          await promise;
+        } catch (error) {
+          return error;
+        }
+        throw new Error('Se esperaba que la promesa rechazara, pero resolvió.');
+      }
+
+      it('permite crear si el usuario está por debajo del techo', async () => {
+        fieldsService.findOne.mockResolvedValue(buildField());
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        weeklyReportRepository.count.mockResolvedValue(2);
+        jest.spyOn(service as any, 'processInBackground').mockResolvedValue(undefined);
+
+        const result = await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        expect(result.status).toBe('processing');
+      });
+
+      it('rechaza con 429 si el usuario ya está en el techo, sin crear ningún reporte', async () => {
+        fieldsService.findOne.mockResolvedValue(buildField());
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        weeklyReportRepository.count.mockResolvedValue(3);
+
+        const error = await captureError(
+          service.create(
+            'field-1',
+            { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+            'user-A',
+          ),
+        );
+
+        expect(error).toBeInstanceOf(HttpException);
+        expect(error.getStatus()).toBe(HttpStatus.TOO_MANY_REQUESTS);
+        expect(weeklyReportRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('cuenta por userId + status processing, sin filtrar por campo (across-field)', async () => {
+        fieldsService.findOne.mockResolvedValue(buildField());
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        weeklyReportRepository.count.mockResolvedValue(0);
+        jest.spyOn(service as any, 'processInBackground').mockResolvedValue(undefined);
+
+        await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        expect(weeklyReportRepository.count).toHaveBeenCalledWith({
+          where: { userId: 'user-A', status: 'processing' },
+        });
+      });
+
+      it('reutilizar un reporte existente (fast-path) nunca consulta el techo', async () => {
+        const existing = { id: 'report-existing', status: 'completed' };
+        fieldsService.findOne.mockResolvedValue(buildField());
+        weeklyReportRepository.findOne.mockResolvedValue(existing);
+
+        await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        expect(weeklyReportRepository.count).not.toHaveBeenCalled();
+      });
     });
   });
 

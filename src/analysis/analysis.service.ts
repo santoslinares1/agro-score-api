@@ -1,5 +1,7 @@
 import {
   BadRequestException,
+  HttpException,
+  HttpStatus,
   Injectable,
   Logger,
   NotFoundException,
@@ -10,6 +12,7 @@ import { IsNull, Repository } from 'typeorm';
 import {
   daysBetweenIsoDates,
   MAX_ANALYSIS_DATE_RANGE_DAYS,
+  MAX_CONCURRENT_ANALYSES_PER_USER,
 } from './analysis-constraints';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
 import {
@@ -335,6 +338,71 @@ export class AnalysisService {
       await this.analysisVerdictService.findResponseByAnalysisId(analysis.id);
 
     return this.reportPdfService.build(analysis, field, technicalVerdict);
+  }
+
+  /**
+   * SEC-008: techo de análisis 'Procesando' simultáneos por usuario (ver
+   * MAX_CONCURRENT_ANALYSES_PER_USER en analysis-constraints.ts) — cierra el abuso multi-campo que
+   * UQ_analysis_running_per_field no cubre (ese índice es por-campo, nunca supo cuántos campos
+   * distintos tiene el mismo dueño).
+   *
+   * Llamado EXPLÍCITAMENTE por los callers manuales (AnalysisController.runFieldAnalysis,
+   * ScheduledAnalysisRunnerService.runNow) — NUNCA desde adentro de runFieldAnalysis/triggerRun. A
+   * propósito: runFieldAnalysis es también el método que usa el dispatcher automático
+   * (processDueSchedules, @Interval), que dispara los schedules vencidos de un usuario
+   * SECUENCIALMENTE. Si este techo viviera dentro de runFieldAnalysis, una cuenta con más campos
+   * programados que MAX_CONCURRENT_ANALYSES_PER_USER vería sus propios schedules automáticos
+   * fallar entre sí la misma noche — una regresión funcional real, no abuso. Manteniendo el chequeo
+   * en el caller, el dispatcher automático queda estructuralmente afuera, igual que ya queda afuera
+   * de cualquier guard HTTP (no pasa por ningún controller).
+   *
+   * Atomicidad — carrera conocida y aceptada (no cerrada con lock): dos requests concurrentes del
+   * mismo usuario para dos campos distintos podrían ambas leer un count por debajo del techo y
+   * pasar, superándolo transitoriamente. No se cierra con pg_advisory_xact_lock porque solo
+   * serviría sostenido hasta el INSERT atómico per-campo (que puede ocurrir mucho después,
+   * getPipelineInput mediante) — eso exigiría pasar el mismo manager hasta adentro de
+   * runAtomicUpsert/resolveOrCreateByClientRequestId, arriesgando el mecanismo per-campo ya
+   * probado (6 specs e2e) por una ganancia marginal. Este techo es un gobernador de negocio, no una
+   * garantía de integridad como UQ_analysis_running_per_field: superarlo en 1-2 no duplica nada, se
+   * autocorrige en cuanto cualquiera de los análisis en curso termina, y el rate limit por usuario
+   * en los mismos entry points (ver UserComputeThrottlerGuard) ya acota, de forma independiente,
+   * cuántos requests concurrentes pueden siquiera llegar hasta acá.
+   *
+   * Borde conocido y aceptado: si el usuario reenvía un request para un campo que YA tiene un
+   * 'Procesando' propio (doble click, retry de cliente), esto puede rechazarlo igual si está en el
+   * techo por OTROS campos, aunque ese request en particular no fuera a consumir un slot nuevo.
+   * Caso raro y de bajo impacto (429 claro, reintentable) — no se resuelve acá para no mezclar esta
+   * lógica con el dedupe per-campo, que ya vive correctamente más abajo.
+   */
+  async assertUserBelowConcurrencyCeiling(userId: string): Promise<void> {
+    const runningCount = await this.countRunningAnalysesForUser(userId);
+
+    if (runningCount >= MAX_CONCURRENT_ANALYSES_PER_USER) {
+      throw new HttpException(
+        'Ya tenés varios análisis en curso. Esperá a que alguno termine antes de iniciar otro.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+  }
+
+  /**
+   * Analysis no tiene columna userId propia — la ownership se resuelve vía Field.userId. Mismo
+   * predicado que UQ_analysis_running_per_field (status='Procesando' AND (scope='field' OR scope
+   * IS NULL)) — cuenta exactamente lo que ese índice protege, nunca filas scope='lot' del módulo
+   * legacy (bloqueado en AUTH-5, GoneException, no puede crear filas nuevas).
+   */
+  private async countRunningAnalysesForUser(userId: string): Promise<number> {
+    const rows: Array<{ count: string }> = await this.analysisRepository.query(
+      `SELECT COUNT(*)::int AS count
+       FROM "analysis" a
+       INNER JOIN "fields" f ON f."id" = a."fieldId"
+       WHERE f."userId" = $1
+         AND a."status" = 'Procesando'
+         AND (a."scope" = 'field' OR a."scope" IS NULL)`,
+      [userId],
+    );
+
+    return Number(rows[0]?.count ?? 0);
   }
 
   async runFieldAnalysis(

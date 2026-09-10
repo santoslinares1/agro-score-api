@@ -1,4 +1,4 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, HttpException, HttpStatus, NotFoundException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 
@@ -761,6 +761,112 @@ describe('AnalysisService', () => {
       expect(
         analysisVerdictService.findResponseByAnalysisId,
       ).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('assertUserBelowConcurrencyCeiling (SEC-008)', () => {
+    /** Mismo criterio que python-worker.service.spec.ts::captureError — permite inspeccionar el
+     * status/mensaje del HttpException lanzado, no solo su tipo. */
+    async function captureError(promise: Promise<unknown>): Promise<any> {
+      try {
+        await promise;
+      } catch (error) {
+        return error;
+      }
+      throw new Error('Se esperaba que la promesa rechazara, pero resolvió.');
+    }
+
+    it('permite el request si el usuario está por debajo del techo (2 de 3)', async () => {
+      analysisRepository.query.mockResolvedValueOnce([{ count: 2 }]);
+
+      await expect(
+        service.assertUserBelowConcurrencyCeiling('user-A'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('rechaza con 429 si el usuario está exactamente en el techo (3 de 3)', async () => {
+      analysisRepository.query.mockResolvedValueOnce([{ count: 3 }]);
+
+      const error = await captureError(
+        service.assertUserBelowConcurrencyCeiling('user-A'),
+      );
+
+      expect(error).toBeInstanceOf(HttpException);
+      expect(error.getStatus()).toBe(HttpStatus.TOO_MANY_REQUESTS);
+    });
+
+    it('rechaza si el usuario ya está por encima del techo', async () => {
+      analysisRepository.query.mockResolvedValueOnce([{ count: 7 }]);
+
+      const error = await captureError(
+        service.assertUserBelowConcurrencyCeiling('user-A'),
+      );
+
+      expect(error).toBeInstanceOf(HttpException);
+      expect(error.getStatus()).toBe(HttpStatus.TOO_MANY_REQUESTS);
+    });
+
+    it('el mensaje no revela el conteo interno, "Earth Engine" ni "worker"', async () => {
+      analysisRepository.query.mockResolvedValueOnce([{ count: 5 }]);
+
+      const error = await captureError(
+        service.assertUserBelowConcurrencyCeiling('user-A'),
+      );
+
+      expect(error.message).not.toMatch(/\d/);
+      expect(error.message.toLowerCase()).not.toContain('earth engine');
+      expect(error.message.toLowerCase()).not.toContain('worker');
+    });
+
+    it('cuenta vía Field.userId (join), filtrando por status Procesando', async () => {
+      analysisRepository.query.mockResolvedValueOnce([{ count: 0 }]);
+
+      await service.assertUserBelowConcurrencyCeiling('user-A');
+
+      expect(analysisRepository.query).toHaveBeenCalledWith(
+        expect.stringContaining(`"status" = 'Procesando'`),
+        ['user-A'],
+      );
+      expect(analysisRepository.query).toHaveBeenCalledWith(
+        expect.stringContaining('f."userId" = $1'),
+        ['user-A'],
+      );
+    });
+  });
+
+  describe('runFieldAnalysis nunca dispara el techo de concurrencia por sí solo (SEC-008, regresión)', () => {
+    // Crítico: el dispatcher automático (ScheduledAnalysisRunnerService.processDueSchedules) llama
+    // a runFieldAnalysis directo, secuencialmente, para cada schedule vencido de un usuario. Si el
+    // techo viviera DENTRO de runFieldAnalysis, una cuenta con más campos programados que
+    // MAX_CONCURRENT_ANALYSES_PER_USER vería sus propios schedules automáticos fallar entre sí la
+    // misma noche. El chequeo vive exclusivamente en los callers manuales (AnalysisController,
+    // ScheduledAnalysisRunnerService.runNow) — ver el comentario completo en
+    // AnalysisService.assertUserBelowConcurrencyCeiling.
+    it('no invoca assertUserBelowConcurrencyCeiling', async () => {
+      const ceilingSpy = jest.spyOn(service, 'assertUserBelowConcurrencyCeiling');
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue({
+        fieldId: 'field-1',
+        name: 'Campo A',
+        lots: [
+          {
+            id: 'lot-1',
+            name: 'Lote 1',
+            geojson: {},
+            areaHa: 10,
+            includeInProductivityClassification: true,
+          },
+        ],
+      } as any);
+      analysisRepository.findOne.mockResolvedValueOnce(null);
+
+      await service.runFieldAnalysis(
+        'field-1',
+        { startDate: '2024-01-01', endDate: '2024-06-01', maxCloudiness: 30 },
+        'user-A',
+      );
+
+      expect(ceilingSpy).not.toHaveBeenCalled();
     });
   });
 

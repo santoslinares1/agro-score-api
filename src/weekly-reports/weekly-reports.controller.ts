@@ -1,8 +1,10 @@
 import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import type { Request } from 'express';
 
 import { AuthenticatedUser } from '../auth/jwt.strategy';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { UserComputeThrottlerGuard } from '../common/guards/user-compute-throttler.guard';
 import { CreateWeeklyReportDto } from './dto/create-weekly-report.dto';
 import { ListWeeklyReportsQueryDto } from './dto/list-weekly-reports-query.dto';
 import { WeeklyObservationsQueryDto } from './dto/weekly-observations-query.dto';
@@ -14,7 +16,13 @@ type AuthenticatedRequest = Request & { user: AuthenticatedUser };
 export class WeeklyReportsController {
   constructor(private readonly weeklyReportsService: WeeklyReportsService) {}
 
-  @UseGuards(JwtAuthGuard)
+  // SEC-008: mismo bucket 'compute' (por usuario) que POST analysis/field/:fieldId y POST
+  // fields/:fieldId/analysis-schedule/run-now — ver UserComputeThrottlerGuard. El techo de
+  // concurrencia propio de weekly-reports (WeeklyReportsService.assertUserBelowConcurrencyCeiling)
+  // se aplica dentro de create(), no acá.
+  @UseGuards(JwtAuthGuard, UserComputeThrottlerGuard)
+  @SkipThrottle({ default: true })
+  @Throttle({ compute: { limit: 10, ttl: 600_000 } })
   @Post('weekly-reports')
   create(
     @Param('fieldId', ParseUUIDPipe) fieldId: string,

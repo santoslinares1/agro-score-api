@@ -1,8 +1,11 @@
+import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { GoneException, NotFoundException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { ThrottlerModule } from '@nestjs/throttler';
 import * as fs from 'fs';
 
 import { AuthenticatedUser } from '../auth/jwt.strategy';
+import { UserComputeThrottlerGuard } from '../common/guards/user-compute-throttler.guard';
 import { AnalysisController } from './analysis.controller';
 import { AnalysisService } from './analysis.service';
 
@@ -21,6 +24,7 @@ describe('AnalysisController', () => {
       | 'findAll'
       | 'findByField'
       | 'runFieldAnalysis'
+      | 'assertUserBelowConcurrencyCeiling'
     >
   >;
 
@@ -38,8 +42,20 @@ describe('AnalysisController', () => {
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
+      // SEC-008: AnalysisController.runFieldAnalysis ahora lleva
+      // @UseGuards(JwtAuthGuard, UserComputeThrottlerGuard) — UserComputeThrottlerGuard extiende
+      // ThrottlerGuard, cuyo constructor pide (options, storageService, reflector) inyectados;
+      // ThrottlerModule.forRoot(...) es lo que provee esos tokens (mismo import que
+      // auth.controller.spec.ts ya usa para probar ThrottlerGuard).
+      imports: [
+        ThrottlerModule.forRoot([
+          { name: 'default', ttl: 60_000, limit: 20 },
+          { name: 'compute', ttl: 600_000, limit: 10 },
+        ]),
+      ],
       controllers: [AnalysisController],
       providers: [
+        UserComputeThrottlerGuard,
         {
           provide: AnalysisService,
           useValue: {
@@ -51,6 +67,7 @@ describe('AnalysisController', () => {
             findAll: jest.fn(),
             findByField: jest.fn(),
             runFieldAnalysis: jest.fn(),
+            assertUserBelowConcurrencyCeiling: jest.fn(),
           },
         },
       ],
@@ -131,18 +148,76 @@ describe('AnalysisController', () => {
       );
     });
 
-    it('runFieldAnalysis llama a runFieldAnalysis(fieldId, body, user.sub)', () => {
+    it('runFieldAnalysis llama a runFieldAnalysis(fieldId, body, user.sub) — DESPUÉS de pasar el techo de concurrencia', async () => {
       const body = {
         startDate: '2024-01-01',
         endDate: '2024-06-01',
         maxCloudiness: 30,
       } as any;
-      controller.runFieldAnalysis('field-1', body, req);
+      const callOrder: string[] = [];
+      analysisService.assertUserBelowConcurrencyCeiling.mockImplementation(
+        () => {
+          callOrder.push('ceiling');
+          return Promise.resolve();
+        },
+      );
+      analysisService.runFieldAnalysis.mockImplementation(() => {
+        callOrder.push('runFieldAnalysis');
+        return Promise.resolve({} as any);
+      });
+
+      await controller.runFieldAnalysis('field-1', body, req);
+
+      expect(
+        analysisService.assertUserBelowConcurrencyCeiling,
+      ).toHaveBeenCalledWith('user-A');
       expect(analysisService.runFieldAnalysis).toHaveBeenCalledWith(
         'field-1',
         body,
         'user-A',
       );
+      expect(callOrder).toEqual(['ceiling', 'runFieldAnalysis']);
+    });
+
+    // SEC-008: si el usuario está en el techo, el rechazo debe ocurrir ANTES de tocar
+    // AnalysisService.runFieldAnalysis (que es lo que dispara el dedupe per-campo/Worker).
+    it('runFieldAnalysis propaga el rechazo del techo de concurrencia sin llamar a runFieldAnalysis', async () => {
+      const body = {
+        startDate: '2024-01-01',
+        endDate: '2024-06-01',
+        maxCloudiness: 30,
+      } as any;
+      const rejection = new Error('429 simulado');
+      analysisService.assertUserBelowConcurrencyCeiling.mockRejectedValue(
+        rejection,
+      );
+
+      await expect(
+        controller.runFieldAnalysis('field-1', body, req),
+      ).rejects.toBe(rejection);
+
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('SEC-008: rate limiting por usuario en runFieldAnalysis', () => {
+    it('lleva UserComputeThrottlerGuard además de JwtAuthGuard', () => {
+      const guards = Reflect.getMetadata(
+        GUARDS_METADATA,
+        (controller as any).runFieldAnalysis,
+      ) as unknown[] | undefined;
+
+      expect(guards).toContain(UserComputeThrottlerGuard);
+    });
+
+    it('usa el throttler "compute" (10 req / 10 min), no el bucket "default"', () => {
+      const handler = (controller as any).runFieldAnalysis;
+
+      expect(Reflect.getMetadata('THROTTLER:LIMITcompute', handler)).toBe(10);
+      expect(Reflect.getMetadata('THROTTLER:TTLcompute', handler)).toBe(
+        600_000,
+      );
+      expect(Reflect.getMetadata('THROTTLER:SKIPdefault', handler)).toBe(true);
     });
   });
 

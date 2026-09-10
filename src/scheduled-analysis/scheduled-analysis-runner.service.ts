@@ -720,6 +720,13 @@ export class ScheduledAnalysisRunnerService {
       );
     }
 
+    // SEC-008: mismo techo por usuario que el disparo manual de POST /analysis/field/:fieldId —
+    // "Ejecutar ahora" es, para este propósito, un disparo manual más (comparte además el mismo
+    // bucket de rate limit por usuario, ver UserComputeThrottlerGuard). Nunca se llama desde
+    // processDueSchedules (el dispatcher automático llama a triggerRun directo, sin pasar por
+    // acá) — ver el comentario completo en AnalysisService.assertUserBelowConcurrencyCeiling.
+    await this.analysisService.assertUserBelowConcurrencyCeiling(userId);
+
     // triggerRun ya dedupea por (scheduleId, scheduledFor) — mismo mecanismo que usa el
     // dispatcher automático, así que "Ejecutar ahora" nunca duplica una corrida ya disparada
     // (automática o manual) para la semana actual.
