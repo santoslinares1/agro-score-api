@@ -99,7 +99,11 @@ export class AdminController {
     @Body() dto: CreateAdminUserDto,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.adminService.createUser(dto, this.buildActorContext(req));
+    return this.adminService.createUser(
+      dto,
+      this.buildActorContext(req),
+      req.user.role,
+    );
   }
 
   @Patch('users/:id')
@@ -108,7 +112,12 @@ export class AdminController {
     @Body() dto: UpdateAdminUserDto,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.adminService.updateUser(id, dto, this.buildActorContext(req));
+    return this.adminService.updateUser(
+      id,
+      dto,
+      this.buildActorContext(req),
+      req.user.role,
+    );
   }
 
   // Soft delete: nunca borra el registro (ver AdminService.deactivateUser),
@@ -138,7 +147,11 @@ export class AdminController {
     @Body() dto: CreateInvitationDto,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.adminService.createInvitation(dto, this.buildActorContext(req));
+    return this.adminService.createInvitation(
+      dto,
+      this.buildActorContext(req),
+      req.user.role,
+    );
   }
 
   @Get('fields')
@@ -231,6 +244,7 @@ export class AdminController {
       id,
       dto,
       this.buildActorContext(req),
+      req.user.role,
     );
   }
 }

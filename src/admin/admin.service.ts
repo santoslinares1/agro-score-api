@@ -2,6 +2,7 @@ import { execSync } from 'child_process';
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -1050,7 +1051,11 @@ export class AdminService {
   async createUser(
     dto: CreateAdminUserDto,
     actor: AuditActorContext,
+    actorRole: UserRole,
   ): Promise<PublicUser> {
+    // SEC-001: ver assertCanGrantOwnerRole — antes de tocar nada más.
+    this.assertCanGrantOwnerRole(actorRole, dto.role);
+
     const email = dto.email.trim().toLowerCase();
 
     const existing = await this.usersService.findByEmail(email);
@@ -1085,12 +1090,20 @@ export class AdminService {
     id: string,
     dto: UpdateAdminUserDto,
     actor: AuditActorContext,
+    actorRole: UserRole,
   ): Promise<PublicUser> {
     const target = await this.usersService.findById(id);
 
     if (!target) {
       throw new NotFoundException('Usuario no encontrado.');
     }
+
+    // SEC-001: ver assertCanGrantOwnerRole. Solo se dispara cuando dto.role === OWNER — nunca
+    // bloquea un cambio de role admin↔user, ni un update que no toca `role` en absoluto (incluido
+    // sobre un target que ya es owner). No reemplaza ni se superpone con assertNotLastActiveOwner
+    // (esa protege la degradación/desactivación del último owner activo; esta protege quién puede
+    // OTORGAR owner).
+    this.assertCanGrantOwnerRole(actorRole, dto.role);
 
     const removesOwner =
       target.role === UserRole.OWNER &&
@@ -1182,6 +1195,30 @@ export class AdminService {
     });
 
     return publicUser;
+  }
+
+  /**
+   * SEC-001: solo un actor con role `owner` puede OTORGAR el role `owner` — a otro usuario o a sí
+   * mismo — desde cualquiera de los 4 endpoints que aceptan un `role` de destino (createUser,
+   * updateUser, createInvitation, createUserFromAccessRequest). Antes de esta ficha, el guard de
+   * clase de AdminController (@Roles(OWNER, ADMIN)) trataba ambos roles como equivalentes para
+   * toda operación, y ningún DTO ni service comparaba el role *solicitado* contra el role del
+   * actor: cualquier admin podía escalarse (o escalar a otro) a owner sin ninguna restricción.
+   *
+   * Deliberadamente NO toca ningún otro caso:
+   * - `requestedRole` undefined (el caller no está tocando `role`) → no dispara nunca.
+   * - `requestedRole` en {admin, user} → no dispara, sin importar el role del actor (admin sigue
+   *   pudiendo asignar admin/user como hoy).
+   * - degradar/desactivar a un owner existente → sigue gobernado exclusivamente por
+   *   assertNotLastActiveOwner, sin relación con este chequeo.
+   */
+  private assertCanGrantOwnerRole(
+    actorRole: UserRole,
+    requestedRole: UserRole | undefined,
+  ): void {
+    if (requestedRole === UserRole.OWNER && actorRole !== UserRole.OWNER) {
+      throw new ForbiddenException('Solo un owner puede otorgar el rol owner.');
+    }
   }
 
   /**
@@ -1321,7 +1358,14 @@ export class AdminService {
     return result;
   }
 
-  async createInvitation(dto: CreateInvitationDto, actor: AuditActorContext) {
+  async createInvitation(
+    dto: CreateInvitationDto,
+    actor: AuditActorContext,
+    actorRole: UserRole,
+  ) {
+    // SEC-001: ver assertCanGrantOwnerRole.
+    this.assertCanGrantOwnerRole(actorRole, dto.role);
+
     const { invitation, rawToken } = await this.issueInvitation(
       dto.email,
       dto.role,
@@ -1487,6 +1531,7 @@ export class AdminService {
     id: string,
     dto: CreateUserFromAccessRequestDto,
     actor: AuditActorContext,
+    actorRole: UserRole,
   ) {
     const accessRequest = await this.accessRequestRepository.findOne({
       where: { id },
@@ -1497,6 +1542,10 @@ export class AdminService {
     }
 
     const role = dto.role ?? UserRole.USER;
+
+    // SEC-001: ver assertCanGrantOwnerRole. `role` ya resuelve el default (USER) antes de esta
+    // llamada, así que un dto.role ausente nunca dispara el chequeo.
+    this.assertCanGrantOwnerRole(actorRole, role);
 
     const { invitation, rawToken } = await this.issueInvitation(
       accessRequest.email,

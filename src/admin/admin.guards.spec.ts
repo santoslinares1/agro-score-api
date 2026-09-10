@@ -36,6 +36,12 @@ class FakeJwtAuthGuard implements CanActivate {
 
 describe('/admin/* — guards de rol (ADMIN-1)', () => {
   let app: INestApplication;
+  let adminService: {
+    createUser: jest.Mock;
+    updateUser: jest.Mock;
+    createInvitation: jest.Mock;
+    createUserFromAccessRequest: jest.Mock;
+  };
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
@@ -117,6 +123,19 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
               scheduledAnalysis: [],
               recentAuditLogs: [],
             }),
+            // SEC-001: la restricción real vive en AdminService (ver admin.service.spec.ts,
+            // describe 'SEC-001'). Acá el service sigue mockeado — estos mocks solo existen
+            // para verificar que AdminController reenvía el role ACTUAL del actor autenticado
+            // (req.user.role, repoblado por JwtStrategy en cada request — nunca un claim crudo
+            // del JWT) como argumento separado, no que la lógica de negocio esté duplicada acá.
+            createUser: jest.fn().mockResolvedValue({ id: 'user-created' }),
+            updateUser: jest.fn().mockResolvedValue({ id: 'user-1' }),
+            createInvitation: jest
+              .fn()
+              .mockResolvedValue({ id: 'invitation-1' }),
+            createUserFromAccessRequest: jest
+              .fn()
+              .mockResolvedValue({ id: 'invitation-1' }),
           },
         },
       ],
@@ -127,6 +146,7 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
 
     app = moduleRef.createNestApplication();
     await app.init();
+    adminService = moduleRef.get(AdminService);
   });
 
   afterAll(async () => {
@@ -251,5 +271,77 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
         '/admin/analysis/a1111111-1111-4111-8111-111111111111/technical-verdict/retry',
       )
       .expect(403);
+  });
+
+  // SEC-001: el controller es el único punto que conoce req.user.role (repoblado por
+  // JwtStrategy desde DB en cada request, nunca un claim del JWT sin revalidar) — tiene que
+  // reenviarlo tal cual al service en los 4 entry points que aceptan un `role` de destino. La
+  // restricción real (assertCanGrantOwnerRole) se prueba contra el service de verdad en
+  // admin.service.spec.ts; acá solo se confirma que el controller no "olvida" mandarlo.
+  describe('SEC-001 — el controller reenvía el role del actor a los 4 entry points', () => {
+    it('POST /admin/users incluye el role del actor autenticado como 3er argumento', async () => {
+      await request(app.getHttpServer())
+        .post('/admin/users')
+        .set('x-test-role', UserRole.ADMIN)
+        .send({
+          fullName: 'Test',
+          email: 'test@agroscorelatam.com',
+          password: 'temporal123',
+          role: UserRole.USER,
+        })
+        .expect(201);
+
+      expect(adminService.createUser).toHaveBeenCalledWith(
+        expect.objectContaining({ role: UserRole.USER }),
+        expect.any(Object),
+        UserRole.ADMIN,
+      );
+    });
+
+    it('PATCH /admin/users/:id incluye el role del actor autenticado como 4to argumento', async () => {
+      await request(app.getHttpServer())
+        .patch('/admin/users/a1111111-1111-4111-8111-111111111111')
+        .set('x-test-role', UserRole.OWNER)
+        .send({ role: UserRole.ADMIN })
+        .expect(200);
+
+      expect(adminService.updateUser).toHaveBeenCalledWith(
+        'a1111111-1111-4111-8111-111111111111',
+        expect.objectContaining({ role: UserRole.ADMIN }),
+        expect.any(Object),
+        UserRole.OWNER,
+      );
+    });
+
+    it('POST /admin/invitations incluye el role del actor autenticado como 3er argumento', async () => {
+      await request(app.getHttpServer())
+        .post('/admin/invitations')
+        .set('x-test-role', UserRole.ADMIN)
+        .send({ email: 'invitado@example.com', role: UserRole.USER })
+        .expect(201);
+
+      expect(adminService.createInvitation).toHaveBeenCalledWith(
+        expect.objectContaining({ role: UserRole.USER }),
+        expect.any(Object),
+        UserRole.ADMIN,
+      );
+    });
+
+    it('POST /admin/access-requests/:id/create-user incluye el role del actor autenticado como 4to argumento', async () => {
+      await request(app.getHttpServer())
+        .post(
+          '/admin/access-requests/a1111111-1111-4111-8111-111111111111/create-user',
+        )
+        .set('x-test-role', UserRole.ADMIN)
+        .send({})
+        .expect(201);
+
+      expect(adminService.createUserFromAccessRequest).toHaveBeenCalledWith(
+        'a1111111-1111-4111-8111-111111111111',
+        expect.any(Object),
+        expect.any(Object),
+        UserRole.ADMIN,
+      );
+    });
   });
 });

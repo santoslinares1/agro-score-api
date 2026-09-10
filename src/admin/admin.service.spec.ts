@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -252,6 +253,7 @@ describe('AdminService', () => {
           role: UserRole.ADMIN,
         },
         actor,
+        UserRole.ADMIN,
       );
 
       expect(result).not.toHaveProperty('passwordHash');
@@ -277,6 +279,7 @@ describe('AdminService', () => {
             role: UserRole.USER,
           },
           actor,
+          UserRole.ADMIN,
         ),
       ).rejects.toBeInstanceOf(ConflictException);
     });
@@ -328,7 +331,12 @@ describe('AdminService', () => {
         buildUser({ role: UserRole.ADMIN }),
       );
 
-      await service.updateUser('user-1', { role: UserRole.ADMIN }, actor);
+      await service.updateUser(
+        'user-1',
+        { role: UserRole.ADMIN },
+        actor,
+        UserRole.ADMIN,
+      );
 
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'admin.user.role_changed' }),
@@ -341,7 +349,12 @@ describe('AdminService', () => {
         buildUser({ fullName: 'Nuevo nombre' }),
       );
 
-      await service.updateUser('user-1', { fullName: 'Nuevo nombre' }, actor);
+      await service.updateUser(
+        'user-1',
+        { fullName: 'Nuevo nombre' },
+        actor,
+        UserRole.ADMIN,
+      );
 
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'admin.user.updated' }),
@@ -357,7 +370,12 @@ describe('AdminService', () => {
       usersService.countActiveByRole.mockResolvedValue(0);
 
       await expect(
-        service.updateUser('user-1', { role: UserRole.ADMIN }, actor),
+        service.updateUser(
+          'user-1',
+          { role: UserRole.ADMIN },
+          actor,
+          UserRole.ADMIN,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
 
       expect(usersService.update).not.toHaveBeenCalled();
@@ -372,7 +390,12 @@ describe('AdminService', () => {
         buildUser({ role: UserRole.ADMIN }),
       );
 
-      await service.updateUser('user-1', { role: UserRole.ADMIN }, actor);
+      await service.updateUser(
+        'user-1',
+        { role: UserRole.ADMIN },
+        actor,
+        UserRole.ADMIN,
+      );
 
       expect(usersService.update).toHaveBeenCalled();
     });
@@ -407,6 +430,214 @@ describe('AdminService', () => {
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'admin.user.deactivated' }),
       );
+    });
+  });
+
+  // SEC-001: solo un actor con role owner puede OTORGAR el role owner — a otro usuario o a sí
+  // mismo — desde cualquiera de los 4 endpoints que aceptan un `role` de destino. Cubre los
+  // cuatro entry points (createUser, updateUser, createInvitation, createUserFromAccessRequest)
+  // con: (a) negativo — actor admin pidiendo owner se rechaza SIN ningún efecto secundario
+  // (nada se persiste, nada se audita, ningún email sale); (b) control positivo — actor owner
+  // pidiendo owner sigue funcionando igual que antes de este fix. Los casos "admin↔user sin
+  // tocar owner" ya están cubiertos por los tests preexistentes de arriba (createUser con
+  // role=ADMIN, updateUser cambiando fullName/role=ADMIN, deactivateUser) — no se duplican acá.
+  describe('SEC-001 — otorgar rol owner', () => {
+    describe('createUser', () => {
+      it('actor admin pidiendo role owner se rechaza sin crear el usuario', async () => {
+        usersService.findByEmail.mockResolvedValue(null);
+
+        await expect(
+          service.createUser(
+            {
+              fullName: 'Intento de escalación',
+              email: 'escalador@agroscorelatam.com',
+              password: 'temporal123',
+              role: UserRole.OWNER,
+            },
+            actor,
+            UserRole.ADMIN,
+          ),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+
+        expect(usersService.create).not.toHaveBeenCalled();
+        expect(auditLogService.record).not.toHaveBeenCalled();
+      });
+
+      it('actor owner pidiendo role owner sigue funcionando (control positivo)', async () => {
+        usersService.findByEmail.mockResolvedValue(null);
+        usersService.create.mockResolvedValue(
+          buildUser({ role: UserRole.OWNER }),
+        );
+
+        const result = await service.createUser(
+          {
+            fullName: 'Nuevo Owner',
+            email: 'nuevo-owner@agroscorelatam.com',
+            password: 'temporal123',
+            role: UserRole.OWNER,
+          },
+          actor,
+          UserRole.OWNER,
+        );
+
+        expect(result.role).toBe(UserRole.OWNER);
+        expect(usersService.create).toHaveBeenCalled();
+      });
+    });
+
+    describe('updateUser', () => {
+      it('actor admin pidiendo role owner para otro usuario se rechaza sin escribir nada', async () => {
+        usersService.findById.mockResolvedValue(
+          buildUser({ role: UserRole.USER }),
+        );
+
+        await expect(
+          service.updateUser(
+            'user-1',
+            { role: UserRole.OWNER },
+            actor,
+            UserRole.ADMIN,
+          ),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+
+        expect(usersService.update).not.toHaveBeenCalled();
+        expect(auditLogService.record).not.toHaveBeenCalled();
+      });
+
+      it('actor admin pidiendo role owner para SÍ MISMO se rechaza igual (autoescalación)', async () => {
+        usersService.findById.mockResolvedValue(
+          buildUser({ id: 'admin-1', role: UserRole.ADMIN }),
+        );
+
+        await expect(
+          service.updateUser(
+            'admin-1',
+            { role: UserRole.OWNER },
+            actor,
+            UserRole.ADMIN,
+          ),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+
+        expect(usersService.update).not.toHaveBeenCalled();
+      });
+
+      it('actor owner pidiendo role owner sigue funcionando (control positivo)', async () => {
+        usersService.findById.mockResolvedValue(
+          buildUser({ role: UserRole.ADMIN }),
+        );
+        usersService.update.mockResolvedValue(
+          buildUser({ role: UserRole.OWNER }),
+        );
+
+        await service.updateUser(
+          'user-1',
+          { role: UserRole.OWNER },
+          actor,
+          UserRole.OWNER,
+        );
+
+        expect(usersService.update).toHaveBeenCalledWith(
+          'user-1',
+          expect.objectContaining({ role: UserRole.OWNER }),
+        );
+      });
+
+      it('actor admin modificando isActive sin tocar role sigue funcionando (sin regresión)', async () => {
+        usersService.findById.mockResolvedValue(
+          buildUser({ role: UserRole.USER, isActive: true }),
+        );
+        usersService.update.mockResolvedValue(
+          buildUser({ role: UserRole.USER, isActive: false }),
+        );
+
+        await service.updateUser(
+          'user-1',
+          { isActive: false },
+          actor,
+          UserRole.ADMIN,
+        );
+
+        expect(usersService.update).toHaveBeenCalledWith(
+          'user-1',
+          expect.objectContaining({ isActive: false }),
+        );
+      });
+    });
+
+    describe('createInvitation', () => {
+      it('actor admin invitando con role owner se rechaza sin persistir ni enviar email', async () => {
+        usersService.findByEmail.mockResolvedValue(null);
+
+        await expect(
+          service.createInvitation(
+            { email: 'escalador@example.com', role: UserRole.OWNER },
+            actor,
+            UserRole.ADMIN,
+          ),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+
+        expect(invitationRepo.save).not.toHaveBeenCalled();
+        expect(emailService.sendInvitationEmail).not.toHaveBeenCalled();
+        expect(auditLogService.record).not.toHaveBeenCalled();
+      });
+
+      it('actor owner invitando con role owner sigue funcionando (control positivo)', async () => {
+        usersService.findByEmail.mockResolvedValue(null);
+        invitationRepo.save.mockImplementation((v: unknown) =>
+          Promise.resolve({ id: 'invitation-owner', ...(v as object) }),
+        );
+
+        const result = await service.createInvitation(
+          { email: 'nuevo-owner@example.com', role: UserRole.OWNER },
+          actor,
+          UserRole.OWNER,
+        );
+
+        expect(result.role).toBe(UserRole.OWNER);
+        expect(invitationRepo.save).toHaveBeenCalled();
+      });
+    });
+
+    describe('createUserFromAccessRequest', () => {
+      it('actor admin pidiendo role owner se rechaza sin convertir la solicitud ni invitar', async () => {
+        const accessRequest = buildAccessRequest();
+        accessRequestRepo.findOne.mockResolvedValue(accessRequest);
+        usersService.findByEmail.mockResolvedValue(null);
+
+        await expect(
+          service.createUserFromAccessRequest(
+            'access-request-1',
+            { role: UserRole.OWNER },
+            actor,
+            UserRole.ADMIN,
+          ),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+
+        expect(invitationRepo.save).not.toHaveBeenCalled();
+        expect(accessRequestRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('actor owner pidiendo role owner sigue funcionando (control positivo)', async () => {
+        const accessRequest = buildAccessRequest();
+        accessRequestRepo.findOne.mockResolvedValue(accessRequest);
+        accessRequestRepo.save.mockImplementation((v: AccessRequest) =>
+          Promise.resolve(v),
+        );
+        usersService.findByEmail.mockResolvedValue(null);
+        invitationRepo.save.mockImplementation((v: unknown) =>
+          Promise.resolve({ id: 'invitation-owner', ...(v as object) }),
+        );
+
+        const result = await service.createUserFromAccessRequest(
+          'access-request-1',
+          { role: UserRole.OWNER },
+          actor,
+          UserRole.OWNER,
+        );
+
+        expect(result.invitation.role).toBe(UserRole.OWNER);
+        expect(accessRequestRepo.save).toHaveBeenCalled();
+      });
     });
   });
 
@@ -492,6 +723,7 @@ describe('AdminService', () => {
         'access-request-1',
         {},
         actor,
+        UserRole.ADMIN,
       );
 
       expect(result.accessRequest.status).toBe('converted');
@@ -519,7 +751,12 @@ describe('AdminService', () => {
       );
 
       await expect(
-        service.createUserFromAccessRequest('access-request-1', {}, actor),
+        service.createUserFromAccessRequest(
+          'access-request-1',
+          {},
+          actor,
+          UserRole.ADMIN,
+        ),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
@@ -527,7 +764,12 @@ describe('AdminService', () => {
       accessRequestRepo.findOne.mockResolvedValue(null);
 
       await expect(
-        service.createUserFromAccessRequest('missing', {}, actor),
+        service.createUserFromAccessRequest(
+          'missing',
+          {},
+          actor,
+          UserRole.ADMIN,
+        ),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
@@ -543,6 +785,7 @@ describe('AdminService', () => {
       const result = await service.createInvitation(
         { email: 'nuevo@example.com', role: UserRole.USER },
         actor,
+        UserRole.ADMIN,
       );
 
       expect(result).toHaveProperty('invitationToken');
@@ -564,6 +807,7 @@ describe('AdminService', () => {
       const result = await service.createInvitation(
         { email: 'nuevo@example.com', role: UserRole.USER },
         actor,
+        UserRole.ADMIN,
       );
 
       expect(result).not.toHaveProperty('invitationToken');
@@ -583,6 +827,7 @@ describe('AdminService', () => {
       await service.createInvitation(
         { email: 'nuevo@example.com', role: UserRole.USER },
         actor,
+        UserRole.ADMIN,
       );
 
       expect(emailService.sendInvitationEmail).toHaveBeenCalledWith(
@@ -615,6 +860,7 @@ describe('AdminService', () => {
       const result = await service.createInvitation(
         { email: 'nuevo@example.com', role: UserRole.USER },
         actor,
+        UserRole.ADMIN,
       );
 
       expect(result.id).toBe('invitation-1');
@@ -628,6 +874,7 @@ describe('AdminService', () => {
         service.createInvitation(
           { email: 'user@agroscorelatam.com', role: UserRole.USER },
           actor,
+          UserRole.ADMIN,
         ),
       ).rejects.toBeInstanceOf(ConflictException);
     });
