@@ -251,7 +251,15 @@ describeContract('F02 (contrato entre repos): default de Web → validación/map
 
     const httpServiceStub = { post: httpServicePostMock } as unknown as HttpService;
     const configServiceStub = {
-      get: jest.fn().mockReturnValue(undefined),
+      // SEC-003: PythonWorkerService ahora exige WORKER_INTERNAL_TOKEN en el constructor (ver
+      // getRequiredWorkerToken) — sin esto, `new PythonWorkerService(...)` de abajo tira. El
+      // resto de las keys sigue devolviendo undefined (este contrato no depende de
+      // PYTHON_WORKER_URL ni del contenido real del token).
+      get: jest.fn((key: string) =>
+        key === 'WORKER_INTERNAL_TOKEN'
+          ? 'f02-contract-test-worker-token'
+          : undefined,
+      ),
     } as unknown as ConfigService;
 
     // REAL PythonWorkerService: solo se reemplaza HttpService (transporte), no la lógica de

@@ -166,10 +166,31 @@ const buildAxiosResponse = (
  * porque PYTHON_WORKER_URL se lee una sola vez en el constructor (ver
  * PythonWorkerService.constructor) — no alcanza con cambiar el mock después
  * de instanciado.
+ *
+ * SEC-003: `workerToken` tiene un default no-vacío para que los ~15 call sites preexistentes de
+ * este archivo (que no son sobre auth) sigan construyendo el service sin tirar por
+ * WORKER_INTERNAL_TOKEN faltante — getRequiredWorkerToken corre en el constructor. `httpService`
+ * incluye `get` (antes solo `post`) porque checkHealth() usa GET y no tenía cobertura alguna.
+ *
+ * `workerToken` es `string | null`, no `string | undefined`: un default parameter de JS/TS se
+ * aplica también cuando el caller pasa `undefined` explícitamente (no solo cuando omite el
+ * argumento), así que `createService(url, undefined)` NO alcanzaría a simular "sin configurar" —
+ * terminaría usando igual el default. `null` es la forma explícita de pedir "sin token" (se
+ * traduce a que ConfigService.get devuelva `undefined` para esa key, igual que una env var real
+ * ausente).
  */
-async function createService(configuredUrl: string | undefined) {
-  const httpService = { post: jest.fn() };
-  const configService = { get: jest.fn().mockReturnValue(configuredUrl) };
+async function createService(
+  configuredUrl: string | undefined,
+  workerToken: string | null = 'test-worker-token',
+) {
+  const httpService = { post: jest.fn(), get: jest.fn() };
+  const configService = {
+    get: jest.fn((key: string) => {
+      if (key === 'PYTHON_WORKER_URL') return configuredUrl;
+      if (key === 'WORKER_INTERNAL_TOKEN') return workerToken === null ? undefined : workerToken;
+      return undefined;
+    }),
+  };
 
   const module: TestingModule = await Test.createTestingModule({
     providers: [
@@ -219,6 +240,85 @@ describe('PythonWorkerService', () => {
       'http://localhost:8000/analyze',
       expect.anything(),
       expect.anything(),
+    );
+  });
+});
+
+describe('PythonWorkerService — SEC-003: header X-Worker-Token', () => {
+  it('checkHealth() NO manda X-Worker-Token (GET /health queda público a propósito)', async () => {
+    const { service, httpService } = await createService(
+      'http://worker:9000',
+      'secreto-compartido',
+    );
+    httpService.get.mockReturnValue(of({ data: { status: 'ok' } } as any));
+
+    await service.checkHealth();
+
+    expect(httpService.get).toHaveBeenCalledTimes(1);
+    // Match exacto (no objectContaining): prueba que el config NO tiene ninguna clave `headers`
+    // agregada, no solo que el valor sea distinto.
+    expect(httpService.get).toHaveBeenCalledWith('http://worker:9000/health', {
+      timeout: 3000,
+    });
+  });
+
+  it('runAnalysis()/postToWorker() manda X-Worker-Token en POST /analyze', async () => {
+    const { service, httpService } = await createService(
+      'http://worker:9000',
+      'secreto-compartido',
+    );
+    httpService.post.mockReturnValue(of(buildAxiosResponse(buildWorkerResult())));
+
+    await service.runAnalysis(buildInput());
+
+    expect(httpService.post).toHaveBeenCalledWith(
+      'http://worker:9000/analyze',
+      expect.anything(),
+      expect.objectContaining({ headers: { 'X-Worker-Token': 'secreto-compartido' } }),
+    );
+  });
+
+  it('runFieldAnalysis() (mismo postToWorker interno) también manda el header', async () => {
+    const { service, httpService } = await createService(
+      'http://worker:9000',
+      'secreto-compartido',
+    );
+    httpService.post.mockReturnValue(of(buildAxiosResponse(buildWorkerResult())));
+
+    await service.runFieldAnalysis(buildFieldInput() as any);
+
+    expect(httpService.post).toHaveBeenCalledWith(
+      'http://worker:9000/analyze',
+      expect.anything(),
+      expect.objectContaining({ headers: { 'X-Worker-Token': 'secreto-compartido' } }),
+    );
+  });
+
+  it('runWeeklyReport() manda X-Worker-Token en POST /weekly-report/spike', async () => {
+    const { service, httpService } = await createService(
+      'http://worker:9000',
+      'secreto-compartido',
+    );
+    httpService.post.mockReturnValue(of(buildAxiosResponse(buildWorkerResult() as any)));
+
+    await service.runWeeklyReport(buildWeeklyReportInput());
+
+    expect(httpService.post).toHaveBeenCalledWith(
+      'http://worker:9000/weekly-report/spike',
+      expect.anything(),
+      expect.objectContaining({ headers: { 'X-Worker-Token': 'secreto-compartido' } }),
+    );
+  });
+
+  it('el constructor falla si WORKER_INTERNAL_TOKEN no está configurada', async () => {
+    await expect(createService('http://worker:9000', null)).rejects.toThrow(
+      /WORKER_INTERNAL_TOKEN no está configurada/,
+    );
+  });
+
+  it('el constructor falla si WORKER_INTERNAL_TOKEN está vacía', async () => {
+    await expect(createService('http://worker:9000', '')).rejects.toThrow(
+      /WORKER_INTERNAL_TOKEN no está configurada/,
     );
   });
 });

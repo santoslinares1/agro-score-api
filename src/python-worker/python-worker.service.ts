@@ -16,6 +16,7 @@ import {
   WeeklyReportWorkerResult,
   WorkerAnalysisResult,
 } from './types';
+import { getRequiredWorkerToken } from './worker-token.util';
 
 type NewWorkerPayload = {
   field_name: string;
@@ -95,6 +96,7 @@ const MAX_MAX_ZONE_CAMPAIGNS = 6;
 export class PythonWorkerService {
   private readonly logger = new Logger(PythonWorkerService.name);
   private readonly workerUrl: string;
+  private readonly workerAuthHeaders: Record<string, string>;
 
   constructor(
     private readonly httpService: HttpService,
@@ -103,6 +105,18 @@ export class PythonWorkerService {
     this.workerUrl =
       this.configService.get<string>('PYTHON_WORKER_URL') ||
       'http://localhost:8000';
+
+    // SEC-003: mismo secreto compartido que agro-score-worker exige vía verify_worker_token
+    // (app/worker_auth.py) en /analyze y /weekly-report/spike. Se resuelve acá, en construcción
+    // (mismo momento de bootstrap que getRequiredJwtSecret en JwtStrategy/AuthModule — ver
+    // jwt-secret.util.ts), no en el primer request: PythonWorkerModule se importa eager desde
+    // AppModule, así que un WORKER_INTERNAL_TOKEN faltante tira abajo el arranque del backend en
+    // vez de dejarlo servir tráfico y fallar recién cuando alguien dispare un análisis.
+    // Se calcula sin importar qué métodos terminen usándolo — checkHealth() deliberadamente NO
+    // lo manda (ver abajo, principio de mínimo envío de credenciales).
+    this.workerAuthHeaders = {
+      'X-Worker-Token': getRequiredWorkerToken(this.configService),
+    };
   }
 
   /**
@@ -110,6 +124,11 @@ export class PythonWorkerService {
    * (3s) porque este endpoint es de un panel admin, no puede colgarse
    * esperando al worker. No dispara ningún llamado a Earth Engine (el
    * worker's /health no lo hace tampoco, ver agro-score-worker/app/main.py).
+   *
+   * SEC-003: a propósito NO manda X-Worker-Token — /health queda intencionalmente sin
+   * autenticación del lado del worker (liveness check sin side effects, ver
+   * app/worker_auth.py), así que no hay razón para enviar el secreto acá (principio de mínimo
+   * envío de credenciales). Solo /analyze y /weekly-report/spike lo requieren.
    */
   async checkHealth(): Promise<{ status: 'ok' | 'unreachable'; error?: string }> {
     try {
@@ -156,6 +175,8 @@ export class PythonWorkerService {
           payload,
           {
             timeout: 600_000,
+            // SEC-003: requerido por verify_worker_token en el worker — ver el constructor.
+            headers: this.workerAuthHeaders,
           },
         ),
       );
@@ -597,7 +618,11 @@ export class PythonWorkerService {
         this.httpService.post<WeeklyReportWorkerResult>(
           `${this.workerUrl}/weekly-report/spike`,
           payload,
-          { timeout: 600_000 },
+          {
+            timeout: 600_000,
+            // SEC-003: requerido por verify_worker_token en el worker — ver el constructor.
+            headers: this.workerAuthHeaders,
+          },
         ),
       );
 
