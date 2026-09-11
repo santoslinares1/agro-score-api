@@ -23,7 +23,9 @@ import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
 import { FieldAnalysisSchedule } from '../scheduled-analysis/entities/field-analysis-schedule.entity';
+import { FieldAnalysisScheduleStatusTransition } from '../scheduled-analysis/entities/field-analysis-schedule-status-transition.entity';
 import { ScheduledAnalysisRun } from '../scheduled-analysis/entities/scheduled-analysis-run.entity';
+import { WeeklyAnalysisSnapshot } from '../scheduled-analysis/entities/weekly-analysis-snapshot.entity';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
@@ -109,6 +111,8 @@ describe('AdminService', () => {
   let analysisVerdictRepo: ReturnType<typeof noopRepo>;
   let fieldAnalysisScheduleRepo: ReturnType<typeof noopRepo>;
   let scheduledAnalysisRunRepo: ReturnType<typeof noopRepo>;
+  let weeklyAnalysisSnapshotRepo: ReturnType<typeof noopRepo>;
+  let fieldAnalysisScheduleTransitionRepo: ReturnType<typeof noopRepo>;
   let weeklyTechnicalVerdictService: jest.Mocked<
     Pick<WeeklyTechnicalVerdictService, 'findResponsesByScheduledRunIds'>
   >;
@@ -126,6 +130,8 @@ describe('AdminService', () => {
     analysisVerdictRepo = noopRepo();
     fieldAnalysisScheduleRepo = noopRepo();
     scheduledAnalysisRunRepo = noopRepo();
+    weeklyAnalysisSnapshotRepo = noopRepo();
+    fieldAnalysisScheduleTransitionRepo = noopRepo();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -147,6 +153,7 @@ describe('AdminService', () => {
             count: jest.fn(),
             countActive: jest.fn(),
             countCreatedSince: jest.fn(),
+            listEligibleProducers: jest.fn().mockResolvedValue([]),
           },
         },
         {
@@ -197,6 +204,14 @@ describe('AdminService', () => {
         {
           provide: getRepositoryToken(ScheduledAnalysisRun),
           useValue: scheduledAnalysisRunRepo,
+        },
+        {
+          provide: getRepositoryToken(WeeklyAnalysisSnapshot),
+          useValue: weeklyAnalysisSnapshotRepo,
+        },
+        {
+          provide: getRepositoryToken(FieldAnalysisScheduleStatusTransition),
+          useValue: fieldAnalysisScheduleTransitionRepo,
         },
         {
           provide: getRepositoryToken(AccessRequest),
@@ -3578,310 +3593,894 @@ describe('AdminService', () => {
     });
   });
 
-  describe('getProductAnalytics (Admin PR 4)', () => {
-    function buildRawOneQueryBuilder(...values: (number | null)[]) {
-      const qb: Record<string, jest.Mock> = {
-        select: jest.fn(),
-        where: jest.fn(),
-        andWhere: jest.fn(),
-        getRawOne: jest.fn(),
-        getCount: jest.fn().mockResolvedValue(0),
+  describe('getProductAnalytics (KPIs P0 — auditoría de KPIs + Decision 1/2)', () => {
+    const WEEK = { weekStart: '2026-08-31', weekEnd: '2026-09-06' }; // lunes-domingo
+    // Retención usa su PROPIO par: N = week - 1, N+1 = week (ver getProductAnalytics) — nunca
+    // week/week+1 como el resto de las métricas semanales.
+    const RETENTION_WEEK = { weekStart: '2026-08-24', weekEnd: '2026-08-30' };
+
+    function buildSufficientResultJson(): Record<string, unknown> {
+      return {
+        timeseries: [
+          {
+            rows: [
+              { values: { NDVI_mean: 0.55, NDMI_mean: 0.2, NDVI_count: 12 } },
+            ],
+          },
+        ],
       };
-      for (const key of ['select', 'where', 'andWhere']) {
-        qb[key].mockReturnValue(qb);
-      }
-      for (const value of values) {
-        qb.getRawOne.mockResolvedValueOnce(
-          value === null ? null : { count: String(value) },
-        );
-      }
-      return qb;
     }
 
-    type Fixture = Partial<{
-      totalUsers: number;
-      usersWithField: number;
-      totalFields: number;
-      fieldsWithLot: number;
-      fieldsWithFinalizedAnalysis: number;
-      fieldsWithVerdict: number;
-      activeSchedules: number;
-      activeSchedulesWithoutRuns: number;
-      fieldsWithRun: number;
-      fieldsWithMailSent: number;
-      sentEmails: number;
-      fieldsWithNoAnalysis: number;
-      failedAnalysisLast30Days: number;
-      latestRunRows: {
-        status: string;
-        failedAt: Date | null;
-        emailSentAt: Date | null;
-      }[];
-      topErrors: { message: string; count: number }[];
-    }>;
-
-    // Arma los ~15 mocks que getProductAnalytics() dispara en paralelo. El orden de cada
-    // mockResolvedValueOnce importa: Promise.all evalúa los elementos del array de forma
-    // sincrónica en el orden en que aparecen (aunque cada uno sea una llamada async), así que el
-    // orden de las llamadas a un mismo mock coincide con el orden del array en el service.
-    function setup(fixture: Fixture = {}) {
-      const f = {
-        totalUsers: 0,
-        usersWithField: 0,
-        totalFields: 0,
-        fieldsWithLot: 0,
-        fieldsWithFinalizedAnalysis: 0,
-        fieldsWithVerdict: 0,
-        activeSchedules: 0,
-        activeSchedulesWithoutRuns: 0,
-        fieldsWithRun: 0,
-        fieldsWithMailSent: 0,
-        sentEmails: 0,
-        fieldsWithNoAnalysis: 0,
-        failedAnalysisLast30Days: 0,
-        latestRunRows: [] as {
-          status: string;
-          failedAt: Date | null;
-          emailSentAt: Date | null;
-        }[],
-        topErrors: [] as { message: string; count: number }[],
-        ...fixture,
+    function buildPartialResultJson(): Record<string, unknown> {
+      return {
+        totalsByZone: [{ name: 'Zona 1', hectares: 5, percent: 100 }],
+        zones: [{ area_ha: 5 }],
       };
-
-      usersService.count.mockResolvedValue(f.totalUsers);
-
-      fieldRepo.createQueryBuilder.mockReturnValue(
-        buildRawOneQueryBuilder(f.usersWithField),
-      );
-      fieldRepo.count.mockResolvedValue(f.totalFields);
-      fieldLotRepo.createQueryBuilder.mockReturnValue(
-        buildRawOneQueryBuilder(f.fieldsWithLot),
-      );
-
-      // fieldRepo.manager.query: finalized-analysis, verdict, countFieldsWithNoAnalysis
-      // (interno), topErrors — en ese orden.
-      fieldRepo.manager.query
-        .mockResolvedValueOnce([{ count: f.fieldsWithFinalizedAnalysis }])
-        .mockResolvedValueOnce([{ count: f.fieldsWithVerdict }])
-        .mockResolvedValueOnce([{ count: f.fieldsWithNoAnalysis }])
-        .mockResolvedValueOnce(
-          f.topErrors.map((e) => ({ message: e.message, count: e.count })),
-        );
-
-      // activeSchedules (propio) + total/active/inactive (dentro de getScheduledAnalysisSummary,
-      // reusado tal cual — valores irrelevantes para este describe, solo deben resolver).
-      fieldAnalysisScheduleRepo.count
-        .mockResolvedValueOnce(f.activeSchedules)
-        .mockResolvedValueOnce(0)
-        .mockResolvedValueOnce(0)
-        .mockResolvedValueOnce(0);
-
-      // activeSchedulesWithoutRuns (propio) + withoutRuns (dentro del summary, no se usa acá).
-      const scheduleQb: Record<string, jest.Mock> = {
-        where: jest.fn(),
-        andWhere: jest.fn(),
-        getCount: jest
-          .fn()
-          .mockResolvedValueOnce(f.activeSchedulesWithoutRuns)
-          .mockResolvedValueOnce(f.activeSchedulesWithoutRuns),
-      };
-      scheduleQb['where'].mockReturnValue(scheduleQb);
-      scheduleQb['andWhere'].mockReturnValue(scheduleQb);
-      fieldAnalysisScheduleRepo.createQueryBuilder.mockReturnValue(scheduleQb);
-      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue(
-        f.latestRunRows,
-      );
-
-      scheduledAnalysisRunRepo.createQueryBuilder.mockReturnValue(
-        buildRawOneQueryBuilder(f.fieldsWithRun, f.fieldsWithMailSent),
-      );
-      scheduledAnalysisRunRepo.count
-        .mockResolvedValueOnce(f.sentEmails) // propio
-        .mockResolvedValueOnce(0) // mailSentLast7Days (summary)
-        .mockResolvedValueOnce(0); // mailSentLast30Days (summary)
-
-      analysisRepo.createQueryBuilder.mockReturnValue(
-        (() => {
-          const qb: Record<string, jest.Mock> = {
-            where: jest.fn(),
-            andWhere: jest.fn(),
-            getCount: jest.fn().mockResolvedValue(f.failedAnalysisLast30Days),
-          };
-          qb['where'].mockReturnValue(qb);
-          qb['andWhere'].mockReturnValue(qb);
-          return qb;
-        })(),
-      );
-
-      return f;
     }
 
-    it('devuelve generatedAt', async () => {
-      setup();
-      const result = await service.getProductAnalytics();
+    // Configura los tres repos con `manager.query` compartido entre varias llamadas concurrentes
+    // (computeNorthStar/computeRetention/computeQualityBreakdown/getScheduleHistoryCoverage/
+    // getNonCanonicalSchedulesCount corren todas dentro de un mismo Promise.all) — discrimina por
+    // el TEXTO del SQL en vez de depender del orden de invocación, así el test no se rompe si se
+    // reordena el Promise.all del service.
+    function mockSnapshotAndScheduleQueries(
+      fixture: {
+        // Denominador de retención (sufficientInWeekCount) — ÚNICO consumidor hoy de este count
+        // "plano" en weeklyAnalysisSnapshotRepo; North Star ya no lo comparte (ver
+        // computeNorthStar: ahora resuelve numerador Y denominador en una sola query combinada
+        // contra fieldAnalysisScheduleTransitionRepo).
+        retentionSufficientCount?: number;
+        retainedCount?: number;
+        breakdownRows?: { status: string; count: number }[];
+        scheduleHistoryMinEffectiveAt?: Date | null;
+        northStarEligibleFieldsCount?: number;
+        northStarUsableFieldsCount?: number;
+        nonCanonicalSchedulesCount?: number;
+      } = {},
+    ) {
+      weeklyAnalysisSnapshotRepo.manager.query.mockImplementation(
+        (sql: string) => {
+          if (sql.includes('INTERSECT')) {
+            return Promise.resolve([{ count: fixture.retainedCount ?? 0 }]);
+          }
+          if (sql.includes('GROUP BY')) {
+            return Promise.resolve(
+              (fixture.breakdownRows ?? []).map((row) => ({
+                status: row.status,
+                count: row.count,
+              })),
+            );
+          }
+          // Única query restante en este repo: denominador de retención.
+          return Promise.resolve([
+            { count: fixture.retentionSufficientCount ?? 0 },
+          ]);
+        },
+      );
+
+      fieldAnalysisScheduleTransitionRepo.manager.query.mockImplementation(
+        (sql: string) => {
+          if (sql.includes('MIN(')) {
+            return Promise.resolve([
+              { min: fixture.scheduleHistoryMinEffectiveAt ?? null },
+            ]);
+          }
+          // Query combinada de North Star: numerador y denominador en una sola fila.
+          return Promise.resolve([
+            {
+              eligibleFieldsCount: fixture.northStarEligibleFieldsCount ?? 0,
+              usableFieldsCount: fixture.northStarUsableFieldsCount ?? 0,
+            },
+          ]);
+        },
+      );
+
+      fieldAnalysisScheduleRepo.manager.query.mockResolvedValue([
+        { count: fixture.nonCanonicalSchedulesCount ?? 0 },
+      ]);
+    }
+
+    // Simula el scan paginado de Analysis: `batches` es una lista de páginas, cada una un array de
+    // filas {resultJson, completedAt, userId} — mockImplementation consume una página por llamada,
+    // devolviendo [] (fin del scan) una vez agotadas.
+    function mockActivationScan(
+      batches: Array<
+        Array<{ resultJson: unknown; completedAt: Date; userId: string }>
+      >,
+    ) {
+      let call = 0;
+      analysisRepo.manager.query.mockImplementation(() => {
+        const page = batches[call] ?? [];
+        call += 1;
+        return Promise.resolve(page);
+      });
+    }
+
+    beforeEach(() => {
+      mockSnapshotAndScheduleQueries();
+      mockActivationScan([]);
+      usersService.listEligibleProducers.mockResolvedValue([]);
+    });
+
+    it('devuelve generatedAt, period.week y coverage', async () => {
+      const result = await service.getProductAnalytics({ week: '2026-09-02' });
+
       expect(typeof result.generatedAt).toBe('string');
       expect(new Date(result.generatedAt).toString()).not.toBe('Invalid Date');
-    });
-
-    it('devuelve el funnel con las 9 etapas, en orden', async () => {
-      setup();
-      const result = await service.getProductAnalytics();
-      expect(result.funnel.map((stage) => stage.id)).toEqual([
-        'total-users',
-        'users-with-field',
-        'total-fields',
-        'fields-with-lot',
-        'fields-with-finalized-analysis',
-        'fields-with-verdict',
-        'fields-with-active-schedule',
-        'fields-with-run',
-        'fields-with-mail-sent',
-      ]);
-    });
-
-    it('calcula usuarios con campo (COUNT DISTINCT userId)', async () => {
-      setup({ totalUsers: 10, usersWithField: 4 });
-      const result = await service.getProductAnalytics();
-      const stage = result.funnel.find((s) => s.id === 'users-with-field');
-      expect(stage?.count).toBe(4);
-      expect(stage?.previousCount).toBe(10);
-    });
-
-    it('calcula campos con lote (COUNT DISTINCT fieldId)', async () => {
-      setup({ totalFields: 78, fieldsWithLot: 78 });
-      const result = await service.getProductAnalytics();
-      const stage = result.funnel.find((s) => s.id === 'fields-with-lot');
-      expect(stage?.count).toBe(78);
-    });
-
-    it('calcula campos con análisis finalizado', async () => {
-      setup({ totalFields: 78, fieldsWithFinalizedAnalysis: 19 });
-      const result = await service.getProductAnalytics();
-      const stage = result.funnel.find(
-        (s) => s.id === 'fields-with-finalized-analysis',
-      );
-      expect(stage?.count).toBe(19);
-    });
-
-    it('calcula campos con veredicto técnico generado', async () => {
-      setup({ fieldsWithVerdict: 12 });
-      const result = await service.getProductAnalytics();
-      const stage = result.funnel.find((s) => s.id === 'fields-with-verdict');
-      expect(stage?.count).toBe(12);
-    });
-
-    it('calcula campos con schedule activo', async () => {
-      setup({ activeSchedules: 2 });
-      const result = await service.getProductAnalytics();
-      const stage = result.funnel.find(
-        (s) => s.id === 'fields-with-active-schedule',
-      );
-      expect(stage?.count).toBe(2);
-      expect(stage?.route).toBe('/scheduled-analysis');
-      expect(stage?.queryParams).toEqual({ enabled: true });
-    });
-
-    it('calcula campos con al menos una corrida', async () => {
-      setup({ fieldsWithRun: 3 });
-      const result = await service.getProductAnalytics();
-      const stage = result.funnel.find((s) => s.id === 'fields-with-run');
-      expect(stage?.count).toBe(3);
-      expect(stage?.queryParams).toEqual({ enabled: true, hasRuns: true });
-    });
-
-    it('calcula campos con mail enviado', async () => {
-      setup({ fieldsWithMailSent: 1 });
-      const result = await service.getProductAnalytics();
-      const stage = result.funnel.find((s) => s.id === 'fields-with-mail-sent');
-      expect(stage?.count).toBe(1);
-      // Sin filtro exacto en Programados todavía (deuda documentada en PR3) — no hay route.
-      expect(stage?.route).toBeUndefined();
-    });
-
-    it('conversionFromPrevious/dropoffFromPrevious no explotan cuando previousCount=0', async () => {
-      setup({ totalUsers: 0, usersWithField: 0, totalFields: 5 });
-      const result = await service.getProductAnalytics();
-
-      const usersWithFieldStage = result.funnel.find(
-        (s) => s.id === 'users-with-field',
-      );
-      expect(usersWithFieldStage?.conversionFromPrevious).toBeUndefined();
-      expect(usersWithFieldStage?.dropoffFromPrevious).toBe(0);
-
-      // totalFields (5) creció respecto de usersWithField (0) — dropoff negativo, no lanza NaN.
-      const totalFieldsStage = result.funnel.find(
-        (s) => s.id === 'total-fields',
-      );
-      expect(totalFieldsStage?.dropoffFromPrevious).toBe(-5);
-      expect(Number.isNaN(totalFieldsStage?.dropoffFromPrevious)).toBe(false);
-    });
-
-    it('devuelve el top de errores de los últimos 30 días agrupados', async () => {
-      setup({
-        topErrors: [
-          { message: 'Timeout worker', count: 12 },
-          { message: 'Nubosidad excesiva', count: 5 },
-        ],
+      expect(result.period).toEqual({
+        week: WEEK,
+        timezone: 'America/Argentina/Cordoba',
       });
-      const result = await service.getProductAnalytics();
-      expect(result.topAnalysisErrorsLast30Days).toEqual([
-        { message: 'Timeout worker', count: 12 },
-        { message: 'Nubosidad excesiva', count: 5 },
-      ]);
+      expect(result.coverage.scheduleHistory).toBeDefined();
+      expect(result.coverage.analysisClassificationScan).toBeDefined();
     });
 
-    it('no crea insight de schedules sin corridas cuando activeSchedulesWithoutRuns es 0', async () => {
-      setup({ activeSchedulesWithoutRuns: 0 });
-      const result = await service.getProductAnalytics();
-      expect(
-        result.insights.find((i) => i.id === 'active-schedules-without-runs'),
-      ).toBeUndefined();
-    });
+    describe('North Star (KPI #1 — campos con monitoreo utilizable semanal)', () => {
+      it('POSITIVO: un snapshot sufficient entra en el numerador', async () => {
+        mockSnapshotAndScheduleQueries({
+          northStarUsableFieldsCount: 3,
+          northStarEligibleFieldsCount: 5,
+        });
 
-    it('crea insight de schedules sin corridas cuando activeSchedulesWithoutRuns > 0, con link real', async () => {
-      setup({ activeSchedules: 2, activeSchedulesWithoutRuns: 2 });
-      const result = await service.getProductAnalytics();
-      const insight = result.insights.find(
-        (i) => i.id === 'active-schedules-without-runs',
-      );
-      expect(insight).toEqual(
-        expect.objectContaining({
-          severity: 'critical',
-          route: '/scheduled-analysis',
-          queryParams: { enabled: true, hasRuns: false },
-        }),
-      );
-    });
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
 
-    it('crea insight de mail pendiente/fallido a partir del resumen de Programados (PR3)', async () => {
-      setup({
-        latestRunRows: [
-          { status: 'completed', failedAt: null, emailSentAt: null },
-        ],
+        expect(result.northStar).toEqual({
+          week: WEEK,
+          usableFieldsCount: 3,
+          eligibleFieldsCount: 5,
+          rate: 3 / 5,
+        });
       });
-      const result = await service.getProductAnalytics();
-      const insight = result.insights.find(
-        (i) => i.id === 'mail-pending-or-failed',
-      );
-      expect(insight?.title).toContain('1');
+
+      it('NEGATIVO: denominador 0 → rate null, nunca 0 ni una división por cero visible', async () => {
+        mockSnapshotAndScheduleQueries({
+          northStarUsableFieldsCount: 0,
+          northStarEligibleFieldsCount: 0,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.northStar.rate).toBeNull();
+      });
+
+      // North Star (query combinada eligibleFieldsCount+usableFieldsCount) corre sobre
+      // fieldAnalysisScheduleTransitionRepo.manager.query, en la MISMA llamada que
+      // getScheduleHistoryCoverage (que filtra por 'MIN(') — se distingue por exclusión.
+      function findNorthStarQueryCall(): [string, unknown[]] {
+        const call =
+          fieldAnalysisScheduleTransitionRepo.manager.query.mock.calls.find(
+            ([sql]: [string]) => !sql.includes('MIN('),
+          );
+        if (!call) {
+          throw new Error(
+            'No se encontró la query combinada de North Star en los mocks.',
+          );
+        }
+        return call as [string, unknown[]];
+      }
+
+      describe('cutoff canónico (decisión de producto: lunes 09:00 America/Argentina/Cordoba)', () => {
+        it('el cutoff es lunes 09:00 de la semana consultada — NUNCA el cierre del domingo', async () => {
+          mockSnapshotAndScheduleQueries();
+
+          await service.getProductAnalytics({ week: '2026-09-02' }); // semana 2026-08-31..09-06
+
+          const [, params] = findNorthStarQueryCall();
+          const cutoffParam = params[5] as Date; // $6 en la query — ver computeNorthStar.
+          // Lunes 2026-08-31, 09:00 America/Argentina/Cordoba (UTC-3) = 12:00 UTC. Si esto fallara
+          // con 2026-09-07T02:59:59.999Z, el cutoff volvió a ser el cierre del domingo (el bug).
+          expect(cutoffParam.toISOString()).toBe('2026-08-31T12:00:00.000Z');
+        });
+
+        it('activación exactamente en el cutoff: el filtro usa <= (inclusive), nunca < estricto', async () => {
+          mockSnapshotAndScheduleQueries();
+
+          await service.getProductAnalytics({ week: '2026-09-02' });
+
+          const [sql] = findNorthStarQueryCall();
+          expect(sql).toContain('t."effectiveAt" <= $6');
+        });
+
+        it('recalcula el cutoff correctamente para una semana explícita distinta', async () => {
+          mockSnapshotAndScheduleQueries();
+
+          await service.getProductAnalytics({ week: '2026-09-10' }); // semana 2026-09-07..09-13
+
+          const [, params] = findNorthStarQueryCall();
+          const cutoffParam = params[5] as Date;
+          // Lunes 2026-09-07, 09:00 ART = 12:00 UTC.
+          expect(cutoffParam.toISOString()).toBe('2026-09-07T12:00:00.000Z');
+        });
+      });
+
+      it('filtra por la configuración CANÓNICA exacta (frequency/dayOfWeek/hour/minute/timezone) — cualquier otra queda fuera', async () => {
+        mockSnapshotAndScheduleQueries();
+
+        await service.getProductAnalytics({ week: '2026-09-02' });
+
+        const [sql, params] = findNorthStarQueryCall();
+        expect(sql).toContain('frequency = $1');
+        expect(sql).toContain('"dayOfWeek" = $2');
+        expect(sql).toContain('hour = $3');
+        expect(sql).toContain('minute = $4');
+        expect(sql).toContain('timezone = $5');
+        expect(params.slice(0, 5)).toEqual([
+          'weekly',
+          1, // lunes
+          9,
+          0,
+          'America/Argentina/Cordoba',
+        ]);
+      });
+
+      it('el numerador queda estructuralmente subordinado al denominador — INNER JOIN contra el mismo universo elegible, nunca una query independiente', async () => {
+        mockSnapshotAndScheduleQueries();
+
+        await service.getProductAnalytics({ week: '2026-09-02' });
+
+        const [sql] = findNorthStarQueryCall();
+        expect(sql).toContain('INNER JOIN eligible_fields');
+        // La misma CTE de elegibles alimenta ambos SELECT del resultado — nunca dos fuentes que
+        // puedan divergir.
+        expect(sql.match(/eligible_fields/g)?.length).toBeGreaterThanOrEqual(2);
+      });
+
+      it('la cuenta de schedules no canónicos NUNCA entra al denominador ni al numerador de North Star — se expone aparte en coverage', async () => {
+        mockSnapshotAndScheduleQueries({
+          northStarUsableFieldsCount: 3,
+          northStarEligibleFieldsCount: 5,
+          nonCanonicalSchedulesCount: 2,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.northStar).toEqual({
+          week: WEEK,
+          usableFieldsCount: 3,
+          eligibleFieldsCount: 5,
+          rate: 3 / 5,
+        });
+        expect(result.coverage.nonCanonicalSchedules).toEqual({ count: 2 });
+      });
+
+      it('la consulta de schedules no canónicos es sobre la configuración VIGENTE (field_analysis_schedules), no reconstruida por semana', async () => {
+        mockSnapshotAndScheduleQueries({ nonCanonicalSchedulesCount: 4 });
+
+        await service.getProductAnalytics({ week: '2026-09-02' });
+
+        expect(fieldAnalysisScheduleRepo.manager.query).toHaveBeenCalledWith(
+          expect.stringContaining('field_analysis_schedules'),
+          expect.arrayContaining([
+            'weekly',
+            1,
+            9,
+            0,
+            'America/Argentina/Cordoba',
+          ]),
+        );
+      });
+
+      it('sin schedules no canónicos: coverage.nonCanonicalSchedules.count es 0, no se omite el campo', async () => {
+        mockSnapshotAndScheduleQueries();
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.nonCanonicalSchedules).toEqual({ count: 0 });
+      });
     });
 
-    it('weeklyMonitoring resta activeSchedulesWithoutRuns de activeSchedules para schedulesWithRuns', async () => {
-      setup({ activeSchedules: 10, activeSchedulesWithoutRuns: 3 });
-      const result = await service.getProductAnalytics();
-      expect(result.weeklyMonitoring).toEqual(
-        expect.objectContaining({
-          activeSchedules: 10,
-          activeSchedulesWithoutRuns: 3,
-          schedulesWithRuns: 7,
-        }),
-      );
+    describe('Retención (KPI #4)', () => {
+      it('POSITIVO: field sufficient en N y N+1 cuenta como retenido — N/N+1 son week-1/week, nunca week/week+1', async () => {
+        mockSnapshotAndScheduleQueries({
+          retentionSufficientCount: 4,
+          retainedCount: 2,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.retention).toEqual({
+          week: RETENTION_WEEK,
+          nextWeek: WEEK,
+          periodComplete: true,
+          sufficientInWeekCount: 4,
+          retainedInNextWeekCount: 2,
+          rate: 2 / 4,
+        });
+      });
+
+      it('NEGATIVO: partial (o insufficient) en N+1 nunca cuenta como retenido — el INTERSECT ya filtra por dataQualityStatus=sufficient en ambos lados', async () => {
+        // El propio SQL (ver computeRetention) exige 'sufficient' en AMBAS mitades del INTERSECT —
+        // este test fija retainedCount en 0 para representar exactamente ese caso (el field tenía
+        // snapshot en N+1, pero no sufficient, así que el INTERSECT real no lo habría devuelto).
+        mockSnapshotAndScheduleQueries({
+          retentionSufficientCount: 1,
+          retainedCount: 0,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.retention.retainedInNextWeekCount).toBe(0);
+        expect(result.retention.rate).toBe(0);
+      });
+
+      it('denominador 0 (con período completo) → rate null', async () => {
+        mockSnapshotAndScheduleQueries({
+          retentionSufficientCount: 0,
+          retainedCount: 0,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.retention.periodComplete).toBe(true);
+        expect(result.retention.rate).toBeNull();
+      });
+
+      it('DEFAULT (sin `week`): N = penúltima semana completa, N+1 = última semana completa — N+1 nunca es la semana en curso', async () => {
+        const fixedNow = new Date('2026-09-08T15:00:00Z'); // martes, mitad de semana
+        jest.useFakeTimers().setSystemTime(fixedNow);
+
+        try {
+          mockSnapshotAndScheduleQueries({
+            retentionSufficientCount: 4,
+            retainedCount: 2,
+          });
+
+          const result = await service.getProductAnalytics({});
+
+          // period.week (última semana completa) = 2026-08-31..09-06 (ver test de "Semanas y
+          // timezone" más abajo). Retención: N = semana anterior a esa, N+1 = esa misma.
+          expect(result.retention.week).toEqual(RETENTION_WEEK);
+          expect(result.retention.nextWeek).toEqual(WEEK);
+          expect(result.retention.periodComplete).toBe(true);
+          expect(result.retention.rate).not.toBeNull();
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
+      it('QUERY HISTÓRICA con N+1 completa: calcula un rate definitivo', async () => {
+        // 2026-09-02 (WEEK) ya terminó hace mucho respecto de la fecha real de ejecución del test.
+        mockSnapshotAndScheduleQueries({
+          retentionSufficientCount: 4,
+          retainedCount: 2,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.retention.periodComplete).toBe(true);
+        expect(result.retention.rate).toBe(0.5);
+      });
+
+      it('QUERY cuya N+1 está EN CURSO: no devuelve un rate definitivo, ni siquiera con snapshots parciales reales', async () => {
+        const fixedNow = new Date('2026-09-10T12:00:00Z'); // jueves, dentro de la semana pedida
+        jest.useFakeTimers().setSystemTime(fixedNow);
+
+        try {
+          // Semana pedida = 2026-09-07..09-13, la MISMA semana en la que "ahora" cae — todavía no
+          // terminó. Snapshots parciales reales (no cero) para demostrar que el conteo no se
+          // fabrica en cero, pero el rate igual se anula.
+          mockSnapshotAndScheduleQueries({
+            retentionSufficientCount: 3,
+            retainedCount: 1,
+          });
+
+          const result = await service.getProductAnalytics({
+            week: '2026-09-10',
+          });
+
+          expect(result.retention.nextWeek).toEqual({
+            weekStart: '2026-09-07',
+            weekEnd: '2026-09-13',
+          });
+          expect(result.retention.periodComplete).toBe(false);
+          expect(result.retention.rate).toBeNull();
+          // Los conteos NO se anulan ni se ponen en 0 artificialmente — son el dato real hasta ahora.
+          expect(result.retention.sufficientInWeekCount).toBe(3);
+          expect(result.retention.retainedInNextWeekCount).toBe(1);
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
+      it('QUERY de una semana FUTURA: tampoco produce una retención válida', async () => {
+        const fixedNow = new Date('2026-09-08T12:00:00Z'); // martes
+        jest.useFakeTimers().setSystemTime(fixedNow);
+
+        try {
+          mockSnapshotAndScheduleQueries({
+            retentionSufficientCount: 0,
+            retainedCount: 0,
+          });
+
+          // 2026-10-01 cae semanas después de "ahora" — completamente futura.
+          const result = await service.getProductAnalytics({
+            week: '2026-10-01',
+          });
+
+          expect(result.retention.periodComplete).toBe(false);
+          expect(result.retention.rate).toBeNull();
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
+      it('BOUNDARY exacto: un milisegundo antes del cierre de N+1 todavía no está completa; en el instante exacto de cierre, sí', async () => {
+        // N+1 = 2026-09-07..09-13 (domingo). Cierre real (America/Argentina/Cordoba, UTC-3):
+        // 2026-09-14T02:59:59.999Z.
+        mockSnapshotAndScheduleQueries({
+          retentionSufficientCount: 1,
+          retainedCount: 1,
+        });
+
+        jest
+          .useFakeTimers()
+          .setSystemTime(new Date('2026-09-14T02:59:59.998Z'));
+        try {
+          const before = await service.getProductAnalytics({
+            week: '2026-09-10',
+          });
+          expect(before.retention.periodComplete).toBe(false);
+          expect(before.retention.rate).toBeNull();
+        } finally {
+          jest.useRealTimers();
+        }
+
+        jest
+          .useFakeTimers()
+          .setSystemTime(new Date('2026-09-14T02:59:59.999Z'));
+        try {
+          const atClose = await service.getProductAnalytics({
+            week: '2026-09-10',
+          });
+          expect(atClose.retention.periodComplete).toBe(true);
+          expect(atClose.retention.rate).not.toBeNull();
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
+      it('el INTERSECT sigue comparando identidad de fieldId (no se toca la lógica de comparación)', async () => {
+        mockSnapshotAndScheduleQueries({
+          retentionSufficientCount: 5,
+          retainedCount: 3,
+        });
+
+        await service.getProductAnalytics({ week: '2026-09-02' });
+
+        const intersectCall =
+          weeklyAnalysisSnapshotRepo.manager.query.mock.calls.find(
+            ([sql]: [string]) => sql.includes('INTERSECT'),
+          );
+        expect(intersectCall).toBeDefined();
+        const [sql] = intersectCall as [string];
+        expect(sql).toContain('INTERSECT');
+        expect(sql).toContain('"fieldId"');
+      });
     });
 
-    it('no genera ninguna migración (solo lectura, sin cambios de esquema)', () => {
-      // Cubierto a nivel repo por `npm run migration:show` en la validación del PR, no acá — este
-      // test documenta la intención: getProductAnalytics() nunca llama a save/insert/update.
-      expect(typeof service.getProductAnalytics).toBe('function');
+    describe('Breakdown de calidad (KPI #5)', () => {
+      it('POSITIVO: conserva las tres categorías aunque falten en el resultado de la query', async () => {
+        mockSnapshotAndScheduleQueries({
+          breakdownRows: [{ status: 'sufficient', count: 5 }],
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.qualityBreakdown.breakdown).toEqual([
+          { status: 'sufficient', count: 5, proportion: 1 },
+          { status: 'partial', count: 0, proportion: 0 },
+          { status: 'insufficient', count: 0, proportion: 0 },
+        ]);
+        expect(result.qualityBreakdown.totalSnapshots).toBe(5);
+      });
+
+      it('nunca llama "error" a partial/insufficient — el shape solo usa `status`, sin severidad', async () => {
+        mockSnapshotAndScheduleQueries({
+          breakdownRows: [
+            { status: 'sufficient', count: 1 },
+            { status: 'partial', count: 2 },
+            { status: 'insufficient', count: 3 },
+          ],
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(Object.keys(result.qualityBreakdown.breakdown[0])).toEqual([
+          'status',
+          'count',
+          'proportion',
+        ]);
+      });
+
+      it('cero snapshots en la semana: counts en 0 y proportion null (no 0/0)', async () => {
+        mockSnapshotAndScheduleQueries({ breakdownRows: [] });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.qualityBreakdown.totalSnapshots).toBe(0);
+        result.qualityBreakdown.breakdown.forEach((entry) => {
+          expect(entry.count).toBe(0);
+          expect(entry.proportion).toBeNull();
+        });
+      });
+    });
+
+    describe('Cobertura del historial de schedules (ticket anterior)', () => {
+      it('sin ninguna transición todavía: availableFrom null y complete false', async () => {
+        mockSnapshotAndScheduleQueries({ scheduleHistoryMinEffectiveAt: null });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.scheduleHistory).toEqual({
+          availableFrom: null,
+          complete: false,
+        });
+      });
+
+      it('semana consultada anterior a la baseline: complete false', async () => {
+        // La baseline es POSTERIOR al lunes de la semana consultada (2026-08-31).
+        mockSnapshotAndScheduleQueries({
+          scheduleHistoryMinEffectiveAt: new Date('2026-09-05T00:00:00Z'),
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.scheduleHistory.complete).toBe(false);
+      });
+
+      it('semana consultada posterior a la baseline: complete true', async () => {
+        mockSnapshotAndScheduleQueries({
+          scheduleHistoryMinEffectiveAt: new Date('2026-01-01T00:00:00Z'),
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.scheduleHistory.complete).toBe(true);
+      });
+
+      it('la cobertura se evalúa contra el CUTOFF real (lunes 09:00), no contra el cierre de semana ni la medianoche del lunes — ajuste de este ticket', async () => {
+        // Lunes 2026-08-31: medianoche local = 03:00 UTC, cutoff canónico (09:00 local) = 12:00 UTC.
+        // Una baseline entre esos dos instantes es EXACTAMENTE el caso que este ticket corrige: con
+        // el criterio viejo (medianoche) habría dado complete=false; con el cutoff real (09:00),
+        // la baseline ya estaba establecida ANTES de que la elegibilidad se evaluara → complete=true.
+        mockSnapshotAndScheduleQueries({
+          scheduleHistoryMinEffectiveAt: new Date('2026-08-31T08:00:00Z'),
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.scheduleHistory.complete).toBe(true);
+      });
+
+      it('baseline establecida DESPUÉS del cutoff (pero el mismo día lunes): complete false', async () => {
+        // 2026-08-31T13:00:00Z es posterior al cutoff (12:00 UTC) del mismo lunes.
+        mockSnapshotAndScheduleQueries({
+          scheduleHistoryMinEffectiveAt: new Date('2026-08-31T13:00:00Z'),
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.scheduleHistory.complete).toBe(false);
+      });
+    });
+
+    describe('Activation (KPI #2) y Time to First Technical Value (KPI #3)', () => {
+      it('Cero usuarios elegibles: todo en 0, rates null, scan nunca se dispara', async () => {
+        usersService.listEligibleProducers.mockResolvedValue([]);
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.activation).toEqual({
+          eligibleUsersCount: 0,
+          activatedUsersCount: 0,
+          rate: null,
+        });
+        expect(result.timeToFirstTechnicalValue).toEqual({
+          cohortUsersCount: 0,
+          activatedUsersCount: 0,
+          notActivatedUsersCount: 0,
+          p50Hours: null,
+          p75Hours: null,
+          p95Hours: null,
+        });
+        expect(analysisRepo.manager.query).not.toHaveBeenCalled();
+      });
+
+      it('POSITIVO: un Analysis sufficient activa al usuario en su completedAt', async () => {
+        const createdAt = new Date('2026-08-01T00:00:00Z');
+        const completedAt = new Date('2026-08-03T12:00:00Z');
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt },
+        ]);
+        mockActivationScan([
+          [
+            {
+              resultJson: buildSufficientResultJson(),
+              completedAt,
+              userId: 'user-1',
+            },
+          ],
+        ]);
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.activation).toEqual({
+          eligibleUsersCount: 1,
+          activatedUsersCount: 1,
+          rate: 1,
+        });
+        expect(result.timeToFirstTechnicalValue.activatedUsersCount).toBe(1);
+        expect(result.timeToFirstTechnicalValue.notActivatedUsersCount).toBe(0);
+        expect(result.timeToFirstTechnicalValue.p50Hours).toBe(60); // 2.5 días = 60hs
+      });
+
+      it('POSITIVO: varios Analysis sufficient del mismo usuario conservan el PRIMER completedAt', async () => {
+        const createdAt = new Date('2026-08-01T00:00:00Z');
+        const first = new Date('2026-08-02T00:00:00Z');
+        const second = new Date('2026-08-10T00:00:00Z');
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt },
+        ]);
+        // ORDER BY completedAt ASC real — el mock ya devuelve las filas en ese orden, como haría Postgres.
+        mockActivationScan([
+          [
+            {
+              resultJson: buildSufficientResultJson(),
+              completedAt: first,
+              userId: 'user-1',
+            },
+            {
+              resultJson: buildSufficientResultJson(),
+              completedAt: second,
+              userId: 'user-1',
+            },
+          ],
+        ]);
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        // 1 día entre createdAt y el PRIMER completedAt (first), no el segundo (9 días).
+        expect(result.timeToFirstTechnicalValue.p50Hours).toBe(24);
+      });
+
+      it('NEGATIVO: partial no activa', async () => {
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt: new Date('2026-08-01T00:00:00Z') },
+        ]);
+        mockActivationScan([
+          [
+            {
+              resultJson: buildPartialResultJson(),
+              completedAt: new Date('2026-08-02T00:00:00Z'),
+              userId: 'user-1',
+            },
+          ],
+        ]);
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.activation.activatedUsersCount).toBe(0);
+      });
+
+      it('NEGATIVO: insufficient no activa', async () => {
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt: new Date('2026-08-01T00:00:00Z') },
+        ]);
+        mockActivationScan([
+          [
+            {
+              resultJson: {},
+              completedAt: new Date('2026-08-02T00:00:00Z'),
+              userId: 'user-1',
+            },
+          ],
+        ]);
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.activation.activatedUsersCount).toBe(0);
+      });
+
+      it('NEGATIVO: Analysis Finalizado con resultJson=null no activa (extractSnapshotMetrics/classifyDataQuality ya degradan a insufficient, nunca lanzan)', async () => {
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt: new Date('2026-08-01T00:00:00Z') },
+        ]);
+        mockActivationScan([
+          [
+            {
+              resultJson: null,
+              completedAt: new Date('2026-08-02T00:00:00Z'),
+              userId: 'user-1',
+            },
+          ],
+        ]);
+
+        await expect(
+          service.getProductAnalytics({ week: '2026-09-02' }),
+        ).resolves.toBeDefined();
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+        expect(result.activation.activatedUsersCount).toBe(0);
+      });
+
+      it('NEGATIVO: dos fields sufficient del mismo usuario no inflan activatedUsersCount', async () => {
+        const createdAt = new Date('2026-08-01T00:00:00Z');
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt },
+        ]);
+        mockActivationScan([
+          [
+            {
+              resultJson: buildSufficientResultJson(),
+              completedAt: new Date('2026-08-02T00:00:00Z'),
+              userId: 'user-1',
+            },
+            {
+              resultJson: buildSufficientResultJson(),
+              completedAt: new Date('2026-08-03T00:00:00Z'),
+              userId: 'user-1',
+            },
+          ],
+        ]);
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.activation.activatedUsersCount).toBe(1);
+      });
+
+      it('NEGATIVO: no hay ninguna métrica que mezcle unidades users/fields (activation y northStar son independientes)', async () => {
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt: new Date('2026-08-01T00:00:00Z') },
+          { id: 'user-2', createdAt: new Date('2026-08-01T00:00:00Z') },
+        ]);
+        mockActivationScan([]);
+        mockSnapshotAndScheduleQueries({
+          northStarUsableFieldsCount: 7,
+          northStarEligibleFieldsCount: 9,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        // activation cuenta USERS (2 elegibles, 0 activados) — northStar cuenta FIELDS (7/9) — sin
+        // ningún campo que combine ambos denominadores/numeradores entre sí.
+        expect(result.activation.eligibleUsersCount).toBe(2);
+        expect(result.northStar.eligibleFieldsCount).toBe(9);
+        expect(Object.keys(result)).not.toContain('funnel');
+        expect(Object.keys(result)).not.toContain('conversionFromPrevious');
+      });
+
+      it('coverage.analysisClassificationScan refleja cuántas filas se inspeccionaron, sin truncar cuando el scan se agota solo', async () => {
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt: new Date('2026-08-01T00:00:00Z') },
+        ]);
+        mockActivationScan([
+          [
+            {
+              resultJson: {},
+              completedAt: new Date('2026-08-02T00:00:00Z'),
+              userId: 'user-1',
+            },
+          ],
+        ]);
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.analysisClassificationScan).toEqual({
+          scanned: 1,
+          limit: 5000,
+          truncated: false,
+        });
+      });
+
+      it('CURSOR DE PAGINACIÓN: usa (completedAt, id) como clave compuesta — nunca solo completedAt, que podría saltear para siempre una fila empatada que cae del otro lado de un corte de lote (no "incompleto", directamente incorrecto)', async () => {
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt: new Date('2026-08-01T00:00:00Z') },
+        ]);
+        mockActivationScan([
+          [
+            {
+              resultJson: {},
+              completedAt: new Date('2026-08-02T00:00:00Z'),
+              userId: 'user-1',
+            },
+          ],
+        ]);
+
+        await service.getProductAnalytics({ week: '2026-09-02' });
+
+        const [sql] = analysisRepo.manager.query.mock.calls[0] as [string];
+        // ORDER BY con desempate por id — sin esto, dos Analysis con el mismo completedAt exacto
+        // pueden caer en lados opuestos de un LIMIT, y un cursor de una sola columna con ">"
+        // estricto nunca vuelve a pedir la fila que quedó del lado equivocado.
+        expect(sql).toContain('ORDER BY a."completedAt" ASC, a.id ASC');
+        // Filtro del cursor: además de completedAt > $1, compara por id cuando hay empate exacto.
+        expect(sql).toMatch(
+          /a\."completedAt"\s*=\s*\$1\s+AND\s+a\.id\s*>\s*\$4/,
+        );
+      });
+    });
+
+    describe('Semanas y timezone', () => {
+      it('sin `week`: usa la última semana calendario completa antes de ahora (nunca la semana en curso)', async () => {
+        const fixedNow = new Date('2026-09-08T15:00:00Z'); // martes
+        jest.useFakeTimers().setSystemTime(fixedNow);
+
+        try {
+          const result = await service.getProductAnalytics({});
+          expect(result.period.week).toEqual({
+            weekStart: '2026-08-31',
+            weekEnd: '2026-09-06',
+          });
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
+      it('con `week` explícito: resuelve la semana calendario que contiene esa fecha', async () => {
+        const result = await service.getProductAnalytics({
+          week: '2026-09-10',
+        }); // jueves
+        expect(result.period.week).toEqual({
+          weekStart: '2026-09-07',
+          weekEnd: '2026-09-13',
+        });
+      });
+
+      it('expone siempre el timezone explícito usado', async () => {
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+        expect(result.period.timezone).toBe('America/Argentina/Cordoba');
+      });
     });
   });
 

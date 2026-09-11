@@ -9,6 +9,7 @@ import { resolveDatabaseSsl } from './config/database-ssl.util';
 import { Field } from './fields/entities/field.entity';
 import { FieldLot } from './fields/entities/field-lot.entity';
 import { FieldAnalysisSchedule } from './scheduled-analysis/entities/field-analysis-schedule.entity';
+import { FieldAnalysisScheduleStatusTransition } from './scheduled-analysis/entities/field-analysis-schedule-status-transition.entity';
 import { ScheduledAnalysisRun } from './scheduled-analysis/entities/scheduled-analysis-run.entity';
 import { WeeklyAnalysisSnapshot } from './scheduled-analysis/entities/weekly-analysis-snapshot.entity';
 import { PasswordResetToken } from './users/entities/password-reset-token.entity';
@@ -52,6 +53,7 @@ export const AppDataSource = new DataSource({
     WeeklyFieldReport,
     WeeklyLotIndexObservation,
     FieldAnalysisSchedule,
+    FieldAnalysisScheduleStatusTransition,
     ScheduledAnalysisRun,
     WeeklyAnalysisSnapshot,
     WeeklyTechnicalVerdict,

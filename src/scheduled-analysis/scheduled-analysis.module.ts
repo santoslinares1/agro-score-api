@@ -9,6 +9,7 @@ import { FieldsModule } from '../fields/fields.module';
 import { UsersModule } from '../users/users.module';
 import { WeeklyTechnicalVerdictModule } from '../weekly-technical-verdict/weekly-technical-verdict.module';
 import { FieldAnalysisSchedule } from './entities/field-analysis-schedule.entity';
+import { FieldAnalysisScheduleStatusTransition } from './entities/field-analysis-schedule-status-transition.entity';
 import { ScheduledAnalysisRun } from './entities/scheduled-analysis-run.entity';
 import { WeeklyAnalysisSnapshot } from './entities/weekly-analysis-snapshot.entity';
 import { FieldAnalysisScheduleService } from './field-analysis-schedule.service';
@@ -32,6 +33,7 @@ import { WeeklyAnalysisSnapshotService } from './weekly-analysis-snapshot.servic
   imports: [
     TypeOrmModule.forFeature([
       FieldAnalysisSchedule,
+      FieldAnalysisScheduleStatusTransition,
       ScheduledAnalysisRun,
       WeeklyAnalysisSnapshot,
     ]),

@@ -31,12 +31,26 @@ import { generateToken, hashToken } from '../auth/token.util';
 import { EmailSendResult, EmailService } from '../email/email.service';
 import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
+import { WorkerResultJson } from '../python-worker/types';
 import { PythonWorkerService } from '../python-worker/python-worker.service';
-import { FieldAnalysisSchedule } from '../scheduled-analysis/entities/field-analysis-schedule.entity';
+import {
+  FieldAnalysisSchedule,
+  ScheduleFrequency,
+} from '../scheduled-analysis/entities/field-analysis-schedule.entity';
+import { FieldAnalysisScheduleStatusTransition } from '../scheduled-analysis/entities/field-analysis-schedule-status-transition.entity';
 import {
   ScheduledAnalysisRun,
   ScheduledRunStatus,
 } from '../scheduled-analysis/entities/scheduled-analysis-run.entity';
+import {
+  WeeklyAnalysisSnapshot,
+  WeeklySnapshotDataQuality,
+} from '../scheduled-analysis/entities/weekly-analysis-snapshot.entity';
+import {
+  classifyDataQuality,
+  extractSnapshotMetrics,
+} from '../scheduled-analysis/weekly-analysis-snapshot-metrics.util';
+import { DEFAULT_SCHEDULE_TIMEZONE } from '../scheduled-analysis/schedule-time.util';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { User } from '../users/user.entity';
@@ -72,11 +86,16 @@ import {
   USER_DETAIL_SCHEDULES_LIMIT,
 } from './dto/admin-user-detail.dto';
 import {
-  AdminAnalysisErrorBucket,
+  AdminActivationMetric,
+  AdminNorthStarMetric,
+  AdminProductAnalyticsCoverage,
   AdminProductAnalyticsDto,
-  AdminProductAnalyticsFunnelStage,
-  AdminProductAnalyticsInsight,
+  AdminQualityBreakdownEntry,
+  AdminQualityBreakdownMetric,
+  AdminRetentionMetric,
+  AdminTimeToFirstTechnicalValueMetric,
 } from './dto/admin-product-analytics.dto';
+import { AdminProductAnalyticsQueryDto } from './dto/admin-product-analytics-query.dto';
 import {
   AdminScheduledAnalysisItem,
   AdminScheduledAnalysisRun,
@@ -94,6 +113,18 @@ import { ListScheduledAnalysisQueryDto } from './dto/list-scheduled-analysis-que
 import { ListUsersQueryDto } from './dto/list-users-query.dto';
 import { UpdateAccessRequestDto } from './dto/update-access-request.dto';
 import { UpdateAdminUserDto } from './dto/update-admin-user.dto';
+import {
+  CalendarWeek,
+  endOfDayInstant,
+  localTimeInstant,
+  resolveCalendarWeekFromDateOnly,
+  resolveLastCompleteCalendarWeek,
+  shiftCalendarWeek,
+} from './product-analytics-week.util';
+import {
+  computeTimeToValuePercentiles,
+  hoursBetween,
+} from './time-to-value.util';
 
 // Mismo costo que AuthService — ver src/auth/auth.service.ts. No se
 // comparte la constante entre módulos para no acoplar AdminModule a
@@ -102,6 +133,40 @@ const SALT_ROUNDS = 10;
 
 const INVITATION_EXPIRES_IN_DAYS = 7;
 const PASSWORD_RESET_EXPIRES_IN_HOURS = 2;
+
+// KPIs P0 (auditoría de KPIs + Decision 1/2): mismo timezone default que scheduled-analysis (sin
+// DST, offset fijo — ver schedule-time.util.ts) para que la semana calendario de reporting sea
+// consistente con el resto del producto, no una convención nueva.
+const PRODUCT_ANALYTICS_TIMEZONE = DEFAULT_SCHEDULE_TIMEZONE;
+
+// North Star eligibility — decisión de producto (ticket de corrección del denominador de North
+// Star, guardada como memoria de proyecto "agroscore-north-star-eligibility-decision"): un field
+// es elegible para una semana si su schedule tenía esta configuración EXACTA y estaba enabled=true
+// el lunes 09:00 de esa semana en America/Argentina/Cordoba. Coincide HOY con los defaults de
+// creación de FieldAnalysisScheduleService (DEFAULT_DAY_OF_WEEK/HOUR/MINUTE) — pero se declara acá
+// de forma INDEPENDIENTE a propósito: es una decisión sobre qué población cuenta para el KPI, no
+// un detalle de formulario, y no deben acoplarse aunque hoy coincidan (si el default de creación
+// cambia mañana, el cutoff canónico de North Star no cambia solo porque comparten el número hoy).
+// Consecuencias aceptadas (ver la decisión): una activación posterior al cutoff entra recién la
+// semana siguiente; una desactivación posterior al cutoff NO saca retroactivamente la
+// elegibilidad; schedules con cualquier otra configuración quedan fuera del P0 por completo y se
+// exponen aparte como `coverage.nonCanonicalSchedules` — nunca se reconstruye su historia de
+// horario (no existe, fuera de alcance) para intentar incluirlos.
+const NORTH_STAR_CANONICAL_FREQUENCY: ScheduleFrequency = 'weekly';
+const NORTH_STAR_CANONICAL_DAY_OF_WEEK = 1; // lunes — misma convención que Date.getUTCDay().
+const NORTH_STAR_CANONICAL_HOUR = 9;
+const NORTH_STAR_CANONICAL_MINUTE = 0;
+const NORTH_STAR_CANONICAL_TIMEZONE = PRODUCT_ANALYTICS_TIMEZONE;
+
+// Tope operativo de Analysis.resultJson efectivamente cargados para activation/time-to-value
+// (computeActivationAndTimeToValue) — resultJson puede traer imágenes base64 pesadas (mapAssets,
+// imageSeries), así que "sin límite" no es una opción real. El scan corta ANTES de este tope en la
+// práctica: se detiene apenas toda la cohorte elegible queda activada, sin importar cuánto volumen
+// de Analysis exista más allá de eso. Si el tope se alcanza con usuarios todavía sin resolver, se
+// expone explícitamente en coverage.analysisClassificationScan — nunca se infla activation en
+// silencio ni se pretende cobertura completa.
+const ANALYSIS_ACTIVATION_SCAN_BATCH_SIZE = 200;
+const ANALYSIS_ACTIVATION_SCAN_MAX_ROWS = 5000;
 
 type Paginated<T> = {
   items: T[];
@@ -146,6 +211,10 @@ export class AdminService {
     private readonly fieldAnalysisScheduleRepository: Repository<FieldAnalysisSchedule>,
     @InjectRepository(ScheduledAnalysisRun)
     private readonly scheduledAnalysisRunRepository: Repository<ScheduledAnalysisRun>,
+    @InjectRepository(WeeklyAnalysisSnapshot)
+    private readonly weeklyAnalysisSnapshotRepository: Repository<WeeklyAnalysisSnapshot>,
+    @InjectRepository(FieldAnalysisScheduleStatusTransition)
+    private readonly fieldAnalysisScheduleTransitionRepository: Repository<FieldAnalysisScheduleStatusTransition>,
     @InjectRepository(AccessRequest)
     private readonly accessRequestRepository: Repository<AccessRequest>,
     @InjectRepository(UserInvitation)
@@ -393,295 +462,495 @@ export class AdminService {
   }
 
   /**
-   * Admin PR 4: Product Analytics básico — GET /admin/product-analytics. Funnel de 9 etapas sobre
-   * entidades ACTUALES, no cohortes por fecha de alta (por eso nunca se llama "conversión real" en
-   * el copy). Todas las queries son COUNT/EXISTS agregados sobre columnas indexadas, ninguna es
-   * por fila ni N+1 — 12 consultas en paralelo, ninguna pesada.
+   * KPIs P0 (auditoría de KPIs + Decision 1/2) — GET /admin/product-analytics. Reemplaza el funnel
+   * de 9 etapas (Admin PR 4, mezclaba users/fields/schedules/runs/emails en una sola "conversión"
+   * que nunca fue un funnel de cohorte real) por el conjunto mínimo de KPIs P0: solo resultados
+   * `dataQualityStatus='sufficient'` cuentan como entrega técnica utilizable — `partial` nunca se
+   * promueve a un numerador de valor, ver AdminQualityBreakdownMetric para dónde sí aparece.
+   *
+   * North Star/calidad usan la MISMA semana calendario (lunes-domingo, ver
+   * product-analytics-week.util.ts) — no la ventana móvil de 7 días propia de cada
+   * WeeklyAnalysisSnapshot, que no es comparable entre campos con schedules en días distintos.
+   * Activation/time-to-value NO están acotados a esa semana: miden la cohorte completa de usuarios
+   * elegibles hasta ahora (ver computeActivationAndTimeToValue).
+   *
+   * Retención usa un par de semanas PROPIO, `week - 1` (N) → `week` (N+1) — nunca `week` → `week +
+   * 1` como el resto: con el default (`week` = última semana completa), `week + 1` sería siempre la
+   * semana EN CURSO, y la retención quedaría subestimada hasta que esa semana termine (ver el
+   * ticket de corrección — gap P0 confirmado). Anclar N+1 a `week` garantiza que, en el caso
+   * default, ambas mitades ya estén completamente terminadas. Una `week` pedida explícitamente
+   * puede seguir siendo la semana en curso o futura — para eso existe
+   * `retention.periodComplete` (ver computeRetention): nunca se infiere completitud desde la
+   * existencia de snapshots, solo desde el reloj.
+   *
+   * `northStarCutoffInstant` (North Star eligibility, decisión de producto — ver
+   * NORTH_STAR_CANONICAL_* arriba) se calcula UNA sola vez acá y se reusa tanto para reconstruir
+   * elegibilidad (computeNorthStar) como para juzgar si la cobertura histórica alcanza para
+   * afirmarla (getScheduleHistoryCoverage) — un solo criterio de "cutoff", nunca dos que puedan
+   * divergir entre sí.
    */
-  async getProductAnalytics(): Promise<AdminProductAnalyticsDto> {
+  async getProductAnalytics(
+    query: AdminProductAnalyticsQueryDto = {},
+  ): Promise<AdminProductAnalyticsDto> {
     const now = new Date();
-    const cutoff30 = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const week: CalendarWeek = query.week
+      ? resolveCalendarWeekFromDateOnly(query.week)
+      : resolveLastCompleteCalendarWeek(now, PRODUCT_ANALYTICS_TIMEZONE);
+    const retentionWeek = shiftCalendarWeek(week, -1);
+    const retentionNextWeek = week;
+    const northStarCutoffInstant = localTimeInstant(
+      week.weekStart,
+      NORTH_STAR_CANONICAL_HOUR,
+      NORTH_STAR_CANONICAL_MINUTE,
+      NORTH_STAR_CANONICAL_TIMEZONE,
+    );
 
     const [
-      totalUsers,
-      usersWithFieldRow,
-      totalFields,
-      fieldsWithLotRow,
-      fieldsWithFinalizedAnalysisRows,
-      fieldsWithVerdictRows,
-      activeSchedules,
-      activeSchedulesWithoutRuns,
-      fieldsWithRunRow,
-      fieldsWithMailSentRow,
-      sentEmails,
-      fieldsWithNoAnalysis,
-      failedAnalysisLast30Days,
-      scheduleSummary,
-      topErrorsRows,
+      northStar,
+      activationAndTimeToValue,
+      retention,
+      qualityBreakdown,
+      scheduleHistoryCoverage,
+      nonCanonicalSchedulesCount,
     ] = await Promise.all([
-      this.usersService.count(),
-      this.fieldRepository
-        .createQueryBuilder('field')
-        .select('COUNT(DISTINCT field."userId")', 'count')
-        .getRawOne<{ count: string }>(),
-      this.fieldRepository.count(),
-      this.fieldLotRepository
-        .createQueryBuilder('lot')
-        .select('COUNT(DISTINCT lot."fieldId")', 'count')
-        .getRawOne<{ count: string }>(),
-      // Mismo join manual scope-based que countFieldsWithNoAnalysis (Analysis.fieldId/lotId son
-      // texto libre histórico, sin FK real hacia Field).
-      this.fieldRepository.manager.query<{ count: string }[]>(`
-        SELECT COUNT(DISTINCT f.id)::int AS count
-        FROM fields f
-        INNER JOIN analysis a ON (
-          (a.scope = 'field' AND a."fieldId" = f.id::text) OR
-          (a.scope IS NULL AND a."lotId" = f.id::text)
-        )
-        WHERE a.status = 'Finalizado'
-      `),
-      this.fieldRepository.manager.query<{ count: string }[]>(`
-        SELECT COUNT(DISTINCT f.id)::int AS count
-        FROM fields f
-        INNER JOIN analysis a ON (
-          (a.scope = 'field' AND a."fieldId" = f.id::text) OR
-          (a.scope IS NULL AND a."lotId" = f.id::text)
-        )
-        INNER JOIN analysis_technical_verdicts v ON v."analysisId" = a.id
-        WHERE v.status = 'generated'
-      `),
-      this.fieldAnalysisScheduleRepository.count({ where: { enabled: true } }),
-      // A propósito NO reusa countActiveSchedulesWithoutRuns() (lastRunAt IS NULL, PR1) — este
-      // bloque usa el criterio real de PR3 (EXISTS/NOT EXISTS), ver comentario en el DTO.
-      this.fieldAnalysisScheduleRepository
-        .createQueryBuilder('schedule')
-        .where('schedule.enabled = true')
-        .andWhere(
-          `NOT EXISTS (SELECT 1 FROM scheduled_analysis_runs r WHERE r."scheduleId" = schedule.id)`,
-        )
-        .getCount(),
-      // ScheduledAnalysisRun.fieldId es columna directa (no hace falta pasar por schedule).
-      this.scheduledAnalysisRunRepository
-        .createQueryBuilder('run')
-        .select('COUNT(DISTINCT run."fieldId")', 'count')
-        .getRawOne<{ count: string }>(),
-      this.scheduledAnalysisRunRepository
-        .createQueryBuilder('run')
-        .select('COUNT(DISTINCT run."fieldId")', 'count')
-        .where('run."emailSentAt" IS NOT NULL')
-        .getRawOne<{ count: string }>(),
-      this.scheduledAnalysisRunRepository.count({
-        where: { emailSentAt: Not(IsNull()) },
-      }),
-      this.countFieldsWithNoAnalysis(),
-      this.countSince(this.analysisRepository, cutoff30, { status: 'Error' }),
-      this.getScheduledAnalysisSummary(),
-      this.fieldRepository.manager.query<{ message: string; count: string }[]>(
-        `
-        SELECT "errorMessage" AS message, COUNT(*)::int AS count
-        FROM analysis
-        WHERE status = 'Error'
-          AND "createdAt" >= $1
-          AND "errorMessage" IS NOT NULL
-        GROUP BY "errorMessage"
-        ORDER BY COUNT(*) DESC
-        LIMIT 3
-      `,
-        [cutoff30],
-      ),
+      this.computeNorthStar(week, northStarCutoffInstant),
+      this.computeActivationAndTimeToValue(),
+      this.computeRetention(retentionWeek, retentionNextWeek, now),
+      this.computeQualityBreakdown(week),
+      this.getScheduleHistoryCoverage(northStarCutoffInstant),
+      this.getNonCanonicalSchedulesCount(),
     ]);
 
-    const usersWithField = Number(usersWithFieldRow?.count ?? 0);
-    const fieldsWithLot = Number(fieldsWithLotRow?.count ?? 0);
-    const fieldsWithFinalizedAnalysis = Number(
-      fieldsWithFinalizedAnalysisRows?.[0]?.count ?? 0,
-    );
-    const fieldsWithVerdict = Number(fieldsWithVerdictRows?.[0]?.count ?? 0);
-    const fieldsWithRun = Number(fieldsWithRunRow?.count ?? 0);
-    const fieldsWithMailSent = Number(fieldsWithMailSentRow?.count ?? 0);
-    const schedulesWithRuns = activeSchedules - activeSchedulesWithoutRuns;
-
-    const funnel: AdminProductAnalyticsFunnelStage[] = [];
-    const pushStage = (
-      stage: Omit<
-        AdminProductAnalyticsFunnelStage,
-        'previousCount' | 'conversionFromPrevious' | 'dropoffFromPrevious'
-      >,
-    ) => {
-      funnel.push(this.buildFunnelStage(stage, funnel.at(-1)?.count));
+    const coverage: AdminProductAnalyticsCoverage = {
+      scheduleHistory: scheduleHistoryCoverage,
+      analysisClassificationScan: activationAndTimeToValue.coverage,
+      nonCanonicalSchedules: { count: nonCanonicalSchedulesCount },
     };
-
-    pushStage({
-      id: 'total-users',
-      label: 'Usuarios totales',
-      count: totalUsers,
-      description: 'Todos los usuarios registrados en la plataforma.',
-      route: '/users',
-    });
-    pushStage({
-      id: 'users-with-field',
-      label: 'Usuarios con al menos un campo',
-      count: usersWithField,
-      description:
-        'No existe todavía un filtro dedicado en Usuarios para esta pregunta.',
-    });
-    pushStage({
-      id: 'total-fields',
-      label: 'Campos totales',
-      count: totalFields,
-      description: 'Todos los campos creados, de cualquier usuario.',
-      route: '/fields',
-    });
-    pushStage({
-      id: 'fields-with-lot',
-      label: 'Campos con al menos un lote',
-      count: fieldsWithLot,
-      description:
-        'No existe todavía un filtro dedicado en Campos para esta pregunta.',
-    });
-    pushStage({
-      id: 'fields-with-finalized-analysis',
-      label: 'Campos con al menos un análisis finalizado',
-      count: fieldsWithFinalizedAnalysis,
-      description:
-        '/fields?hasAnalysis=true existe pero incluye cualquier estado (también Procesando/Error), así que no se linkea acá para no insinuar más precisión de la que tiene.',
-    });
-    pushStage({
-      id: 'fields-with-verdict',
-      label: 'Campos con veredicto técnico generado',
-      count: fieldsWithVerdict,
-      description: 'No existe todavía un filtro dedicado para esta pregunta.',
-    });
-    pushStage({
-      id: 'fields-with-active-schedule',
-      label: 'Campos con monitoreo semanal activo',
-      count: activeSchedules,
-      description:
-        'FieldAnalysisSchedule.fieldId es único por campo, así que este número ya es "campos", no "schedules".',
-      route: '/scheduled-analysis',
-      queryParams: { enabled: true },
-    });
-    pushStage({
-      id: 'fields-with-run',
-      label: 'Campos con al menos una corrida semanal',
-      count: fieldsWithRun,
-      description:
-        'Existencia real de ScheduledAnalysisRun (mismo criterio que el filtro hasRuns de Programados, PR3).',
-      route: '/scheduled-analysis',
-      queryParams: { enabled: true, hasRuns: true },
-    });
-    pushStage({
-      id: 'fields-with-mail-sent',
-      label: 'Campos con mail semanal enviado',
-      count: fieldsWithMailSent,
-      description:
-        'No existe todavía un filtro por mailStatus en el listado de Programados (deuda documentada en PR3).',
-    });
-
-    const insights: AdminProductAnalyticsInsight[] = [];
-
-    if (fieldsWithNoAnalysis > 0) {
-      insights.push({
-        id: 'fields-without-analysis',
-        severity: 'warning',
-        title: `${fieldsWithNoAnalysis} de ${totalFields} ${this.pluralize(totalFields, 'campo todavía no tiene', 'campos todavía no tienen')} ningún diagnóstico`,
-        description:
-          'Principal punto de pérdida: activación del primer análisis.',
-        route: '/fields',
-        queryParams: { hasAnalysis: false },
-      });
-    }
-
-    if (totalFields > 0 && activeSchedules / totalFields < 0.5) {
-      insights.push({
-        id: 'weekly-monitoring-adoption',
-        severity: 'opportunity',
-        title: `${activeSchedules} de ${totalFields} campos tienen monitoreo semanal activo`,
-        description: 'La adopción del monitoreo semanal todavía es baja.',
-        route: '/scheduled-analysis',
-        queryParams: { enabled: true },
-      });
-    }
-
-    if (activeSchedulesWithoutRuns > 0) {
-      insights.push({
-        id: 'active-schedules-without-runs',
-        severity: 'critical',
-        title: `${activeSchedulesWithoutRuns} de ${activeSchedules} monitoreos semanales activos todavía no registran ninguna corrida`,
-        description:
-          'Revisar el pipeline semanal antes de seguir empujando adopción de monitoreo.',
-        route: '/scheduled-analysis',
-        queryParams: { enabled: true, hasRuns: false },
-      });
-    }
-
-    if (failedAnalysisLast30Days > 0) {
-      insights.push({
-        id: 'failed-analysis-30d',
-        severity: 'critical',
-        title: `${failedAnalysisLast30Days} ${this.pluralize(failedAnalysisLast30Days, 'diagnóstico fallido', 'diagnósticos fallidos')} en los últimos 30 días`,
-        description:
-          'Revisar estabilidad del worker/API antes de escalar el volumen de análisis.',
-        route: '/analysis',
-        queryParams: { status: 'Error' },
-      });
-    }
-
-    if (scheduleSummary.mailPendingOrFailed > 0) {
-      insights.push({
-        id: 'mail-pending-or-failed',
-        severity: 'warning',
-        title: `${scheduleSummary.mailPendingOrFailed} ${this.pluralize(scheduleSummary.mailPendingOrFailed, 'monitoreo semanal todavía no envió', 'monitoreos semanales todavía no enviaron')} el mail de su corrida más reciente`,
-        description:
-          'Puede ser un envío pendiente del próximo ciclo o un mail que se omitió — ver detalle en Programados.',
-        route: '/scheduled-analysis',
-        queryParams: { enabled: true },
-      });
-    }
-
-    const topAnalysisErrorsLast30Days: AdminAnalysisErrorBucket[] =
-      topErrorsRows.map((row) => ({
-        message: row.message,
-        count: Number(row.count),
-      }));
 
     return {
       generatedAt: now.toISOString(),
-      funnel,
-      insights,
-      weeklyMonitoring: {
-        totalFields,
-        activeSchedules,
-        activeSchedulesWithoutRuns,
-        schedulesWithRuns,
-        sentEmails,
-      },
-      topAnalysisErrorsLast30Days,
+      period: { week, timezone: PRODUCT_ANALYTICS_TIMEZONE },
+      coverage,
+      northStar,
+      activation: activationAndTimeToValue.activation,
+      timeToFirstTechnicalValue:
+        activationAndTimeToValue.timeToFirstTechnicalValue,
+      retention,
+      qualityBreakdown,
     };
   }
 
-  private buildFunnelStage(
-    stage: Omit<
-      AdminProductAnalyticsFunnelStage,
-      'previousCount' | 'conversionFromPrevious' | 'dropoffFromPrevious'
-    >,
-    previousCount: number | undefined,
-  ): AdminProductAnalyticsFunnelStage {
-    if (previousCount === undefined) {
-      return stage;
-    }
+  /**
+   * KPI #1 — "Campos con monitoreo utilizable semanal" (North Star). Población elegible
+   * restringida a schedules CANÓNICOS (frequency/dayOfWeek/hour/minute/timezone == los
+   * NORTH_STAR_CANONICAL_* de arriba — decisión de producto explícita, ver esa constante):
+   * cualquier otra configuración queda fuera del P0 por completo, ni numerador ni denominador —
+   * ver `coverage.nonCanonicalSchedules` para esa cuenta aparte.
+   *
+   * Denominador: fields con schedule canónico cuyo estado reconstruido (desde
+   * field_analysis_schedule_status_transitions, ticket anterior) al CUTOFF canónico
+   * (`cutoffInstant` — lunes 09:00 de esa semana, nunca el cierre del domingo) es enabled=true.
+   * Numerador: de ESOS MISMOS fields (INNER JOIN contra el universo elegible, no una query
+   * independiente) los que además tienen snapshot sufficient con `weekEnd` en la semana — así
+   * usableFieldsCount <= eligibleFieldsCount queda garantizado por construcción SQL, no solo por
+   * convención.
+   */
+  private async computeNorthStar(
+    week: CalendarWeek,
+    cutoffInstant: Date,
+  ): Promise<AdminNorthStarMetric> {
+    const rows =
+      await this.fieldAnalysisScheduleTransitionRepository.manager.query<
+        { eligibleFieldsCount: string; usableFieldsCount: string }[]
+      >(
+        `WITH canonical_schedules AS (
+         SELECT id
+         FROM field_analysis_schedules
+         WHERE frequency = $1
+           AND "dayOfWeek" = $2
+           AND hour = $3
+           AND minute = $4
+           AND timezone = $5
+       ),
+       -- DISTINCT ON (scheduleId) ... ORDER BY effectiveAt DESC = la transición vigente de cada
+       -- schedule canónico al cutoff consultado (ver invariante en
+       -- field-analysis-schedule-status-transition.entity.ts).
+       latest_transition AS (
+         SELECT DISTINCT ON (t."scheduleId") t."scheduleId", t."fieldId", t.enabled
+         FROM field_analysis_schedule_status_transitions t
+         INNER JOIN canonical_schedules cs ON cs.id = t."scheduleId"
+         WHERE t."effectiveAt" <= $6
+         ORDER BY t."scheduleId", t."effectiveAt" DESC, t."createdAt" DESC
+       ),
+       eligible_fields AS (
+         SELECT DISTINCT "fieldId" FROM latest_transition WHERE enabled = true
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM eligible_fields) AS "eligibleFieldsCount",
+         (SELECT COUNT(DISTINCT s."fieldId")::int
+          FROM weekly_analysis_snapshots s
+          INNER JOIN eligible_fields ef ON ef."fieldId" = s."fieldId"
+          WHERE s."weekEnd" BETWEEN $7 AND $8 AND s."dataQualityStatus" = 'sufficient'
+         ) AS "usableFieldsCount"`,
+        [
+          NORTH_STAR_CANONICAL_FREQUENCY,
+          NORTH_STAR_CANONICAL_DAY_OF_WEEK,
+          NORTH_STAR_CANONICAL_HOUR,
+          NORTH_STAR_CANONICAL_MINUTE,
+          NORTH_STAR_CANONICAL_TIMEZONE,
+          cutoffInstant,
+          week.weekStart,
+          week.weekEnd,
+        ],
+      );
+
+    const eligibleFieldsCount = Number(rows[0]?.eligibleFieldsCount ?? 0);
+    const usableFieldsCount = Number(rows[0]?.usableFieldsCount ?? 0);
 
     return {
-      ...stage,
-      previousCount,
-      conversionFromPrevious:
-        previousCount > 0 ? stage.count / previousCount : undefined,
-      dropoffFromPrevious: previousCount - stage.count,
+      week,
+      usableFieldsCount,
+      eligibleFieldsCount,
+      rate:
+        eligibleFieldsCount > 0
+          ? usableFieldsCount / eligibleFieldsCount
+          : null,
     };
   }
 
-  private pluralize(count: number, singular: string, plural: string): string {
-    return count === 1 ? singular : plural;
+  /**
+   * Señal de calidad de datos para North Star (ver `coverage.nonCanonicalSchedules` en el DTO):
+   * cuántos schedules HOY tienen una configuración distinta de la canónica. Es un conteo sobre la
+   * configuración VIGENTE, no reconstruido para ninguna semana en particular — no existe historia
+   * de dayOfWeek/hour/minute/timezone (solo de `enabled`, ver ticket anterior), así que no hay
+   * forma de afirmar con certeza qué configuración tenía un schedule en el pasado. Nunca se
+   * excluyen del conteo por estar `enabled=false`: la pregunta es "¿cuántos schedules no siguen el
+   * cutoff que North Star asume?", no "¿cuántos están afectando el KPI ahora mismo?".
+   */
+  private async getNonCanonicalSchedulesCount(): Promise<number> {
+    const rows = await this.fieldAnalysisScheduleRepository.manager.query<
+      { count: string }[]
+    >(
+      `SELECT COUNT(*)::int AS count
+       FROM field_analysis_schedules
+       WHERE NOT (
+         frequency = $1
+         AND "dayOfWeek" = $2
+         AND hour = $3
+         AND minute = $4
+         AND timezone = $5
+       )`,
+      [
+        NORTH_STAR_CANONICAL_FREQUENCY,
+        NORTH_STAR_CANONICAL_DAY_OF_WEEK,
+        NORTH_STAR_CANONICAL_HOUR,
+        NORTH_STAR_CANONICAL_MINUTE,
+        NORTH_STAR_CANONICAL_TIMEZONE,
+      ],
+    );
+
+    return Number(rows[0]?.count ?? 0);
+  }
+
+  /**
+   * KPI #4 — retención semanal técnica de fields. Denominador: fields sufficient en la semana N.
+   * Numerador: el MISMO fieldId, también sufficient en N+1 — el INTERSECT hace esa comparación por
+   * identidad de fila, nunca por conteo agregado (evita el error clásico de "conteo de N+1 / conteo
+   * de N", que no garantiza que sean los mismos campos).
+   *
+   * `periodComplete` es un chequeo de RELOJ, nunca de datos: compara `now` contra el instante real
+   * de cierre de N+1 (23:59:59.999 en America/Argentina/Cordoba) — jamás se infiere que N+1 ya
+   * terminó porque ya tiene algún snapshot sufficient (eso solo demostraría que ALGÚN campo corrió
+   * temprano esa semana, no que la semana completa). `week`/`nextWeek` que recibe este método ya
+   * vienen resueltas por el caller (getProductAnalytics) para que N+1 sea `period.week` — acá no se
+   * decide esa relación, solo se verifica si terminó.
+   */
+  private async computeRetention(
+    week: CalendarWeek,
+    nextWeek: CalendarWeek,
+    now: Date,
+  ): Promise<AdminRetentionMetric> {
+    const periodComplete =
+      now.getTime() >=
+      endOfDayInstant(nextWeek.weekEnd, PRODUCT_ANALYTICS_TIMEZONE).getTime();
+
+    const [sufficientRows, retainedRows] = await Promise.all([
+      this.weeklyAnalysisSnapshotRepository.manager.query<{ count: string }[]>(
+        `SELECT COUNT(DISTINCT "fieldId")::int AS count
+         FROM weekly_analysis_snapshots
+         WHERE "weekEnd" BETWEEN $1 AND $2 AND "dataQualityStatus" = 'sufficient'`,
+        [week.weekStart, week.weekEnd],
+      ),
+      this.weeklyAnalysisSnapshotRepository.manager.query<{ count: string }[]>(
+        `SELECT COUNT(*)::int AS count FROM (
+           SELECT "fieldId" FROM weekly_analysis_snapshots
+           WHERE "weekEnd" BETWEEN $1 AND $2 AND "dataQualityStatus" = 'sufficient'
+           INTERSECT
+           SELECT "fieldId" FROM weekly_analysis_snapshots
+           WHERE "weekEnd" BETWEEN $3 AND $4 AND "dataQualityStatus" = 'sufficient'
+         ) retained`,
+        [week.weekStart, week.weekEnd, nextWeek.weekStart, nextWeek.weekEnd],
+      ),
+    ]);
+
+    const sufficientInWeekCount = Number(sufficientRows[0]?.count ?? 0);
+    const retainedInNextWeekCount = Number(retainedRows[0]?.count ?? 0);
+
+    return {
+      week,
+      nextWeek,
+      periodComplete,
+      sufficientInWeekCount,
+      retainedInNextWeekCount,
+      // Invariante del ticket: rate != null ⟹ N y N+1 terminaron completamente. `periodComplete`
+      // se evalúa PRIMERO — un denominador > 0 nunca alcanza para mostrar un rate si N+1 todavía
+      // está en curso o es futura.
+      rate:
+        periodComplete && sufficientInWeekCount > 0
+          ? retainedInNextWeekCount / sufficientInWeekCount
+          : null,
+    };
+  }
+
+  /**
+   * KPI #5 — breakdown de calidad. Siempre las tres categorías, incluso en 0 — nunca se omite
+   * 'partial'/'insufficient' porque esa semana no tuvo ninguno (el ticket exige poder distinguir
+   * "cero partial" de "no se sabe").
+   */
+  private async computeQualityBreakdown(
+    week: CalendarWeek,
+  ): Promise<AdminQualityBreakdownMetric> {
+    const rows = await this.weeklyAnalysisSnapshotRepository.manager.query<
+      { status: WeeklySnapshotDataQuality; count: string }[]
+    >(
+      `SELECT "dataQualityStatus" AS status, COUNT(*)::int AS count
+       FROM weekly_analysis_snapshots
+       WHERE "weekEnd" BETWEEN $1 AND $2
+       GROUP BY "dataQualityStatus"`,
+      [week.weekStart, week.weekEnd],
+    );
+
+    const counts = new Map<WeeklySnapshotDataQuality, number>([
+      ['sufficient', 0],
+      ['partial', 0],
+      ['insufficient', 0],
+    ]);
+    for (const row of rows) {
+      counts.set(row.status, Number(row.count));
+    }
+
+    const totalSnapshots = Array.from(counts.values()).reduce(
+      (acc, n) => acc + n,
+      0,
+    );
+
+    const breakdown: AdminQualityBreakdownEntry[] = (
+      ['sufficient', 'partial', 'insufficient'] as const
+    ).map((status) => {
+      const count = counts.get(status) ?? 0;
+      return {
+        status,
+        count,
+        proportion: totalSnapshots > 0 ? count / totalSnapshots : null,
+      };
+    });
+
+    return { week, totalSnapshots, breakdown };
+  }
+
+  /**
+   * Cobertura honesta del denominador de North Star (ticket anterior: "hasta que exista cobertura
+   * completa del historial de schedules, devolver metadata que indique denominador histórico
+   * incompleto"). `complete` exige que el CUTOFF real evaluado (`cutoffInstant` — lunes 09:00 de la
+   * semana consultada, ver getProductAnalytics) esté en o después de la fila más antigua del
+   * historial — el mismo instante que `computeNorthStar` reconstruye, nunca uno distinto (antes
+   * era el cierre del domingo; una baseline posterior al lunes 09:00 pero anterior al domingo
+   * habría afirmado "completo" incorrectamente, ver el ticket de corrección).
+   */
+  private async getScheduleHistoryCoverage(
+    cutoffInstant: Date,
+  ): Promise<AdminProductAnalyticsCoverage['scheduleHistory']> {
+    const rows =
+      await this.fieldAnalysisScheduleTransitionRepository.manager.query<
+        { min: Date | null }[]
+      >(
+        `SELECT MIN("effectiveAt") AS min FROM field_analysis_schedule_status_transitions`,
+      );
+
+    const availableFrom = rows[0]?.min ?? null;
+
+    if (!availableFrom) {
+      // Sin ninguna fila todavía: no hay evidencia de ningún tipo — nunca se afirma "completo" por
+      // ausencia de datos, aunque el count resultante (0) sea, de hecho, correcto.
+      return { availableFrom: null, complete: false };
+    }
+
+    const availableFromDate = new Date(availableFrom);
+
+    return {
+      availableFrom: availableFromDate.toISOString(),
+      complete: cutoffInstant.getTime() >= availableFromDate.getTime(),
+    };
+  }
+
+  /**
+   * KPIs #2/#3 — Activation técnica y Time to First Technical Value. Único lugar que clasifica
+   * Analysis.resultJson directamente (no WeeklyAnalysisSnapshot.dataQualityStatus, que solo existe
+   * para corridas del scheduler): la activación de un usuario puede venir de CUALQUIER Analysis de
+   * Field, manual o automático — reusa classifyDataQuality/extractSnapshotMetrics tal cual, nunca
+   * reimplementa la regla en SQL.
+   *
+   * Lectura acotada (ver ANALYSIS_ACTIVATION_SCAN_* arriba): recorre Analysis 'Finalizado' de Field
+   * (regla scope/fieldId/lotId de siempre, ver AnalysisService.findByField) en lotes ordenados por
+   * completedAt ASC, y se DETIENE apenas toda la cohorte elegible queda activada — nunca carga más
+   * resultJson que los estrictamente necesarios para resolver "el primer sufficient de cada
+   * usuario", acotado además por un tope duro de filas.
+   */
+  private async computeActivationAndTimeToValue(): Promise<{
+    activation: AdminActivationMetric;
+    timeToFirstTechnicalValue: AdminTimeToFirstTechnicalValueMetric;
+    coverage: AdminProductAnalyticsCoverage['analysisClassificationScan'];
+  }> {
+    const eligibleUsers = await this.usersService.listEligibleProducers();
+
+    if (eligibleUsers.length === 0) {
+      return {
+        activation: {
+          eligibleUsersCount: 0,
+          activatedUsersCount: 0,
+          rate: null,
+        },
+        timeToFirstTechnicalValue: {
+          cohortUsersCount: 0,
+          activatedUsersCount: 0,
+          notActivatedUsersCount: 0,
+          p50Hours: null,
+          p75Hours: null,
+          p95Hours: null,
+        },
+        coverage: {
+          scanned: 0,
+          limit: ANALYSIS_ACTIVATION_SCAN_MAX_ROWS,
+          truncated: false,
+        },
+      };
+    }
+
+    const createdAtByUserId = new Map(
+      eligibleUsers.map((user) => [user.id, user.createdAt]),
+    );
+    const pendingUserIds = new Set(eligibleUsers.map((user) => user.id));
+    const activatedAt = new Map<string, Date>();
+
+    // Cursor compuesto (completedAt, id) — nunca solo completedAt: dos Analysis distintos pueden
+    // compartir el mismo completedAt exacto (mismo tick de reconciliación, por ejemplo), y un
+    // cursor de una sola columna con comparación estricta ">" puede dejar SIN VOLVER A CONSULTAR
+    // para siempre a la fila empatada que cayó del lado equivocado de un corte de lote — no un
+    // simple "incompleto" (eso ya lo cubre `truncated`), sino un resultado directamente
+    // incorrecto: un usuario cuyo primer Analysis sufficient real cae justo en ese empate
+    // aparecería como "no activado". `id` como desempate hace que el cursor sea una clave
+    // verdaderamente única, igual que ORDER BY completedAt ASC, id ASC de abajo.
+    let cursor: { completedAt: Date; id: string } | null = null;
+    let scanned = 0;
+
+    while (
+      pendingUserIds.size > 0 &&
+      scanned < ANALYSIS_ACTIVATION_SCAN_MAX_ROWS
+    ) {
+      const batchLimit = Math.min(
+        ANALYSIS_ACTIVATION_SCAN_BATCH_SIZE,
+        ANALYSIS_ACTIVATION_SCAN_MAX_ROWS - scanned,
+      );
+
+      const rows: Array<{
+        id: string;
+        resultJson: WorkerResultJson | null;
+        completedAt: Date;
+        userId: string;
+      }> = await this.analysisRepository.manager.query(
+        `SELECT a.id, a."resultJson", a."completedAt", f."userId" AS "userId"
+           FROM analysis a
+           INNER JOIN fields f ON (
+             (a.scope = 'field' AND a."fieldId" = f.id::text) OR
+             (a.scope IS NULL AND a."lotId" = f.id::text)
+           )
+           WHERE a.status = 'Finalizado'
+             AND a."completedAt" IS NOT NULL
+             AND (
+               $1::timestamp IS NULL
+               OR a."completedAt" > $1
+               OR (a."completedAt" = $1 AND a.id > $4::uuid)
+             )
+             AND f."userId" = ANY($2::uuid[])
+           ORDER BY a."completedAt" ASC, a.id ASC
+           LIMIT $3`,
+        [
+          cursor?.completedAt ?? null,
+          Array.from(pendingUserIds),
+          batchLimit,
+          cursor?.id ?? null,
+        ],
+      );
+
+      if (rows.length === 0) {
+        break;
+      }
+
+      scanned += rows.length;
+      const lastRow = rows[rows.length - 1];
+      cursor = { completedAt: lastRow.completedAt, id: lastRow.id };
+
+      for (const row of rows) {
+        if (!pendingUserIds.has(row.userId)) {
+          continue; // ya activado en un lote anterior — no reclasifica de más.
+        }
+
+        const classification = classifyDataQuality(
+          extractSnapshotMetrics(row.resultJson),
+        );
+        if (classification.status === 'sufficient') {
+          activatedAt.set(row.userId, row.completedAt);
+          pendingUserIds.delete(row.userId);
+        }
+      }
+
+      if (rows.length < batchLimit) {
+        break; // no hay más candidatos — se agotaron antes del tope.
+      }
+    }
+
+    const activatedUsersCount = activatedAt.size;
+    const durationsHours = Array.from(activatedAt.entries()).map(
+      ([userId, completedAt]) =>
+        hoursBetween(createdAtByUserId.get(userId) as Date, completedAt),
+    );
+    const percentiles = computeTimeToValuePercentiles(durationsHours);
+
+    return {
+      activation: {
+        eligibleUsersCount: eligibleUsers.length,
+        activatedUsersCount,
+        rate:
+          eligibleUsers.length > 0
+            ? activatedUsersCount / eligibleUsers.length
+            : null,
+      },
+      timeToFirstTechnicalValue: {
+        cohortUsersCount: eligibleUsers.length,
+        activatedUsersCount,
+        notActivatedUsersCount: eligibleUsers.length - activatedUsersCount,
+        p50Hours: percentiles.p50,
+        p75Hours: percentiles.p75,
+        p95Hours: percentiles.p95,
+      },
+      coverage: {
+        scanned,
+        limit: ANALYSIS_ACTIVATION_SCAN_MAX_ROWS,
+        truncated:
+          pendingUserIds.size > 0 &&
+          scanned >= ANALYSIS_ACTIVATION_SCAN_MAX_ROWS,
+      },
+    };
   }
 
   // ── Usuarios ────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, In, Not, Repository, UpdateResult } from 'typeorm';
 
 import { User } from './user.entity';
-import { UserRole } from './user-role.enum';
+import { ADMIN_ROLES, UserRole } from './user-role.enum';
 
 // PROFILE-SEC-1: tokenVersion se excluye del shape público igual que
 // passwordHash — es un detalle interno de invalidación de JWT, no algo que
@@ -192,6 +192,21 @@ export class UsersService {
   async incrementTokenVersion(id: string): Promise<void> {
     await this.usersRepository.update(id, {
       tokenVersion: () => '"tokenVersion" + 1',
+    });
+  }
+
+  /**
+   * KPIs P0 (auditoría de KPIs + Decision 1/2): población elegible ("cohorte de productores") para
+   * activation/time-to-value — todo usuario cuyo rol NO sea administrativo (ver ADMIN_ROLES:
+   * owner/admin). No filtra por `isActive`: desactivar una cuenta no borra si esa persona llegó o
+   * no a un resultado técnicamente utilizable en el pasado, que es lo que estas métricas miden.
+   * Solo trae `id`/`createdAt` (lo único que AdminService necesita: identidad para el join contra
+   * Analysis, y el ancla de Time to First Technical Value) — nunca el usuario completo.
+   */
+  async listEligibleProducers(): Promise<Pick<User, 'id' | 'createdAt'>[]> {
+    return this.usersRepository.find({
+      where: { role: Not(In(ADMIN_ROLES)) },
+      select: { id: true, createdAt: true },
     });
   }
 

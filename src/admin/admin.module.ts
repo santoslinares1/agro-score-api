@@ -11,7 +11,9 @@ import { Field } from '../fields/entities/field.entity';
 import { FieldLot } from '../fields/entities/field-lot.entity';
 import { PythonWorkerModule } from '../python-worker/python-worker.module';
 import { FieldAnalysisSchedule } from '../scheduled-analysis/entities/field-analysis-schedule.entity';
+import { FieldAnalysisScheduleStatusTransition } from '../scheduled-analysis/entities/field-analysis-schedule-status-transition.entity';
 import { ScheduledAnalysisRun } from '../scheduled-analysis/entities/scheduled-analysis-run.entity';
+import { WeeklyAnalysisSnapshot } from '../scheduled-analysis/entities/weekly-analysis-snapshot.entity';
 import { PasswordResetToken } from '../users/entities/password-reset-token.entity';
 import { UserInvitation } from '../users/entities/user-invitation.entity';
 import { UsersModule } from '../users/users.module';
@@ -53,6 +55,11 @@ import { AdminService } from './admin.service';
  * EmailModule/PythonWorkerModule/etc. innecesarios solo para leer dos
  * tablas de solo lectura).
  *
+ * KPIs P0: mismo criterio para WeeklyAnalysisSnapshot (dataQualityStatus/weekStart/weekEnd, ya
+ * persistidos — ver AdminService.computeNorthStar/computeRetention/computeQualityBreakdown) y
+ * FieldAnalysisScheduleStatusTransition (historial append-only de enabled, ticket anterior — ver
+ * computeNorthStar/getScheduleHistoryCoverage). Ambas de solo lectura acá, repositorio directo.
+ *
  * PR 16D: weeklyTechnicalVerdict es la ÚNICA excepción al criterio de arriba — importa
  * WeeklyTechnicalVerdictModule (liviano: solo TypeOrmModule.forFeature + sus 2 generadores, sin
  * EmailModule/PythonWorkerModule) y reusa WeeklyTechnicalVerdictService.findResponsesByScheduledRunIds
@@ -82,7 +89,9 @@ import { AdminService } from './admin.service';
       Analysis,
       AnalysisTechnicalVerdict,
       FieldAnalysisSchedule,
+      FieldAnalysisScheduleStatusTransition,
       ScheduledAnalysisRun,
+      WeeklyAnalysisSnapshot,
       AccessRequest,
       UserInvitation,
       PasswordResetToken,

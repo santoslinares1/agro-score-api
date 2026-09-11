@@ -57,18 +57,58 @@ describe('/admin/* — guards de rol (ADMIN-1)', () => {
             listAuditLogs: jest
               .fn()
               .mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
+            // KPIs P0: este describe solo valida status codes por rol (ver el test de abajo),
+            // nunca el body — el fixture no necesita ser exhaustivo, solo tener el shape vigente
+            // de AdminProductAnalyticsDto (ver admin-product-analytics.dto.ts).
             getProductAnalytics: jest.fn().mockResolvedValue({
               generatedAt: new Date().toISOString(),
-              funnel: [],
-              insights: [],
-              weeklyMonitoring: {
-                totalFields: 0,
-                activeSchedules: 0,
-                activeSchedulesWithoutRuns: 0,
-                schedulesWithRuns: 0,
-                sentEmails: 0,
+              period: {
+                week: { weekStart: '2026-08-31', weekEnd: '2026-09-06' },
+                timezone: 'America/Argentina/Cordoba',
               },
-              topAnalysisErrorsLast30Days: [],
+              coverage: {
+                scheduleHistory: { availableFrom: null, complete: false },
+                analysisClassificationScan: {
+                  scanned: 0,
+                  limit: 5000,
+                  truncated: false,
+                },
+              },
+              northStar: {
+                week: { weekStart: '2026-08-31', weekEnd: '2026-09-06' },
+                usableFieldsCount: 0,
+                eligibleFieldsCount: 0,
+                rate: null,
+              },
+              activation: {
+                eligibleUsersCount: 0,
+                activatedUsersCount: 0,
+                rate: null,
+              },
+              timeToFirstTechnicalValue: {
+                cohortUsersCount: 0,
+                activatedUsersCount: 0,
+                notActivatedUsersCount: 0,
+                p50Hours: null,
+                p75Hours: null,
+                p95Hours: null,
+              },
+              retention: {
+                week: { weekStart: '2026-08-31', weekEnd: '2026-09-06' },
+                nextWeek: { weekStart: '2026-09-07', weekEnd: '2026-09-13' },
+                sufficientInWeekCount: 0,
+                retainedInNextWeekCount: 0,
+                rate: null,
+              },
+              qualityBreakdown: {
+                week: { weekStart: '2026-08-31', weekEnd: '2026-09-06' },
+                totalSnapshots: 0,
+                breakdown: [
+                  { status: 'sufficient', count: 0, proportion: null },
+                  { status: 'partial', count: 0, proportion: null },
+                  { status: 'insufficient', count: 0, proportion: null },
+                ],
+              },
             }),
             getFieldDetail: jest.fn().mockResolvedValue({
               field: {

@@ -1,7 +1,9 @@
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
+import { In, Not } from 'typeorm';
 
 import { User } from './user.entity';
+import { UserRole } from './user-role.enum';
 import { UsersService } from './users.service';
 
 // F03: única cobertura unitaria agregada para UsersService en esta ficha — deliberadamente
@@ -74,5 +76,53 @@ describe('UsersService.updatePassword — participación opcional en una transac
     const result = await service.updatePassword('id-inexistente', 'hash-nuevo');
 
     expect(result).toEqual({ affected: 0 });
+  });
+});
+
+// KPIs P0 (auditoría de KPIs + Decision 1/2): listEligibleProducers() es la única fuente de la
+// cohorte de activation/time-to-value — cobertura acotada a ese método, mismo criterio de alcance
+// que el describe de F03 de arriba.
+describe('UsersService.listEligibleProducers (KPIs P0)', () => {
+  let service: UsersService;
+  let usersRepository: { find: jest.Mock };
+
+  beforeEach(async () => {
+    usersRepository = { find: jest.fn().mockResolvedValue([]) };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        UsersService,
+        { provide: getRepositoryToken(User), useValue: usersRepository },
+      ],
+    }).compile();
+
+    service = module.get(UsersService);
+  });
+
+  it('excluye roles administrativos (owner/admin) vía NOT IN, nunca lista todos los usuarios', async () => {
+    await service.listEligibleProducers();
+
+    expect(usersRepository.find).toHaveBeenCalledWith({
+      where: { role: Not(In([UserRole.OWNER, UserRole.ADMIN])) },
+      select: { id: true, createdAt: true },
+    });
+  });
+
+  it('no filtra por isActive — una cuenta desactivada conserva su historia de activación', async () => {
+    await service.listEligibleProducers();
+
+    const [args] = usersRepository.find.mock.calls[0] as [
+      { where: Record<string, unknown> },
+    ];
+    expect(args.where).not.toHaveProperty('isActive');
+  });
+
+  it('devuelve exactamente lo que el repositorio resuelve (id/createdAt), sin transformar', async () => {
+    const rows = [{ id: 'u1', createdAt: new Date('2026-01-01') }];
+    usersRepository.find.mockResolvedValue(rows);
+
+    const result = await service.listEligibleProducers();
+
+    expect(result).toBe(rows);
   });
 });

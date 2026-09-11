@@ -20,6 +20,7 @@ import { RolesGuard } from '../auth/roles.guard';
 import { AuditActorContext } from '../audit-log/audit-log.service';
 import { UserRole } from '../users/user-role.enum';
 import { AdminService } from './admin.service';
+import { AdminProductAnalyticsQueryDto } from './dto/admin-product-analytics-query.dto';
 import { CreateAdminUserDto } from './dto/create-admin-user.dto';
 import { CreateInvitationDto } from './dto/create-invitation.dto';
 import { CreateUserFromAccessRequestDto } from './dto/create-user-from-access-request.dto';
@@ -62,12 +63,14 @@ export class AdminController {
     return this.adminService.getMetrics();
   }
 
-  // Admin PR 4: Product Analytics básico — funnel + insights + monitoreo semanal + top errores.
-  // Endpoint separado de /admin/metrics a propósito (ver AdminService.getProductAnalytics):
-  // responde una pregunta distinta ("dónde se pierde valor") y /admin/metrics ya es grande.
+  // KPIs P0 (auditoría de KPIs + Decision 1/2): North Star, activation, time-to-value, retención
+  // técnica y calidad — solo `sufficient` cuenta como entrega utilizable (ver
+  // AdminService.getProductAnalytics). Endpoint separado de /admin/metrics a propósito: responde
+  // una pregunta de producto distinta ("¿cuántos llegan a un resultado técnicamente utilizable?"),
+  // y /admin/metrics ya es grande.
   @Get('product-analytics')
-  getProductAnalytics() {
-    return this.adminService.getProductAnalytics();
+  getProductAnalytics(@Query() query: AdminProductAnalyticsQueryDto) {
+    return this.adminService.getProductAnalytics(query);
   }
 
   @Get('system/health')
