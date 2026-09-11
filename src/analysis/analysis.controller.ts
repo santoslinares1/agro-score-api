@@ -106,6 +106,18 @@ export class AnalysisController {
   // PDF-1: genera el PDF real desde los datos del análisis ya validado por ownership — no
   // depende de resultJson.report.pdfPath ni de ningún archivo report.pdf en disco generado
   // por otro proceso (ver ReportPdfService).
+  //
+  // MEASUREMENT GAP P1-04 ("PDF descargado"): el listener de `finish` se registra ANTES de
+  // `stream.pipe(res)` — evita la carrera de que la respuesta pudiera completarse (síncronamente
+  // en un mock, o por buffering interno) antes de que el listener exista. Solo `finish` (el
+  // servidor terminó de ENTREGAR la respuesta) dispara markPdfDownloaded — nunca se escucha
+  // `close`: un cierre prematuro (cliente desconectado antes de `finish`) simplemente nunca
+  // dispara nada, y un `close` que llega DESPUÉS de `finish` (comportamiento normal del socket
+  // subyacente) tampoco tiene ningún handler que reaccione — no hay dos escrituras que puedan
+  // contradecirse porque solo existe una. Si la generación falla o el stream de pdfmake emite un
+  // error a mitad de camino, `res.end()` nunca se invoca y `finish` nunca se dispara (comportamiento
+  // real de Node: `.pipe()` no propaga errores de la fuente al destino ni lo cierra por su cuenta)
+  // — nada que agregar acá para que "stream fallido no marca" ya sea cierto por construcción.
   @UseGuards(JwtAuthGuard)
   @Get('analysis/:id/report/pdf')
   async downloadPdfReport(
@@ -121,6 +133,16 @@ export class AnalysisController {
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // .once(): defensivo ante un mock/stream defectuoso que emitiera 'finish' más de una vez —
+    // el propio UPDATE set-once en el service ya lo garantiza a nivel de datos, esto evita
+    // encolar una segunda llamada innecesaria a nivel de proceso. El .catch() es belt-and-suspenders:
+    // markPdfDownloaded ya nunca rechaza por su cuenta (try/catch interno, ver el service), pero la
+    // respuesta HTTP ya está completa en este punto — ninguna futura regresión de esa garantía
+    // interna debe poder convertirse en un unhandled rejection.
+    res.once('finish', () => {
+      this.analysisService.markPdfDownloaded(analysis.id).catch(() => {});
+    });
 
     stream.pipe(res);
     stream.end();
@@ -148,6 +170,19 @@ export class AnalysisController {
     @Req() req: AuthenticatedRequest,
   ) {
     return this.analysisService.findOneOwnedWithVerdict(id, req.user.sub);
+  }
+
+  // MEASUREMENT GAP P1-03: acknowledgement explícito, separado a propósito de GET
+  // /analysis/:id — mezclar consumo (GET) con escritura (POST) sobre el mismo endpoint
+  // ensuciaría un endpoint que también usan otras superficies (ver AnalysisService.
+  // markResultViewed). Nunca devuelve resultJson.
+  @UseGuards(JwtAuthGuard)
+  @Post('analysis/:id/result-viewed')
+  markResultViewed(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.analysisService.markResultViewed(id, req.user.sub);
   }
 
   // Ruta histórica. El alias 'analysis/field/:fieldId' es el nombre preferido

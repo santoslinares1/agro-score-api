@@ -18,6 +18,14 @@ describe('WeeklyAnalysisSnapshotService', () => {
     findOne: jest.Mock;
     create: jest.Mock;
     save: jest.Mock;
+    createQueryBuilder: jest.Mock;
+  };
+  let queryBuilderMock: {
+    update: jest.Mock;
+    set: jest.Mock;
+    where: jest.Mock;
+    andWhere: jest.Mock;
+    execute: jest.Mock;
   };
   let fieldsService: jest.Mocked<Pick<FieldsService, 'findOne'>>;
   let weeklyTechnicalVerdictService: jest.Mocked<
@@ -114,6 +122,14 @@ describe('WeeklyAnalysisSnapshotService', () => {
     }) as Field;
 
   beforeEach(async () => {
+    queryBuilderMock = {
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ affected: 1 }),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         WeeklyAnalysisSnapshotService,
@@ -126,6 +142,10 @@ describe('WeeklyAnalysisSnapshotService', () => {
             save: jest.fn((data) =>
               Promise.resolve({ id: data.id ?? 'snapshot-1', ...data }),
             ),
+            // MEASUREMENT GAP P1-05: cadena update()/set()/where()/andWhere()/execute() de
+            // markViewed — no valida SQL real (eso lo prueba el e2e contra Postgres), solo
+            // permite que el service ejecute la sentencia sin romper el mock.
+            createQueryBuilder: jest.fn(() => queryBuilderMock),
           },
         },
         { provide: FieldsService, useValue: { findOne: jest.fn() } },
@@ -477,6 +497,127 @@ describe('WeeklyAnalysisSnapshotService', () => {
           summary: ['Primer reporte semanal disponible para este campo.'],
         }),
       );
+    });
+  });
+
+  // MEASUREMENT GAP P1-05 ("Monitoreo semanal consultado") — POST
+  // fields/:fieldId/weekly-analysis-snapshots/:snapshotId/viewed. La concurrencia real (dos
+  // llamadas disputando el mismo UPDATE guardado por "firstViewedAt" IS NULL) y la migración en
+  // sí NO se prueban acá con mocks — eso vive en
+  // test/weekly-analysis-snapshot-viewed.e2e-spec.ts contra Postgres real; un mock solo puede
+  // demostrar que el service arma la query correcta y respeta el mismo gate de ownership.
+  describe('markViewed (MEASUREMENT GAP P1-05)', () => {
+    it('propietario + snapshot existente: fija el timestamp (lee el valor ya commiteado, nunca lo fabrica)', async () => {
+      const viewedAt = new Date('2026-08-24T12:00:00.000Z');
+      fieldsService.findOne.mockResolvedValue(buildField());
+      snapshotRepository.findOne
+        .mockResolvedValueOnce({ id: 'snapshot-1', fieldId: 'field-1' }) // lookup de ownership del snapshot.
+        .mockResolvedValueOnce({ id: 'snapshot-1', firstViewedAt: viewedAt }); // re-read post-UPDATE.
+
+      const result = await service.markViewed(
+        'field-1',
+        'snapshot-1',
+        'user-A',
+      );
+
+      expect(result).toEqual({ firstViewedAt: viewedAt.toISOString() });
+    });
+
+    it('arma el UPDATE con el guard set-once ("firstViewedAt" IS NULL), scoped por fieldId, y un timestamp de SERVIDOR, nunca uno del caller', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      snapshotRepository.findOne
+        .mockResolvedValueOnce({ id: 'snapshot-1', fieldId: 'field-1' })
+        .mockResolvedValueOnce({
+          id: 'snapshot-1',
+          firstViewedAt: new Date('2026-08-24T12:00:00.000Z'),
+        });
+
+      await service.markViewed('field-1', 'snapshot-1', 'user-A');
+
+      expect(queryBuilderMock.update).toHaveBeenCalledWith(
+        WeeklyAnalysisSnapshot,
+      );
+      expect(queryBuilderMock.set).toHaveBeenCalledWith({
+        firstViewedAt: expect.any(Function), // función SQL cruda (now()), nunca un Date de Node.
+      });
+      const [setCall] = queryBuilderMock.set.mock.calls;
+      expect(setCall[0].firstViewedAt()).toBe('now()');
+      expect(queryBuilderMock.where).toHaveBeenCalledWith('id = :id', {
+        id: 'snapshot-1',
+      });
+      expect(queryBuilderMock.andWhere).toHaveBeenCalledWith(
+        '"fieldId" = :fieldId',
+        { fieldId: 'field-1' },
+      );
+      expect(queryBuilderMock.andWhere).toHaveBeenCalledWith(
+        '"firstViewedAt" IS NULL',
+      );
+      expect(queryBuilderMock.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('no tiene ningún parámetro de timestamp en su firma — solo (fieldId, snapshotId, userId)', () => {
+      expect(service.markViewed.length).toBe(3);
+    });
+
+    it('reutilización (llamada repetida sobre un snapshot ya confirmado): responde éxito con el MISMO timestamp original, sin re-set', async () => {
+      const originalViewedAt = new Date('2026-08-24T12:00:00.000Z');
+      fieldsService.findOne.mockResolvedValue(buildField());
+      snapshotRepository.findOne
+        .mockResolvedValueOnce({ id: 'snapshot-1', fieldId: 'field-1' })
+        .mockResolvedValueOnce({
+          id: 'snapshot-1',
+          firstViewedAt: originalViewedAt, // ya estaba poblado ANTES de esta llamada.
+        });
+
+      const result = await service.markViewed(
+        'field-1',
+        'snapshot-1',
+        'user-A',
+      );
+
+      // El UPDATE se ejecuta igual (su propio guard "IS NULL" en Postgres real es lo que
+      // garantiza que no pise el valor — ver el e2e), pero la respuesta refleja el valor YA
+      // COMMITEADO que el re-read devuelve, no uno nuevo fabricado localmente.
+      expect(result).toEqual({
+        firstViewedAt: originalViewedAt.toISOString(),
+      });
+    });
+
+    it('NEGATIVO: campo ajeno conserva la semántica 404 vigente de findOne, sin tocar el UPDATE', async () => {
+      fieldsService.findOne.mockRejectedValue(
+        new NotFoundException('Campo no encontrado.'),
+      );
+
+      await expect(
+        service.markViewed('field-1', 'snapshot-1', 'user-B'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(snapshotRepository.findOne).not.toHaveBeenCalled();
+      expect(queryBuilderMock.update).not.toHaveBeenCalled();
+    });
+
+    it('NEGATIVO: snapshot inexistente o de otro fieldId conserva la semántica 404 vigente de findOne, sin tocar el UPDATE', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      snapshotRepository.findOne.mockResolvedValueOnce(null); // no matchea id+fieldId.
+
+      await expect(
+        service.markViewed('field-1', 'snapshot-ajeno', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(queryBuilderMock.update).not.toHaveBeenCalled();
+    });
+
+    it('NEGATIVO: un fallo del UPDATE se propaga tal cual, sin devolver una respuesta fabricada', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      snapshotRepository.findOne.mockResolvedValueOnce({
+        id: 'snapshot-1',
+        fieldId: 'field-1',
+      });
+      queryBuilderMock.execute.mockRejectedValueOnce(
+        new Error('connection terminated'),
+      );
+
+      await expect(
+        service.markViewed('field-1', 'snapshot-1', 'user-A'),
+      ).rejects.toThrow('connection terminated');
     });
   });
 });

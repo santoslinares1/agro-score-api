@@ -14,7 +14,25 @@ import { Field } from '../../fields/entities/field.entity';
 import { User } from '../../users/user.entity';
 import { FieldAnalysisSchedule } from './field-analysis-schedule.entity';
 
-export type ScheduledRunStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'email_sent';
+export type ScheduledRunStatus =
+  | 'pending'
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'email_sent';
+
+/**
+ * Entry point que efectivamente CREÓ esta fila (MEASUREMENT GAP P1-01). Los dos únicos entry
+ * points confirmados que llegan a ScheduledAnalysisRunnerService.triggerRun:
+ * - 'automatic_dispatcher': ScheduledAnalysisRunnerService.processDueSchedules (el scheduler
+ *   periódico).
+ * - 'user_run_now': ScheduledAnalysisRunnerService.runNow (POST .../analysis-schedule/run-now).
+ * `null` es el único valor para filas creadas ANTES de este rollout — no existe una tercera
+ * categoría "desconocido" en el union a propósito: el histórico se representa con `null`, nunca
+ * con un string que pueda confundirse con una clasificación real. No agregar un valor nuevo acá
+ * sin agregar, en el mismo cambio, el entry point real que lo origina (ver triggerRun).
+ */
+export type ScheduledRunTriggerSource = 'automatic_dispatcher' | 'user_run_now';
 
 /**
  * Una corrida puntual de un FieldAnalysisSchedule (disparada por el dispatcher automático o por
@@ -32,7 +50,12 @@ export type ScheduledRunStatus = 'pending' | 'processing' | 'completed' | 'faile
 @Index(['createdAt'])
 @Index(['startedAt'])
 @Index(['scheduledFor'])
-@Index('UQ_scheduled_analysis_runs_schedule_week', ['scheduleId', 'scheduledFor'], { unique: true })
+@Index(['triggerSource'])
+@Index(
+  'UQ_scheduled_analysis_runs_schedule_week',
+  ['scheduleId', 'scheduledFor'],
+  { unique: true },
+)
 export class ScheduledAnalysisRun {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -40,7 +63,10 @@ export class ScheduledAnalysisRun {
   @Column({ type: 'uuid' })
   scheduleId: string;
 
-  @ManyToOne(() => FieldAnalysisSchedule, { onDelete: 'CASCADE', nullable: false })
+  @ManyToOne(() => FieldAnalysisSchedule, {
+    onDelete: 'CASCADE',
+    nullable: false,
+  })
   @JoinColumn({ name: 'scheduleId' })
   schedule?: FieldAnalysisSchedule;
 
@@ -88,6 +114,16 @@ export class ScheduledAnalysisRun {
 
   @Column({ type: 'jsonb', nullable: true })
   metadata: Record<string, unknown> | null;
+
+  /**
+   * Ver ScheduledRunTriggerSource arriba. Se persiste UNA sola vez, al crear la fila (ver
+   * ScheduledAnalysisRunnerService.triggerRun) — nunca se reescribe al reutilizar una corrida
+   * existente ni al perder la carrera de unique(scheduleId, scheduledFor). `null` para toda fila
+   * creada antes de este rollout: no se infiere desde metadata.dateRange, lastRunAt ni ningún
+   * otro campo (backfill heurístico imposible de forma confiable, ver el ticket de origen).
+   */
+  @Column({ type: 'varchar', nullable: true })
+  triggerSource: ScheduledRunTriggerSource | null;
 
   @CreateDateColumn()
   createdAt: Date;

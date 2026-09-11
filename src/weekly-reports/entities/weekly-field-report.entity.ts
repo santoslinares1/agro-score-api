@@ -94,6 +94,28 @@ export class WeeklyFieldReport {
   @Column({ type: 'jsonb' })
   indices: string[];
 
+  /**
+   * MEASUREMENT GAP P1-02 ("Cobertura completa lote × índice"): snapshot INMUTABLE de los IDs de
+   * `FieldLot` efectivamente enviados a `PythonWorkerService.runWeeklyReport` al crear este
+   * reporte (los mismos `includedLots` ya filtrados por `includeInProductivityClassification` —
+   * ver WeeklyReportsService.create). Junto con `indices`, permite derivar más adelante la
+   * población esperada lote×índice (`expectedLotIds × indices`) sin depender del estado actual
+   * del Field, que puede cambiar (lotes agregados/eliminados/excluidos) después de creado el
+   * reporte.
+   *
+   * Deliberadamente solo IDs, sin FK por elemento: tienen que sobrevivir conceptualmente a que el
+   * FieldLot referenciado se borre (GEOMETRY-1 permite el borrado físico de lotes) — a diferencia
+   * de WeeklyLotIndexObservation.lotId, que sí es una FK real y queda null en ese caso.
+   *
+   * Se fija UNA sola vez, en `create()`, antes de disparar `processInBackground` — nunca se
+   * recalcula al completar/fallar el reporte ni se reconstruye desde `result.lots` (eso sería el
+   * resultado devuelto, no lo pedido). `null` para todo reporte creado antes de este rollout —
+   * nunca se infiere desde WeeklyLotIndexObservation ni desde los FieldLot actuales (backfill
+   * heurístico imposible de forma confiable, ver el ticket de origen).
+   */
+  @Column({ type: 'jsonb', nullable: true })
+  expectedLotIds: string[] | null;
+
   @Column({ type: 'jsonb', nullable: true })
   warnings: string[] | null;
 

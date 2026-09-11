@@ -12,6 +12,12 @@ export type AdminAuditAction =
   | 'admin.user.updated'
   | 'admin.user.deactivated'
   | 'admin.user.role_changed'
+  // MEASUREMENT GAP P1-06 ("Self-service frente a asistencia"): acción específica, nunca
+  // 'admin.user.updated' — distingue "el equipo empezó a asistir materialmente a este usuario"
+  // de cualquier otro cambio de datos del usuario. Ver AdminService.
+  // markActivationAssistanceStarted; solo se registra en la transición REAL (primera marca),
+  // nunca en una repetición sobre un usuario ya marcado.
+  | 'admin.user.activation_assistance_started'
   | 'admin.access_request.updated'
   | 'admin.access_request.converted'
   | 'admin.invitation.created'

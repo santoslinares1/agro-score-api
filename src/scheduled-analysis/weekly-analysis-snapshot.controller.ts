@@ -1,4 +1,4 @@
-import { Controller, Get, Param, ParseUUIDPipe, Query, Req, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, ParseUUIDPipe, Post, Query, Req, UseGuards } from '@nestjs/common';
 import type { Request } from 'express';
 
 import { AuthenticatedUser } from '../auth/jwt.strategy';
@@ -38,5 +38,19 @@ export class WeeklyAnalysisSnapshotController {
     @Req() req: AuthenticatedRequest,
   ) {
     return this.snapshotService.findOne(fieldId, snapshotId, req.user.sub);
+  }
+
+  // MEASUREMENT GAP P1-05 ("Monitoreo semanal consultado"): acknowledgement explícito, separado
+  // a propósito de cualquier GET (list/latest/:snapshotId) — devolver un snapshot nunca implica
+  // que una persona lo vio en la sección principal (list/latest se piden aunque
+  // field-weekly-monitoring esté fuera de vista). Nunca acepta timestamp ni identidad en el body
+  // (ver WeeklyAnalysisSnapshotService.markViewed).
+  @Post(':snapshotId/viewed')
+  markViewed(
+    @Param('fieldId', ParseUUIDPipe) fieldId: string,
+    @Param('snapshotId', ParseUUIDPipe) snapshotId: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.snapshotService.markViewed(fieldId, snapshotId, req.user.sub);
   }
 }

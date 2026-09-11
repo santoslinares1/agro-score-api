@@ -14,7 +14,10 @@ import { EmailService } from '../email/email.service';
 import { FieldsService } from '../fields/fields.service';
 import { UsersService } from '../users/users.service';
 import { FieldAnalysisSchedule } from './entities/field-analysis-schedule.entity';
-import { ScheduledAnalysisRun } from './entities/scheduled-analysis-run.entity';
+import {
+  ScheduledAnalysisRun,
+  ScheduledRunTriggerSource,
+} from './entities/scheduled-analysis-run.entity';
 import { WeeklyAnalysisSnapshot } from './entities/weekly-analysis-snapshot.entity';
 import { computeScheduledAnalysisDateRange } from './scheduled-analysis-date-range.util';
 import {
@@ -96,7 +99,7 @@ export class ScheduledAnalysisRunnerService {
 
     for (const schedule of dueSchedules) {
       try {
-        await this.triggerRun(schedule, now);
+        await this.triggerRun(schedule, now, 'automatic_dispatcher');
       } catch (error) {
         this.logger.error(
           `[scheduled-analysis] Fallo procesando schedule ${schedule.id} (fieldId=${schedule.fieldId}): ${this.describe(error)}`,
@@ -109,10 +112,18 @@ export class ScheduledAnalysisRunnerService {
    * Dispara (o reutiliza) la corrida de la semana de `now` para `schedule`, y siempre recalcula
    * nextRunAt al final — así el dispatcher nunca vuelve a seleccionar el mismo schedule en el
    * próximo tick, sin importar si esta llamada creó una corrida nueva o reencontró una existente.
+   *
+   * `triggerSource` (MEASUREMENT GAP P1-01) identifica el entry point que llama — SIN default: los
+   * dos únicos callers reales (processDueSchedules, runNow) lo pasan siempre explícito, así que
+   * ningún caller nuevo puede crear una fila sin clasificación por omisión silenciosa. Se persiste
+   * SOLO en la rama que efectivamente inserta una fila nueva más abajo — `existingRun` (acá) y el
+   * loser de la carrera de unique (ver saveNewRun) devuelven la fila tal cual ya existe, sin tocar
+   * su triggerSource: ese valor describe quién la CREÓ, no quién la reutilizó después.
    */
   async triggerRun(
     schedule: FieldAnalysisSchedule,
     now: Date,
+    triggerSource: ScheduledRunTriggerSource,
   ): Promise<ScheduledAnalysisRun> {
     const scheduledFor = resolveScheduledForDate(now, schedule);
 
@@ -144,6 +155,7 @@ export class ScheduledAnalysisRunnerService {
         status: 'pending',
         scheduledFor,
         metadata: { dateRange },
+        triggerSource,
       }),
       schedule.id,
       scheduledFor,
@@ -730,7 +742,7 @@ export class ScheduledAnalysisRunnerService {
     // triggerRun ya dedupea por (scheduleId, scheduledFor) — mismo mecanismo que usa el
     // dispatcher automático, así que "Ejecutar ahora" nunca duplica una corrida ya disparada
     // (automática o manual) para la semana actual.
-    return this.triggerRun(schedule, new Date());
+    return this.triggerRun(schedule, new Date(), 'user_run_now');
   }
 
   private summarizeError(error: unknown): string {

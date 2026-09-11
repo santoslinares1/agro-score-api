@@ -318,6 +318,164 @@ describe('WeeklyReportsService', () => {
         expect(weeklyReportRepository.count).not.toHaveBeenCalled();
       });
     });
+
+    // MEASUREMENT GAP P1-02: snapshot inmutable de la población esperada (lotes enviados al
+    // Worker) — ver WeeklyFieldReport.expectedLotIds.
+    describe('expectedLotIds (MEASUREMENT GAP P1-02)', () => {
+      it('persiste exactamente los IDs de los lotes incluidos, en el mismo orden', async () => {
+        const lotA = buildLot({ id: 'lot-a', includeInProductivityClassification: true });
+        const lotB = buildLot({ id: 'lot-b', includeInProductivityClassification: true });
+        fieldsService.findOne.mockResolvedValue(buildField({ lots: [lotA, lotB] }));
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        jest.spyOn(service as any, 'processInBackground').mockResolvedValue(undefined);
+
+        await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        expect(weeklyReportRepository.save).toHaveBeenCalledWith(
+          expect.objectContaining({ expectedLotIds: ['lot-a', 'lot-b'] }),
+        );
+      });
+
+      it('NEGATIVO: los lotes excluidos de la clasificación productiva no aparecen en expectedLotIds', async () => {
+        const included = buildLot({ id: 'lot-included', includeInProductivityClassification: true });
+        const excluded = buildLot({ id: 'lot-excluded', includeInProductivityClassification: false });
+        fieldsService.findOne.mockResolvedValue(buildField({ lots: [included, excluded] }));
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        jest.spyOn(service as any, 'processInBackground').mockResolvedValue(undefined);
+
+        await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        expect(weeklyReportRepository.save).toHaveBeenCalledWith(
+          expect.objectContaining({ expectedLotIds: ['lot-included'] }),
+        );
+      });
+
+      it('la población congelada coincide exactamente con los lotes que reciben processInBackground/el Worker — misma fuente, nunca dos cálculos separados', async () => {
+        const lotA = buildLot({ id: 'lot-a', includeInProductivityClassification: true });
+        const lotB = buildLot({ id: 'lot-b', includeInProductivityClassification: true });
+        const excluded = buildLot({ id: 'lot-c', includeInProductivityClassification: false });
+        fieldsService.findOne.mockResolvedValue(
+          buildField({ lots: [lotA, lotB, excluded] }),
+        );
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        const processInBackgroundSpy = jest
+          .spyOn(service as any, 'processInBackground')
+          .mockResolvedValue(undefined);
+
+        await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        const savedCall = weeklyReportRepository.save.mock.calls[0][0];
+        const [, , includedLotsArg] = processInBackgroundSpy.mock.calls[0];
+        expect((includedLotsArg as FieldLot[]).map((lot) => lot.id)).toEqual(
+          savedCall.expectedLotIds,
+        );
+      });
+
+      it('crea una copia estable: un create() posterior con otra población no muta el array ya persistido por el primero', async () => {
+        fieldsService.findOne.mockResolvedValue(
+          buildField({ lots: [buildLot({ id: 'lot-a' })] }),
+        );
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        jest.spyOn(service as any, 'processInBackground').mockResolvedValue(undefined);
+
+        await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+        const firstExpectedLotIds =
+          weeklyReportRepository.save.mock.calls[0][0].expectedLotIds;
+        expect(firstExpectedLotIds).toEqual(['lot-a']);
+
+        // Segundo create(), población totalmente distinta — si expectedLotIds compartiera alguna
+        // estructura mutable entre llamadas, este segundo cálculo contaminaría al primero.
+        fieldsService.findOne.mockResolvedValue(
+          buildField({
+            lots: [buildLot({ id: 'lot-b' }), buildLot({ id: 'lot-c' })],
+          }),
+        );
+        await service.create(
+          'field-1',
+          { campaignStart: '2025-11-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        expect(firstExpectedLotIds).toEqual(['lot-a']); // intacto, sin mutar en el lugar.
+      });
+
+      it('reutilizar un reporte existente (fast-path) nunca recalcula expectedLotIds', async () => {
+        const existing = { id: 'report-existing', status: 'completed', expectedLotIds: ['lot-old'] };
+        fieldsService.findOne.mockResolvedValue(
+          buildField({ lots: [buildLot({ id: 'lot-new' })] }), // población actual distinta — no debe importar.
+        );
+        weeklyReportRepository.findOne.mockResolvedValue(existing);
+
+        const result = await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        expect(result).toBe(existing);
+        expect(result.expectedLotIds).toEqual(['lot-old']); // sin cambios.
+        expect(weeklyReportRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('un retry (nueva fila tras un failed previo) congela la población VIGENTE en ese segundo intento, no la del intento fallido', async () => {
+        // Primer intento: falla antes de llegar acá (no hay fila 'no-failed' que reutilizar).
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        jest.spyOn(service as any, 'processInBackground').mockResolvedValue(undefined);
+
+        // Entre el intento fallido y el retry, el Field ganó un lote nuevo.
+        fieldsService.findOne.mockResolvedValue(
+          buildField({
+            lots: [buildLot({ id: 'lot-a' }), buildLot({ id: 'lot-nuevo' })],
+          }),
+        );
+
+        await service.create(
+          'field-1',
+          { campaignStart: '2025-10-01', targetDate: '2026-08-21' },
+          'user-A',
+        );
+
+        expect(weeklyReportRepository.save).toHaveBeenCalledWith(
+          expect.objectContaining({ expectedLotIds: ['lot-a', 'lot-nuevo'] }),
+        );
+      });
+
+      it('request con índices duplicados: se persiste (y se envía al Worker) una lista sin duplicados, preservando el orden de la primera aparición', async () => {
+        fieldsService.findOne.mockResolvedValue(buildField());
+        weeklyReportRepository.findOne.mockResolvedValue(null);
+        jest.spyOn(service as any, 'processInBackground').mockResolvedValue(undefined);
+
+        await service.create(
+          'field-1',
+          {
+            campaignStart: '2025-10-01',
+            targetDate: '2026-08-21',
+            indices: ['NDMI', 'NDVI', 'NDMI', 'NDVI'],
+          },
+          'user-A',
+        );
+
+        expect(weeklyReportRepository.save).toHaveBeenCalledWith(
+          expect.objectContaining({ indices: ['NDMI', 'NDVI'] }),
+        );
+      });
+    });
   });
 
   describe('findAll', () => {
@@ -605,6 +763,78 @@ describe('WeeklyReportsService', () => {
           errorMessage: safeMessage,
         }),
       );
+    });
+
+    // MEASUREMENT GAP P1-02: expectedLotIds se fija UNA sola vez en create() — ninguna escritura
+    // posterior (completar, fallar) debe siquiera mencionarlo en su payload de `.update()`.
+    describe('expectedLotIds no se toca después de creado el reporte (MEASUREMENT GAP P1-02)', () => {
+      it('persistResult (reporte completed) no incluye expectedLotIds en su update()', async () => {
+        pythonWorkerService.runWeeklyReport.mockResolvedValue(workerResultBase);
+
+        await (service as any).processInBackground('report-1', buildField(), buildField().lots, {
+          campaignStart: '2025-10-01',
+          campaignEnd: null,
+          targetDate: '2026-08-21',
+          indices: ['NDVI', 'NDMI'],
+          includeNdreExperimental: false,
+        });
+
+        const [, payload] = weeklyReportRepository.update.mock.calls[0];
+        expect(payload).not.toHaveProperty('expectedLotIds');
+      });
+
+      it('markFailed (reporte failed) no incluye expectedLotIds en su update()', async () => {
+        pythonWorkerService.runWeeklyReport.mockRejectedValue(
+          new Error('Fallo simulado.'),
+        );
+
+        await (service as any).processInBackground('report-1', buildField(), buildField().lots, {
+          campaignStart: '2025-10-01',
+          campaignEnd: null,
+          targetDate: '2026-08-21',
+          indices: ['NDVI', 'NDMI'],
+          includeNdreExperimental: false,
+        });
+
+        const [, payload] = weeklyReportRepository.update.mock.calls[0];
+        expect(payload).not.toHaveProperty('expectedLotIds');
+      });
+
+      it('observaciones faltantes (el worker omite un lote/índice) no reducen expectedLotIds — el update() de persistResult sigue sin tocarlo, sin importar cuántas observaciones vuelvan', async () => {
+        // El worker responde con MENOS observaciones de las esperadas (omite pares) — persistResult
+        // igual no debe intentar "ajustar" expectedLotIds a lo efectivamente recibido.
+        pythonWorkerService.runWeeklyReport.mockResolvedValue({
+          ...workerResultBase,
+          lots: [], // ninguna observación devuelta, aunque se hayan pedido lotes.
+        });
+
+        await (service as any).processInBackground('report-1', buildField(), buildField().lots, {
+          campaignStart: '2025-10-01',
+          campaignEnd: null,
+          targetDate: '2026-08-21',
+          indices: ['NDVI', 'NDMI'],
+          includeNdreExperimental: false,
+        });
+
+        expect(observationRepository.save).not.toHaveBeenCalled();
+        const [, payload] = weeklyReportRepository.update.mock.calls[0];
+        expect(payload).not.toHaveProperty('expectedLotIds');
+      });
+
+      it('un reporte histórico con expectedLotIds=null se lee sin romper — findOneWithObservations no exige el campo', async () => {
+        const historical = {
+          id: 'report-old',
+          fieldId: 'field-1',
+          expectedLotIds: null,
+          observations: [],
+        };
+        fieldsService.findOne.mockResolvedValue(buildField());
+        weeklyReportRepository.findOne.mockResolvedValue(historical);
+
+        const result = await service.findOneWithObservations('field-1', 'report-old', 'user-A');
+
+        expect(result.expectedLotIds).toBeNull();
+      });
     });
 
     it('usa deltaVsPrevious del worker tal cual si viene no nulo, sin consultar historial', async () => {

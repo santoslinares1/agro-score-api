@@ -1467,6 +1467,47 @@ export class AdminService {
   }
 
   /**
+   * MEASUREMENT GAP P1-06 ("Self-service frente a asistencia") — POST
+   * /admin/users/:id/activation-assistance. Un owner/admin confirma explícitamente que el
+   * equipo empezó a asistir materialmente a este usuario (nunca automático: no dispara esto
+   * ningún otro flujo — crear la cuenta, crear una invitación, resetear password, revisar un
+   * Analysis, ni P1-01 a P1-05). 404 genérico si el usuario no existe, mismo criterio que el
+   * resto de las rutas `users/:id`.
+   *
+   * Set-once real en UsersService (ver ese método): esta capa solo decide SI auditar, no cómo
+   * escribir. La auditoría se registra únicamente cuando `wasNewlySet` es true — una llamada
+   * repetida sobre un usuario ya marcado responde éxito con el mismo timestamp, pero NUNCA
+   * fabrica una segunda entrada de auditoría para la misma transición de negocio.
+   */
+  async markActivationAssistanceStarted(
+    id: string,
+    actor: AuditActorContext,
+  ): Promise<PublicUser> {
+    const target = await this.usersService.findById(id);
+
+    if (!target) {
+      throw new NotFoundException('Usuario no encontrado.');
+    }
+
+    const { user, wasNewlySet } =
+      await this.usersService.markActivationAssistanceStarted(id);
+
+    if (wasNewlySet) {
+      await this.auditLogService.record({
+        actor,
+        action: 'admin.user.activation_assistance_started',
+        targetType: 'user',
+        targetId: id,
+        after: {
+          activationAssistanceStartedAt: user.activationAssistanceStartedAt,
+        },
+      });
+    }
+
+    return this.usersService.toPublicUser(user);
+  }
+
+  /**
    * SEC-001: solo un actor con role `owner` puede OTORGAR el role `owner` — a otro usuario o a sí
    * mismo — desde cualquiera de los 4 endpoints que aceptan un `role` de destino (createUser,
    * updateUser, createInvitation, createUserFromAccessRequest). Antes de esta ficha, el guard de

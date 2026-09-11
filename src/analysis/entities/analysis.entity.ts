@@ -145,6 +145,40 @@ export class Analysis {
   @Column({ type: 'timestamp', nullable: true })
   lastRetriedAt: Date | null;
 
+  /**
+   * MEASUREMENT GAP P1-03 ("Resultado técnico consultado"): cuándo un usuario con ownership
+   * confirmó, por primera vez, haber recibido y aceptado el resultado completo de este Analysis
+   * en la pantalla principal (ver AnalysisService.markResultViewed / POST
+   * /analysis/:id/result-viewed) — nunca `completedAt` (eso mide entrega técnica del pipeline,
+   * no consulta humana), ni polling, ni report preview/PDF, que deliberadamente NO producen esta
+   * columna. Set-once: la primera escritura fija el valor, cualquier llamada posterior
+   * (reutilización, retry, concurrencia) lo conserva sin cambios — ver el UPDATE guardado por
+   * `"firstResultViewedAt" IS NULL` en markResultViewed, nunca un valor enviado por el cliente.
+   * `null` para todo Analysis anterior a este rollout — no existe backfill confiable (no se
+   * guardaba esta señal antes), así que null significa "sin cobertura histórica", nunca "nunca
+   * consultado".
+   */
+  @Column({ type: 'timestamp', nullable: true })
+  firstResultViewedAt: Date | null;
+
+  /**
+   * MEASUREMENT GAP P1-04 ("PDF descargado"): cuándo el servidor completó, por primera vez, una
+   * respuesta HTTP PDF autorizada para este Analysis (ver AnalysisService.markPdfDownloaded /
+   * GET /analysis/:id/report/pdf) — nunca el inicio de la generación, ni el fin del stream
+   * generador de pdfmake, ni ningún evento del lado del cliente (click, recepción confirmada,
+   * apertura). La señal real es el evento `finish` de la respuesta HTTP (el servidor terminó de
+   * entregarla), nunca `close` (que también puede significar una desconexión ANTES de
+   * terminar). Set-once, igual criterio que `firstResultViewedAt`: la primera respuesta
+   * completada fija el valor, cualquier descarga posterior o concurrente lo conserva — ver el
+   * UPDATE guardado por `"firstPdfDownloadedAt" IS NULL` en markPdfDownloaded, nunca un valor
+   * enviado por el cliente. `null` para todo Analysis anterior a este rollout — no existe
+   * backfill confiable (report preview, `resultJson`, `firstResultViewedAt` y el envío de email
+   * no implican que el PDF se haya descargado), así que null significa "sin cobertura
+   * histórica", nunca "nunca descargado".
+   */
+  @Column({ type: 'timestamp', nullable: true })
+  firstPdfDownloadedAt: Date | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

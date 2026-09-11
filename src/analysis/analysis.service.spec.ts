@@ -94,6 +94,7 @@ describe('AnalysisService', () => {
     innerJoin: jest.Mock;
     select: jest.Mock;
     where: jest.Mock;
+    andWhere: jest.Mock;
     orderBy: jest.Mock;
     getMany: jest.Mock;
     getOne: jest.Mock;
@@ -101,6 +102,9 @@ describe('AnalysisService', () => {
     into: jest.Mock;
     values: jest.Mock;
     getQueryAndParameters: jest.Mock;
+    update: jest.Mock;
+    set: jest.Mock;
+    execute: jest.Mock;
   };
   /** F04: última carga pasada a queryBuilderMock.values({...}) — permite que el mock de
    * analysisRepository.query "eco" esos mismos campos en la fila devuelta, igual que el viejo
@@ -114,6 +118,7 @@ describe('AnalysisService', () => {
       innerJoin: jest.fn().mockReturnThis(),
       select: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
       orderBy: jest.fn().mockReturnThis(),
       getMany: jest.fn().mockResolvedValue([]),
       getOne: jest.fn().mockResolvedValue(null),
@@ -124,6 +129,12 @@ describe('AnalysisService', () => {
         return queryBuilderMock;
       }),
       getQueryAndParameters: jest.fn(() => ['INSERT INTO "analysis" (...) VALUES (...)', []]),
+      // MEASUREMENT GAP P1-03: cadena update()/set()/where()/andWhere()/execute() de
+      // markResultViewed — no valida SQL real (eso lo prueba el e2e contra Postgres), solo
+      // permite que el service ejecute la sentencia sin romper el mock.
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ affected: 1 }),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -761,6 +772,232 @@ describe('AnalysisService', () => {
       expect(
         analysisVerdictService.findResponseByAnalysisId,
       ).not.toHaveBeenCalled();
+    });
+  });
+
+  // MEASUREMENT GAP P1-03 ("Resultado técnico consultado") — POST /analysis/:id/result-viewed.
+  // La concurrencia real (dos llamadas disputando el mismo UPDATE guardado por
+  // "firstResultViewedAt" IS NULL) NO se prueba acá con mocks — eso vive en
+  // test/analysis-result-viewed.e2e-spec.ts contra Postgres real; un mock solo puede demostrar
+  // que el service arma la query correcta, no que Postgres serializa dos INSERTs/UPDATEs
+  // concurrentes.
+  describe('markResultViewed (MEASUREMENT GAP P1-03)', () => {
+    it('propietario + Finalizado: fija el timestamp (lee el valor ya commiteado, nunca lo fabrica)', async () => {
+      const viewedAt = new Date('2026-01-05T12:00:00.000Z');
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Finalizado',
+        firstResultViewedAt: viewedAt,
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      const result = await service.markResultViewed('analysis-1', 'user-A');
+
+      expect(result).toEqual({ firstResultViewedAt: viewedAt.toISOString() });
+    });
+
+    it('la respuesta nunca incluye resultJson ni ningún otro campo del análisis', async () => {
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Finalizado',
+        firstResultViewedAt: new Date('2026-01-05T12:00:00.000Z'),
+        resultJson: { mode: 'python-worker-v2' } as any,
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      const result = await service.markResultViewed('analysis-1', 'user-A');
+
+      expect(Object.keys(result)).toEqual(['firstResultViewedAt']);
+    });
+
+    it('arma el UPDATE con el guard set-once ("firstResultViewedAt" IS NULL) y un timestamp de SERVIDOR, nunca uno del caller', async () => {
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Finalizado',
+        firstResultViewedAt: new Date('2026-01-05T12:00:00.000Z'),
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      await service.markResultViewed('analysis-1', 'user-A');
+
+      expect(queryBuilderMock.update).toHaveBeenCalledWith(Analysis);
+      expect(queryBuilderMock.set).toHaveBeenCalledWith({
+        firstResultViewedAt: expect.any(Function), // función SQL cruda (now()), nunca un Date de Node.
+      });
+      const [setCall] = queryBuilderMock.set.mock.calls;
+      expect(setCall[0].firstResultViewedAt()).toBe('now()');
+      expect(queryBuilderMock.where).toHaveBeenCalledWith('id = :id', {
+        id: 'analysis-1',
+      });
+      expect(queryBuilderMock.andWhere).toHaveBeenCalledWith(
+        '"firstResultViewedAt" IS NULL',
+      );
+      expect(queryBuilderMock.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('markResultViewed no tiene ningún parámetro de timestamp en su firma — ningún caller puede inyectar uno', () => {
+      expect(service.markResultViewed.length).toBe(2); // (id, userId) — nada más.
+    });
+
+    it('NEGATIVO: Procesando no escribe — rechaza antes de tocar el repositorio de escritura', async () => {
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Procesando',
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      await expect(
+        service.markResultViewed('analysis-1', 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(queryBuilderMock.update).not.toHaveBeenCalled();
+    });
+
+    it('NEGATIVO: Error no escribe', async () => {
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Error',
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      await expect(
+        service.markResultViewed('analysis-1', 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(queryBuilderMock.update).not.toHaveBeenCalled();
+    });
+
+    it('NEGATIVO: análisis inexistente devuelve 404 (misma semántica que findOneOwned), sin tocar el UPDATE', async () => {
+      analysisRepository.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.markResultViewed('missing', 'user-A'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(queryBuilderMock.update).not.toHaveBeenCalled();
+    });
+
+    it('NEGATIVO: análisis ajeno sigue la semántica de 404 vigente de findOneOwned, sin tocar el UPDATE', async () => {
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Finalizado',
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockRejectedValue(
+        new NotFoundException('Campo no encontrado.'),
+      );
+
+      await expect(
+        service.markResultViewed('analysis-1', 'user-B'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(queryBuilderMock.update).not.toHaveBeenCalled();
+    });
+
+    it('NEGATIVO: un fallo del UPDATE se propaga tal cual, sin devolver una respuesta fabricada', async () => {
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Finalizado',
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      queryBuilderMock.execute.mockRejectedValueOnce(
+        new Error('connection terminated'),
+      );
+
+      await expect(
+        service.markResultViewed('analysis-1', 'user-A'),
+      ).rejects.toThrow('connection terminated');
+    });
+
+    it('reutilización (llamada repetida sobre un análisis ya confirmado): responde éxito con el MISMO timestamp original, sin re-set', async () => {
+      const originalViewedAt = new Date('2026-01-05T12:00:00.000Z');
+      const analysis = buildAnalysis({
+        scope: 'field',
+        fieldId: 'field-1',
+        status: 'Finalizado',
+        firstResultViewedAt: originalViewedAt, // ya estaba poblado ANTES de esta llamada.
+      });
+      analysisRepository.findOne.mockResolvedValue(analysis);
+      fieldsService.findOne.mockResolvedValue(buildField());
+
+      const result = await service.markResultViewed('analysis-1', 'user-A');
+
+      // El UPDATE se ejecuta igual (su propio guard "IS NULL" en Postgres real es lo que
+      // garantiza que no pise el valor — ver el e2e), pero la respuesta refleja el valor
+      // YA COMMITEADO que el re-read devuelve, no uno nuevo fabricado localmente.
+      expect(result).toEqual({
+        firstResultViewedAt: originalViewedAt.toISOString(),
+      });
+    });
+  });
+
+  // MEASUREMENT GAP P1-04 ("PDF descargado") — GET /analysis/:id/report/pdf. La concurrencia
+  // real (dos respuestas terminando simultáneamente) y el lifecycle HTTP real (finish vs. close)
+  // NO se prueban acá con mocks — eso vive en test/analysis-pdf-downloaded.e2e-spec.ts contra
+  // Postgres real; un mock solo puede demostrar que el service arma la query correcta.
+  describe('markPdfDownloaded (MEASUREMENT GAP P1-04)', () => {
+    it('arma el UPDATE con el guard set-once ("firstPdfDownloadedAt" IS NULL) y un timestamp de SERVIDOR, nunca uno del caller', async () => {
+      await service.markPdfDownloaded('analysis-1');
+
+      expect(queryBuilderMock.update).toHaveBeenCalledWith(Analysis);
+      expect(queryBuilderMock.set).toHaveBeenCalledWith({
+        firstPdfDownloadedAt: expect.any(Function), // función SQL cruda (now()), nunca un Date de Node.
+      });
+      const [setCall] = queryBuilderMock.set.mock.calls;
+      expect(setCall[0].firstPdfDownloadedAt()).toBe('now()');
+      expect(queryBuilderMock.where).toHaveBeenCalledWith('id = :id', {
+        id: 'analysis-1',
+      });
+      expect(queryBuilderMock.andWhere).toHaveBeenCalledWith(
+        '"firstPdfDownloadedAt" IS NULL',
+      );
+      expect(queryBuilderMock.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('no tiene ningún parámetro de timestamp en su firma — solo (analysisId)', () => {
+      expect(service.markPdfDownloaded.length).toBe(1);
+    });
+
+    it('llamadas repetidas ejecutan el mismo UPDATE guardado cada vez (el guard "IS NULL" es lo que garantiza set-once contra Postgres real, no un chequeo previo en TS)', async () => {
+      await service.markPdfDownloaded('analysis-1');
+      await service.markPdfDownloaded('analysis-1');
+
+      expect(queryBuilderMock.execute).toHaveBeenCalledTimes(2);
+      // Ambas llamadas piden exactamente lo mismo — es Postgres, no este código, quien decide
+      // cuál (si alguna) efectivamente escribe.
+      expect(queryBuilderMock.where).toHaveBeenNthCalledWith(1, 'id = :id', {
+        id: 'analysis-1',
+      });
+      expect(queryBuilderMock.where).toHaveBeenNthCalledWith(2, 'id = :id', {
+        id: 'analysis-1',
+      });
+    });
+
+    it('FRONTERA DELIBERADA: no valida ownership ni existencia — un id inexistente resuelve igual (0 filas afectadas, nunca 404)', async () => {
+      await expect(
+        service.markPdfDownloaded('id-que-no-existe'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('NEGATIVO: nunca lanza — un fallo SQL se registra internamente y se resuelve en silencio, sin alterar ningún otro campo (el UPDATE nunca incluyó otra columna)', async () => {
+      queryBuilderMock.execute.mockRejectedValueOnce(
+        new Error('connection terminated'),
+      );
+
+      await expect(
+        service.markPdfDownloaded('analysis-1'),
+      ).resolves.toBeUndefined();
+      // El único campo que este UPDATE intentó tocar es firstPdfDownloadedAt — confirmado en el
+      // primer test de este describe (queryBuilderMock.set con un solo campo).
     });
   });
 

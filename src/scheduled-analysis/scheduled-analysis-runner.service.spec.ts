@@ -149,6 +149,7 @@ describe('ScheduledAnalysisRunnerService', () => {
     emailSentAt: null,
     errorMessage: null,
     metadata: null,
+    triggerSource: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -464,7 +465,11 @@ describe('ScheduledAnalysisRunnerService', () => {
       fieldsService.findOne.mockResolvedValue(buildField());
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
-      await service.triggerRun(schedule, new Date('2026-08-24T12:00:00Z'));
+      await service.triggerRun(
+        schedule,
+        new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
+      );
 
       expect(analysisService.runFieldAnalysis).toHaveBeenCalledWith(
         'field-1',
@@ -484,7 +489,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       );
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
-      await service.triggerRun(schedule, now);
+      await service.triggerRun(schedule, now, 'automatic_dispatcher');
 
       const expectedRange = computeScheduledAnalysisDateRange(now, {
         timezone: 'America/Argentina/Cordoba',
@@ -514,7 +519,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       fieldsService.findOne.mockResolvedValue(buildField());
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
-      await service.triggerRun(schedule, now);
+      await service.triggerRun(schedule, now, 'automatic_dispatcher');
 
       const expectedRange = computeScheduledAnalysisDateRange(now, {
         timezone: schedule.timezone,
@@ -534,7 +539,11 @@ describe('ScheduledAnalysisRunnerService', () => {
       fieldsService.findOne.mockResolvedValue(buildField());
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
-      await service.triggerRun(schedule, new Date('2026-08-24T12:00:00Z'));
+      await service.triggerRun(
+        schedule,
+        new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
+      );
 
       expect(analysisService.runFieldAnalysis).toHaveBeenCalledWith(
         'field-1',
@@ -555,6 +564,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       const result = await service.triggerRun(
         schedule,
         new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
       );
 
       expect(result).toBe(existingRun);
@@ -573,6 +583,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       const run = await service.triggerRun(
         schedule,
         new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
       );
 
       expect(run.status).toBe('failed');
@@ -597,6 +608,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       const run = await service.triggerRun(
         schedule,
         new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
       );
 
       expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
@@ -619,6 +631,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       const run = await service.triggerRun(
         schedule,
         new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
       );
       runRepository.find.mockResolvedValue([run]); // el run 'failed' ya no lo reconsidera el reconciler
 
@@ -641,7 +654,11 @@ describe('ScheduledAnalysisRunnerService', () => {
       ]);
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
-      const run = await service.triggerRun(schedule, now);
+      const run = await service.triggerRun(
+        schedule,
+        now,
+        'automatic_dispatcher',
+      );
 
       expect(analysisService.runFieldAnalysis).toHaveBeenCalledTimes(1);
       expect(run.status).toBe('processing');
@@ -661,7 +678,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       ]);
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
-      await service.triggerRun(schedule, now);
+      await service.triggerRun(schedule, now, 'automatic_dispatcher');
 
       // ScheduledAnalysisRunnerService no tiene ningún repositorio de Analysis inyectado — la
       // única forma de que el stale se resuelva es que runFieldAnalysis (mockeado acá) lo haga
@@ -685,7 +702,11 @@ describe('ScheduledAnalysisRunnerService', () => {
         }),
       ]);
 
-      const run = await service.triggerRun(schedule, now);
+      const run = await service.triggerRun(
+        schedule,
+        now,
+        'automatic_dispatcher',
+      );
 
       expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
       expect(run.status).toBe('failed');
@@ -707,6 +728,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       const run = await service.triggerRun(
         schedule,
         new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
       );
 
       expect(analysisService.runFieldAnalysis).toHaveBeenCalledTimes(1);
@@ -732,6 +754,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       const result = await service.triggerRun(
         schedule,
         new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
       );
 
       expect(result).toBe(winnerRun);
@@ -751,7 +774,11 @@ describe('ScheduledAnalysisRunnerService', () => {
       );
 
       await expect(
-        service.triggerRun(schedule, new Date('2026-08-24T12:00:00Z')),
+        service.triggerRun(
+          schedule,
+          new Date('2026-08-24T12:00:00Z'),
+          'automatic_dispatcher',
+        ),
       ).rejects.toThrow('connection terminated');
     });
 
@@ -761,7 +788,11 @@ describe('ScheduledAnalysisRunnerService', () => {
       fieldsService.findOne.mockResolvedValue(buildField());
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
-      await service.triggerRun(schedule, new Date('2026-08-24T12:00:00Z'));
+      await service.triggerRun(
+        schedule,
+        new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
+      );
 
       const nextRunAtCall = scheduleRepository.update.mock.calls.find(
         ([, fields]) => fields && 'nextRunAt' in fields,
@@ -2242,6 +2273,132 @@ describe('ScheduledAnalysisRunnerService', () => {
         analysisService.assertUserBelowConcurrencyCeiling,
       ).not.toHaveBeenCalled();
       expect(analysisService.runFieldAnalysis).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // MEASUREMENT GAP P1-01 ("Dispatcher automático vs 'Ejecutar ahora'"): triggerSource identifica
+  // el entry point que efectivamente CREÓ la fila. La carrera real dispatcher/run-now (Postgres de
+  // verdad, no mocks) vive en test/scheduled-analysis-run-trigger-source.e2e-spec.ts — acá se
+  // cubre la propagación por entry point y las dos ramas negativas que NO deben tocar el origen ya
+  // persistido (reutilización, loser de la carrera simulada con mocks).
+  describe('triggerSource (MEASUREMENT GAP P1-01)', () => {
+    it('processDueSchedules propaga automatic_dispatcher al crear', async () => {
+      const schedule = buildSchedule();
+      scheduleRepository.find.mockResolvedValue([schedule]);
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
+
+      await service.processDueSchedules(new Date('2026-08-24T12:05:00Z'));
+
+      expect(runRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ triggerSource: 'automatic_dispatcher' }),
+      );
+    });
+
+    it('runNow propaga user_run_now al crear', async () => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      scheduleRepository.findOne.mockResolvedValue(buildSchedule());
+      runRepository.findOne.mockResolvedValue(null);
+      analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
+
+      await service.runNow('field-1', 'user-A');
+
+      expect(runRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ triggerSource: 'user_run_now' }),
+      );
+    });
+
+    it('triggerRun persiste el origen recibido al crear, junto con metadata.dateRange (ninguno pisa al otro)', async () => {
+      const schedule = buildSchedule();
+      const now = new Date('2026-08-24T12:00:00Z');
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
+
+      const run = await service.triggerRun(schedule, now, 'user_run_now');
+
+      const expectedRange = computeScheduledAnalysisDateRange(now, {
+        timezone: schedule.timezone,
+      });
+      expect(runRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          triggerSource: 'user_run_now',
+          metadata: { dateRange: expectedRange },
+        }),
+      );
+      expect(run.triggerSource).toBe('user_run_now');
+    });
+
+    it('una corrida que luego falla conserva el origen que la creó', async () => {
+      const schedule = buildSchedule();
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.runFieldAnalysis.mockRejectedValue(
+        new Error('El worker no responde.'),
+      );
+
+      const run = await service.triggerRun(
+        schedule,
+        new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
+      );
+
+      expect(run.status).toBe('failed');
+      expect(run.triggerSource).toBe('automatic_dispatcher'); // sin cambios pese al fallo.
+    });
+
+    it('NEGATIVO: existingRun no recibe updates de origen — triggerRun ni siquiera llama a save() en esa rama', async () => {
+      const schedule = buildSchedule();
+      const existingRun = buildRun({
+        status: 'processing',
+        triggerSource: 'user_run_now',
+      });
+      runRepository.findOne.mockResolvedValue(existingRun);
+
+      const result = await service.triggerRun(
+        schedule,
+        new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher', // un caller distinto pide reutilizar — no debe cambiar nada.
+      );
+
+      expect(result).toBe(existingRun);
+      expect(result.triggerSource).toBe('user_run_now'); // el origen original, intacto.
+      expect(runRepository.create).not.toHaveBeenCalled();
+      expect(runRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('NEGATIVO: el loser de la carrera de unique(scheduleId, scheduledFor) devuelve el triggerSource del ganador, nunca el propio', async () => {
+      const schedule = buildSchedule();
+      const winnerRun = buildRun({
+        id: 'run-winner',
+        status: 'processing',
+        triggerSource: 'automatic_dispatcher', // el dispatcher ganó la carrera real.
+      });
+
+      // Primer findOne (dedup al principio de triggerRun): nadie la creó todavía. save() choca
+      // contra el unique — perdió la carrera. Segundo findOne (dentro de saveNewRun): ya existe,
+      // creada por el ganador.
+      runRepository.findOne
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(winnerRun);
+      runRepository.save.mockRejectedValueOnce(
+        Object.assign(
+          new Error('duplicate key value violates unique constraint'),
+          { code: '23505' },
+        ),
+      );
+
+      const result = await service.triggerRun(
+        schedule,
+        new Date('2026-08-24T12:00:00Z'),
+        'user_run_now', // este caller (el loser) pidió un origen distinto — nunca debe imponerse.
+      );
+
+      expect(result).toBe(winnerRun);
+      expect(result.triggerSource).toBe('automatic_dispatcher'); // el del ganador, no 'user_run_now'.
+      // El loser nunca vuelve a llamar a save() sobre la fila ya existente para "corregir" su origen.
+      expect(runRepository.save).toHaveBeenCalledTimes(1); // solo el intento que perdió.
     });
   });
 });

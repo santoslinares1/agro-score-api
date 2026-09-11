@@ -193,6 +193,107 @@ export class AnalysisService {
   }
 
   /**
+   * MEASUREMENT GAP P1-03 ("Resultado técnico consultado") — POST /analysis/:id/result-viewed.
+   * Confirma que un usuario con ownership recibió y aceptó el resultado completo de un Analysis
+   * 'Finalizado' en la pantalla principal (nunca desde polling, report preview o PDF — eso lo
+   * decide el caller Web, ver AnalysisResultComponent). Mismo gate de ownership que findOneOwned
+   * (AUTH-3/AUTH-4, sin una segunda regla) — 404 genérico si el análisis no existe o no es del
+   * usuario, idéntico a cualquier otra ruta de /analysis/:id.
+   *
+   * Nunca acepta un Analysis 'Procesando'/'Error': Web solo llama a esto después de un
+   * GET /analysis/:id exitoso, que a su vez el frontend solo dispara cuando el status liviano ya
+   * reportó 'Finalizado' — si de todos modos llega para un análisis que no está Finalizado (un
+   * caller directo al endpoint, no el flujo real), se rechaza en vez de escribir cualquier cosa.
+   *
+   * Set-once atómico: el UPDATE de abajo lleva su propio guard
+   * `"firstResultViewedAt" IS NULL` en el WHERE — una sola sentencia SQL es atómica de por sí en
+   * Postgres, así que ante dos llamadas concurrentes (doble tab, retry de red) como máximo UNA
+   * efectivamente escribe; la otra no encuentra fila que matchee (ya no es NULL) y no hace nada,
+   * sin necesitar una transacción explícita ni un lock. El timestamp es SIEMPRE `now()` de
+   * Postgres (nunca `new Date()` de Node ni nada provisto por el cliente) — no hay ningún
+   * parámetro de timestamp en la firma del método, así que ningún caller puede inyectar uno.
+   * Después de la escritura se relee el valor ya commiteado (gane o no la carrera esta llamada
+   * puntual) — la respuesta refleja siempre el estado real en DB, nunca un valor fabricado
+   * localmente.
+   */
+  async markResultViewed(
+    id: string,
+    userId: string,
+  ): Promise<{ firstResultViewedAt: string }> {
+    const analysis = await this.findOneOwned(id, userId);
+
+    if (analysis.status !== 'Finalizado') {
+      throw new BadRequestException(
+        'Solo se puede confirmar la vista del resultado de un análisis finalizado.',
+      );
+    }
+
+    await this.analysisRepository
+      .createQueryBuilder()
+      .update(Analysis)
+      .set({ firstResultViewedAt: () => 'now()' })
+      .where('id = :id', { id })
+      .andWhere('"firstResultViewedAt" IS NULL')
+      .execute();
+
+    const current = await this.analysisRepository.findOne({
+      where: { id },
+      select: { id: true, firstResultViewedAt: true },
+    });
+
+    if (!current?.firstResultViewedAt) {
+      // No debería ser alcanzable: el UPDATE de arriba, si no escribió porque otra llamada ya
+      // había ganado la carrera, implica que ESA otra llamada ya deja la columna poblada. Un
+      // valor todavía null acá señala un bug real — mejor un error explícito que fabricar un
+      // timestamp local para no romper la respuesta.
+      throw new Error(
+        `No se pudo confirmar ni leer firstResultViewedAt para analysisId=${id} tras el UPDATE set-once.`,
+      );
+    }
+
+    return { firstResultViewedAt: current.firstResultViewedAt.toISOString() };
+  }
+
+  /**
+   * MEASUREMENT GAP P1-04 ("PDF descargado"). Marca, best-effort y set-once, que el servidor
+   * completó con éxito una respuesta PDF para este Analysis.
+   *
+   * FRONTERA DELIBERADA: a diferencia de markResultViewed, este método NO valida ownership por
+   * su cuenta — confía en que el único caller real (AnalysisController.downloadPdfReport) ya
+   * validó ownership (findOneOwned) y generó el PDF (buildReportPdf) ANTES de que la respuesta
+   * HTTP llegara a su evento `finish`, que es lo único que dispara esta llamada. No expone
+   * ningún dato del Analysis ni acepta un timestamp — el único efecto posible de invocarlo fuera
+   * de ese flujo es una fila con un timestamp de más en una columna que, por sí sola, no revela
+   * nada. No convertir esto en un endpoint ni en un método público de propósito general: sigue
+   * existiendo únicamente para ese caller.
+   *
+   * Nunca lanza: cualquier fallo de la escritura (SQL, conexión) se registra internamente y se
+   * resuelve en silencio — para cuando esto corre, la respuesta HTTP YA se completó (`finish` ya
+   * emitió), así que ningún fallo de esta señal puede ni debe convertirse en un error HTTP ni
+   * reabrir una respuesta ya cerrada.
+   */
+  async markPdfDownloaded(analysisId: string): Promise<void> {
+    try {
+      // Mismo patrón atómico set-once que markResultViewed: una sola sentencia UPDATE guardada
+      // por "IS NULL" en el WHERE, sin transacción/lock explícito — Postgres serializa cualquier
+      // carrera real (dos descargas concurrentes) a nivel de fila.
+      await this.analysisRepository
+        .createQueryBuilder()
+        .update(Analysis)
+        .set({ firstPdfDownloadedAt: () => 'now()' })
+        .where('id = :id', { id: analysisId })
+        .andWhere('"firstPdfDownloadedAt" IS NULL')
+        .execute();
+    } catch (error) {
+      this.logger.error(
+        `No se pudo persistir firstPdfDownloadedAt para analysisId=${analysisId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
    * PERF-2: versión liviana de findOneOwned para GET /analysis/:id/status — mismo chequeo de
    * ownership (AUTH-3/AUTH-4, default-deny vía resolveOwnedFieldId), pero la query a Postgres
    * solo trae ANALYSIS_STATUS_COLUMNS: resultJson (y todo lo que cuelga de él — mapAssets,

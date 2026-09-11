@@ -49,6 +49,7 @@ function buildUser(overrides: Partial<User> = {}): User {
     companyName: undefined,
     role: UserRole.USER,
     isActive: true,
+    activationAssistanceStartedAt: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -144,6 +145,7 @@ describe('AdminService', () => {
             findByIds: jest.fn().mockResolvedValue([]),
             create: jest.fn(),
             update: jest.fn(),
+            markActivationAssistanceStarted: jest.fn(),
             countActiveByRole: jest.fn(),
             toPublicUser: jest.fn((user: User) => {
               const { passwordHash: _passwordHash, ...publicUser } = user;
@@ -445,6 +447,85 @@ describe('AdminService', () => {
       expect(auditLogService.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'admin.user.deactivated' }),
       );
+    });
+  });
+
+  // MEASUREMENT GAP P1-06 ("Self-service frente a asistencia"): esta capa decide SI auditar (solo
+  // en la transición efectiva) — la atomicidad del UPDATE set-once en sí ya está cubierta en
+  // users.service.spec.ts y en el e2e contra Postgres real; acá se verifica delegación, el 404,
+  // y que repetir la llamada nunca fabrique una segunda entrada de auditoría.
+  describe('markActivationAssistanceStarted (MEASUREMENT GAP P1-06)', () => {
+    it('404 si el usuario no existe — nunca llega a intentar el UPDATE', async () => {
+      usersService.findById.mockResolvedValue(null);
+
+      await expect(
+        service.markActivationAssistanceStarted('id-inexistente', actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(usersService.markActivationAssistanceStarted).not.toHaveBeenCalled();
+      expect(auditLogService.record).not.toHaveBeenCalled();
+    });
+
+    it('primera marca (transición real): audita admin.user.activation_assistance_started con actor y target correctos, y devuelve el usuario sin passwordHash/tokenVersion', async () => {
+      const markedAt = new Date('2026-09-11T12:00:00.000Z');
+      usersService.findById.mockResolvedValue(buildUser());
+      usersService.markActivationAssistanceStarted.mockResolvedValue({
+        user: buildUser({ activationAssistanceStartedAt: markedAt }),
+        wasNewlySet: true,
+      });
+
+      const result = await service.markActivationAssistanceStarted(
+        'user-1',
+        actor,
+      );
+
+      expect(usersService.markActivationAssistanceStarted).toHaveBeenCalledWith(
+        'user-1',
+      );
+      expect(auditLogService.record).toHaveBeenCalledTimes(1);
+      expect(auditLogService.record).toHaveBeenCalledWith({
+        actor,
+        action: 'admin.user.activation_assistance_started',
+        targetType: 'user',
+        targetId: 'user-1',
+        after: { activationAssistanceStartedAt: markedAt },
+      });
+      expect(result).not.toHaveProperty('passwordHash');
+      expect(result).not.toHaveProperty('tokenVersion');
+      expect(result.activationAssistanceStartedAt).toEqual(markedAt);
+    });
+
+    it('usuario ya marcado (reutilización): responde éxito con el mismo timestamp pero NUNCA fabrica una segunda auditoría', async () => {
+      const originalMark = new Date('2026-01-01T00:00:00.000Z');
+      usersService.findById.mockResolvedValue(buildUser());
+      usersService.markActivationAssistanceStarted.mockResolvedValue({
+        user: buildUser({ activationAssistanceStartedAt: originalMark }),
+        wasNewlySet: false,
+      });
+
+      const result = await service.markActivationAssistanceStarted(
+        'user-1',
+        actor,
+      );
+
+      expect(auditLogService.record).not.toHaveBeenCalled();
+      expect(result.activationAssistanceStartedAt).toEqual(originalMark);
+    });
+
+    it('la firma no acepta timestamp/actor/mode del caller — solo (id, actor de auditoría)', () => {
+      expect(service.markActivationAssistanceStarted.length).toBe(2);
+    });
+
+    it('nunca toca otros campos del usuario (no llama a usersService.update)', async () => {
+      usersService.findById.mockResolvedValue(buildUser());
+      usersService.markActivationAssistanceStarted.mockResolvedValue({
+        user: buildUser({ activationAssistanceStartedAt: new Date() }),
+        wasNewlySet: true,
+      });
+
+      await service.markActivationAssistanceStarted('user-1', actor);
+
+      expect(usersService.update).not.toHaveBeenCalled();
     });
   });
 

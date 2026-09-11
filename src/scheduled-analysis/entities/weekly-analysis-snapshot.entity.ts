@@ -137,6 +137,29 @@ export class WeeklyAnalysisSnapshot {
   @Column({ type: 'jsonb', nullable: true })
   metrics: Record<string, unknown> | null;
 
+  /**
+   * MEASUREMENT GAP P1-05 ("Monitoreo semanal consultado"): cuándo un usuario con ownership
+   * confirmó, por primera vez, que este snapshot fue efectivamente presentado como el destacado
+   * en la sección "Monitoreo semanal" de field-detail (ver WeeklyAnalysisSnapshotService.
+   * markViewed / POST fields/:fieldId/weekly-analysis-snapshots/:snapshotId/viewed) — nunca
+   * `createdAt`/`updatedAt` (esos describen cuándo se calculó/tocó la fila, no cuándo una
+   * persona lo vio), ni el solo hecho de que `list`/`latest`/`findOne` lo hayan devuelto: montar
+   * field-detail con la sección "field-weekly-monitoring" fuera de vista NO marca nada — Web
+   * solo confirma cuando la sección quedó realmente activa (click o scroll-spy) Y el snapshot
+   * destacado ya está renderizado. Distinto, a propósito, de `Analysis.firstResultViewedAt`
+   * (P1-03, otra pantalla) y `Analysis.firstPdfDownloadedAt` (P1-04, otro artefacto) — ninguno de
+   * los dos se reutiliza ni se deriva acá.
+   *
+   * Set-once: la primera confirmación fija el valor; cualquier llamada posterior (reutilización,
+   * retry, dos pestañas concurrentes) lo conserva sin cambios — ver el UPDATE guardado por
+   * `"firstViewedAt" IS NULL` en markViewed, nunca un valor provisto por el cliente. `null` para
+   * todo snapshot anterior a este rollout — no existe backfill confiable (no se guardaba esta
+   * señal antes, y no se infiere desde `updatedAt`, emails ni GETs históricos), así que null
+   * significa "sin cobertura histórica", nunca "nunca consultado".
+   */
+  @Column({ type: 'timestamp', nullable: true })
+  firstViewedAt: Date | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

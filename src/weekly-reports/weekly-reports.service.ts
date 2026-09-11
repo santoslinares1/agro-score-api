@@ -65,7 +65,12 @@ export class WeeklyReportsService {
     const field = await this.fieldsService.findOne(fieldId, userId);
 
     const includeNdreExperimental = dto.includeNdreExperimental ?? false;
-    const requestedIndices = dto.indices ?? DEFAULT_INDICES;
+    // MEASUREMENT GAP P1-02: lista canónica sin duplicados, preservando el orden de la primera
+    // aparición (Set conserva orden de inserción) — hoy el DTO no rechazaba `indices` repetidos
+    // (@IsIn valida pertenencia, no unicidad), y tanto lo persistido en `indices` como lo enviado
+    // al Worker tienen que representar el mismo conjunto sin ambigüedad. Ningún test/contrato
+    // existente depende de que un duplicado sobreviva tal cual.
+    const requestedIndices = [...new Set(dto.indices ?? DEFAULT_INDICES)];
 
     if (requestedIndices.includes('NDRE') && !includeNdreExperimental) {
       throw new BadRequestException(
@@ -141,6 +146,10 @@ export class WeeklyReportsService {
       source: 'manual',
       includeNdreExperimental,
       indices: requestedIndices,
+      // MEASUREMENT GAP P1-02: snapshot inmutable del payload esperado — copia estable (nunca la
+      // referencia de `includedLots`), fijada ACÁ, antes de disparar processInBackground. Nunca se
+      // recalcula después (ver el docstring de WeeklyFieldReport.expectedLotIds).
+      expectedLotIds: includedLots.map((lot) => lot.id),
       startedAt: new Date(),
     });
 

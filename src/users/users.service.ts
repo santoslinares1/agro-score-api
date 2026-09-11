@@ -136,6 +136,48 @@ export class UsersService {
   }
 
   /**
+   * MEASUREMENT GAP P1-06 ("Self-service frente a asistencia"): set-once atómico de
+   * `activationAssistanceStartedAt` — el UPDATE lleva su propio guard
+   * `"activationAssistanceStartedAt" IS NULL` en el WHERE: una sola sentencia SQL es atómica de
+   * por sí en Postgres, así que ante dos llamadas concurrentes (doble click, retry) como máximo
+   * UNA efectivamente escribe. El timestamp es SIEMPRE `now()` de Postgres — no hay ningún
+   * parámetro de timestamp en la firma del método, así que ningún caller puede inyectar uno.
+   *
+   * `wasNewlySet` distingue la transición real (esta llamada ganó la carrera y de verdad puso el
+   * timestamp) de una reutilización (ya estaba poblado, por esta misma llamada perdiendo una
+   * carrera o por una marca previa) — AdminService lo usa para auditar solo la transición
+   * efectiva, nunca cada repetición. `user` siempre refleja el valor YA COMMITEADO tras el
+   * UPDATE, nunca uno fabricado localmente — la respuesta es correcta incluso si esta llamada
+   * perdió la carrera.
+   *
+   * No valida existencia del usuario por su cuenta (ver el 404 de AdminService, resuelto ANTES
+   * de llegar acá) — si de todos modos se llamara con un id inexistente, el UPDATE no afecta
+   * ninguna fila y el `findOne` posterior devuelve null, lo cual se trata acá como un bug real
+   * (nunca alcanzable por el único caller real), no como un 404 legítimo.
+   */
+  async markActivationAssistanceStarted(
+    userId: string,
+  ): Promise<{ user: User; wasNewlySet: boolean }> {
+    const result = await this.usersRepository
+      .createQueryBuilder()
+      .update(User)
+      .set({ activationAssistanceStartedAt: () => 'now()' })
+      .where('id = :id', { id: userId })
+      .andWhere('"activationAssistanceStartedAt" IS NULL')
+      .execute();
+
+    const user = await this.usersRepository.findOne({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new ConflictException('El usuario no existe.');
+    }
+
+    return { user, wasNewlySet: (result.affected ?? 0) > 0 };
+  }
+
+  /**
    * ADMIN-1: cuenta cuántos usuarios activos tienen el rol dado, excluyendo
    * opcionalmente un id — usado para la protección de "último owner" antes
    * de degradar o desactivar a alguien.

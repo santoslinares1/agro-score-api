@@ -134,6 +134,21 @@ export class AdminController {
     return this.adminService.deactivateUser(id, this.buildActorContext(req));
   }
 
+  // MEASUREMENT GAP P1-06 ("Self-service frente a asistencia"): acknowledgement explícito de un
+  // owner/admin — nunca acepta body (ver AdminService.markActivationAssistanceStarted). Ruta
+  // separada de PATCH users/:id a propósito: no es una edición de datos del usuario, es una
+  // declaración de negocio con su propia acción de auditoría.
+  @Post('users/:id/activation-assistance')
+  markActivationAssistanceStarted(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.adminService.markActivationAssistanceStarted(
+      id,
+      this.buildActorContext(req),
+    );
+  }
+
   @Post('users/:id/password-reset')
   createPasswordReset(
     @Param('id', ParseUUIDPipe) id: string,

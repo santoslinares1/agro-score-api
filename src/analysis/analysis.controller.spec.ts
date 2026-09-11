@@ -2,9 +2,11 @@ import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { GoneException, NotFoundException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ThrottlerModule } from '@nestjs/throttler';
+import { EventEmitter } from 'events';
 import * as fs from 'fs';
 
 import { AuthenticatedUser } from '../auth/jwt.strategy';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { UserComputeThrottlerGuard } from '../common/guards/user-compute-throttler.guard';
 import { AnalysisController } from './analysis.controller';
 import { AnalysisService } from './analysis.service';
@@ -25,6 +27,8 @@ describe('AnalysisController', () => {
       | 'findByField'
       | 'runFieldAnalysis'
       | 'assertUserBelowConcurrencyCeiling'
+      | 'markResultViewed'
+      | 'markPdfDownloaded'
     >
   >;
 
@@ -35,8 +39,13 @@ describe('AnalysisController', () => {
   };
   const req = { user } as any;
 
+  // MEASUREMENT GAP P1-04: `res` real (http.ServerResponse, y Express Response que lo extiende)
+  // es un EventEmitter — downloadPdfReport ahora depende de `res.once('finish', ...)`. Un mock
+  // plano `{ setHeader: jest.fn() }` ya no alcanza; se necesita un emitter real para poder
+  // disparar 'finish'/'close' de forma determinística desde los tests.
   const buildRes = () => {
-    const res: any = { setHeader: jest.fn() };
+    const res = new EventEmitter() as EventEmitter & { setHeader: jest.Mock };
+    res.setHeader = jest.fn();
     return res;
   };
 
@@ -68,6 +77,8 @@ describe('AnalysisController', () => {
             findByField: jest.fn(),
             runFieldAnalysis: jest.fn(),
             assertUserBelowConcurrencyCeiling: jest.fn(),
+            markResultViewed: jest.fn(),
+            markPdfDownloaded: jest.fn().mockResolvedValue(undefined),
           },
         },
       ],
@@ -218,6 +229,46 @@ describe('AnalysisController', () => {
         600_000,
       );
       expect(Reflect.getMetadata('THROTTLER:SKIPdefault', handler)).toBe(true);
+    });
+  });
+
+  // MEASUREMENT GAP P1-03 ("Resultado técnico consultado") — POST /analysis/:id/result-viewed.
+  describe('markResultViewed (MEASUREMENT GAP P1-03)', () => {
+    it('lleva JwtAuthGuard — sin JWT, la request nunca llega al handler (401 vía el guard chain real, ver el patrón de user-compute-throttler.e2e-spec.ts)', () => {
+      const guards = Reflect.getMetadata(
+        GUARDS_METADATA,
+        (controller as any).markResultViewed,
+      ) as unknown[] | undefined;
+
+      expect(guards).toContain(JwtAuthGuard);
+    });
+
+    it('invoca al service con (id, req.user.sub)', () => {
+      controller.markResultViewed('analysis-1', req);
+
+      expect(analysisService.markResultViewed).toHaveBeenCalledWith(
+        'analysis-1',
+        'user-A',
+      );
+    });
+
+    it('devuelve exactamente lo que resuelve el service (respuesta mínima, sin resultJson)', async () => {
+      const response = { firstResultViewedAt: '2026-01-05T12:00:00.000Z' };
+      analysisService.markResultViewed.mockResolvedValue(response);
+
+      const result = await controller.markResultViewed('analysis-1', req);
+
+      expect(result).toBe(response);
+    });
+
+    it('propaga NotFoundException del service (análisis inexistente o ajeno) tal cual', async () => {
+      analysisService.markResultViewed.mockRejectedValue(
+        new NotFoundException('Análisis no encontrado.'),
+      );
+
+      await expect(
+        controller.markResultViewed('missing-or-foreign', req),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 
@@ -424,6 +475,139 @@ describe('AnalysisController', () => {
       );
       expect(pipeMock).toHaveBeenCalledWith(res);
       expect(endMock).toHaveBeenCalled();
+      // El listener queda registrado ANTES de pipe/end, pero markPdfDownloaded todavía no se
+      // dispara — recién con 'finish' (ver el describe de abajo), nunca solo por conectar el pipe.
+      expect(analysisService.markPdfDownloaded).not.toHaveBeenCalled();
+    });
+  });
+
+  // MEASUREMENT GAP P1-04 ("PDF descargado"): lifecycle real de la respuesta HTTP — solo
+  // 'finish' (el servidor terminó de ENTREGAR la respuesta) marca la descarga.
+  describe('downloadPdfReport — lifecycle de finish/close (MEASUREMENT GAP P1-04)', () => {
+    async function setupHappyPath(): Promise<
+      EventEmitter & { setHeader: jest.Mock }
+    > {
+      const analysis = { id: 'analysis-1' } as any;
+      analysisService.findOneOwned.mockResolvedValue(analysis);
+      analysisService.buildReportPdf.mockResolvedValue({
+        stream: { pipe: jest.fn(), end: jest.fn() } as any,
+        filename: 'agroscore-reporte-campo-a-2026-01-01.pdf',
+      });
+
+      const res = buildRes();
+      await controller.downloadPdfReport('analysis-1', req, res);
+      return res;
+    }
+
+    it("'finish' marca la descarga exactamente una vez, con el id del análisis ya validado por ownership", async () => {
+      const res = await setupHappyPath();
+
+      res.emit('finish');
+
+      expect(analysisService.markPdfDownloaded).toHaveBeenCalledTimes(1);
+      expect(analysisService.markPdfDownloaded).toHaveBeenCalledWith(
+        'analysis-1',
+      );
+    });
+
+    it("el listener de 'finish' queda registrado ANTES de pipe/end (evita la carrera de un 'finish' síncrono)", async () => {
+      const analysis = { id: 'analysis-1' } as any;
+      analysisService.findOneOwned.mockResolvedValue(analysis);
+
+      const pipeMock = jest.fn();
+      const res = buildRes();
+      // Simula un stream cuyo .pipe() dispara 'finish' SINCRÓNICAMENTE (peor caso de carrera:
+      // si el listener se registrara DESPUÉS de pipe/end, este 'finish' se perdería).
+      pipeMock.mockImplementation((destination: typeof res) => {
+        destination.emit('finish');
+        return destination;
+      });
+      analysisService.buildReportPdf.mockResolvedValue({
+        stream: { pipe: pipeMock, end: jest.fn() } as any,
+        filename: 'x.pdf',
+      });
+
+      await controller.downloadPdfReport('analysis-1', req, res);
+
+      expect(analysisService.markPdfDownloaded).toHaveBeenCalledWith(
+        'analysis-1',
+      );
+    });
+
+    it("NEGATIVO: 'close' SIN 'finish' previo (cierre prematuro) nunca marca la descarga", async () => {
+      const res = await setupHappyPath();
+
+      res.emit('close'); // el cliente cortó la conexión antes de terminar — nunca 'finish'.
+
+      expect(analysisService.markPdfDownloaded).not.toHaveBeenCalled();
+    });
+
+    it("'finish' seguido de 'close' (comportamiento normal del socket subyacente) no duplica la escritura", async () => {
+      const res = await setupHappyPath();
+
+      res.emit('finish');
+      res.emit('close'); // normal después de una respuesta completa — no debe disparar nada más.
+
+      expect(analysisService.markPdfDownloaded).toHaveBeenCalledTimes(1);
+    });
+
+    it("'finish' emitido dos veces por un mock/stream defectuoso no dispara una segunda llamada (.once, defensivo — el set-once real vive en el service)", async () => {
+      const res = await setupHappyPath();
+
+      res.emit('finish');
+      res.emit('finish');
+
+      expect(analysisService.markPdfDownloaded).toHaveBeenCalledTimes(1);
+    });
+
+    it('generación fallida (buildReportPdf rechaza) nunca llega a registrar el listener ni a marcar la descarga', async () => {
+      analysisService.findOneOwned.mockResolvedValue({
+        id: 'analysis-1',
+      } as any);
+      analysisService.buildReportPdf.mockRejectedValue(
+        new NotFoundException(
+          'El análisis no tiene datos suficientes para generar el reporte.',
+        ),
+      );
+      const res = buildRes();
+
+      await expect(
+        controller.downloadPdfReport('analysis-1', req, res),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      res.emit('finish'); // aunque algo externo lo emitiera después, no hay listener que reaccione.
+      expect(analysisService.markPdfDownloaded).not.toHaveBeenCalled();
+    });
+
+    it('ownership fallido nunca genera el PDF ni conecta ningún listener de finish', async () => {
+      analysisService.findOneOwned.mockRejectedValue(
+        new NotFoundException('Análisis no encontrado.'),
+      );
+      const res = buildRes();
+
+      await expect(
+        controller.downloadPdfReport('analysis-1', req, res),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(analysisService.buildReportPdf).not.toHaveBeenCalled();
+
+      res.emit('finish');
+      expect(analysisService.markPdfDownloaded).not.toHaveBeenCalled();
+    });
+
+    it('persistencia rechazada (markPdfDownloaded) después de finish no altera la respuesta ya enviada — no hay nada que capturar del lado del controller', async () => {
+      const res = await setupHappyPath();
+      analysisService.markPdfDownloaded.mockRejectedValueOnce(
+        new Error(
+          'DB caída — no debería propagarse, ver el try/catch interno del service',
+        ),
+      );
+
+      // El controller llama a markPdfDownloaded fire-and-forget (void) — no hay ninguna promesa
+      // que el test deba esperar ni ningún catch en el controller: el contrato es que el
+      // MÉTODO DEL SERVICE nunca rechaza (ver AnalysisService.markPdfDownloaded), así que esto
+      // solo confirma que emitir 'finish' no lanza ni rompe el flujo del controller aunque el
+      // mock puntual de este test decida rechazar.
+      expect(() => res.emit('finish')).not.toThrow();
     });
   });
 });

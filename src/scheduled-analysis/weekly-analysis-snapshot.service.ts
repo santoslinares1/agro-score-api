@@ -289,4 +289,64 @@ export class WeeklyAnalysisSnapshotService {
       weeklyTechnicalVerdict: toPublicWeeklyTechnicalVerdictDto(verdict),
     };
   }
+
+  /**
+   * MEASUREMENT GAP P1-05 ("Monitoreo semanal consultado") — POST
+   * fields/:fieldId/weekly-analysis-snapshots/:snapshotId/viewed. Confirma que un usuario con
+   * ownership recibió y tiene efectivamente activa/renderizada la sección "Monitoreo semanal"
+   * para este snapshot destacado. Mismo gate de ownership que findOne (fieldsService.findOne +
+   * buscar el snapshot por id+fieldId) — 404 genérico e indistinguible si el snapshot no existe,
+   * pertenece a otro Field, o el Field no es del usuario, idéntico al resto de las rutas de este
+   * controller.
+   *
+   * Set-once atómico: el UPDATE de abajo lleva su propio guard `"firstViewedAt" IS NULL` en el
+   * WHERE (además de `fieldId`, por defensa en profundidad aunque ya se validó arriba) — una
+   * sola sentencia SQL es atómica de por sí en Postgres, así que ante dos llamadas concurrentes
+   * (dos pestañas, retry) como máximo UNA efectivamente escribe. El timestamp es SIEMPRE `now()`
+   * de Postgres — no hay ningún parámetro de timestamp en la firma del método, así que ningún
+   * caller puede inyectar uno. Después de la escritura se relee el valor ya commiteado (gane o
+   * no la carrera esta llamada puntual) — la respuesta refleja siempre el estado real en DB,
+   * nunca un valor fabricado localmente.
+   */
+  async markViewed(
+    fieldId: string,
+    snapshotId: string,
+    userId: string,
+  ): Promise<{ firstViewedAt: string }> {
+    await this.fieldsService.findOne(fieldId, userId);
+
+    const snapshot = await this.snapshotRepository.findOne({
+      where: { id: snapshotId, fieldId },
+    });
+
+    if (!snapshot) {
+      throw new NotFoundException('Reporte semanal no encontrado.');
+    }
+
+    await this.snapshotRepository
+      .createQueryBuilder()
+      .update(WeeklyAnalysisSnapshot)
+      .set({ firstViewedAt: () => 'now()' })
+      .where('id = :id', { id: snapshotId })
+      .andWhere('"fieldId" = :fieldId', { fieldId })
+      .andWhere('"firstViewedAt" IS NULL')
+      .execute();
+
+    const current = await this.snapshotRepository.findOne({
+      where: { id: snapshotId },
+      select: { id: true, firstViewedAt: true },
+    });
+
+    if (!current?.firstViewedAt) {
+      // No debería ser alcanzable: el UPDATE de arriba, si no escribió porque otra llamada ya
+      // había ganado la carrera, implica que ESA otra llamada ya deja la columna poblada. Un
+      // valor todavía null acá señala un bug real — mejor un error explícito que fabricar un
+      // timestamp local para no romper la respuesta.
+      throw new Error(
+        `No se pudo confirmar ni leer firstViewedAt para snapshotId=${snapshotId} tras el UPDATE set-once.`,
+      );
+    }
+
+    return { firstViewedAt: current.firstViewedAt.toISOString() };
+  }
 }
