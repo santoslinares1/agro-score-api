@@ -7,6 +7,8 @@ import { UpdateFieldDto } from './dto/update-field.dto';
 import { UpdateFieldLotDto } from './dto/update-field-lot.dto';
 import { Field } from './entities/field.entity';
 import { FieldLot } from './entities/field-lot.entity';
+import { MAX_GEOMETRY_COORDINATES } from './fields-constraints';
+import { isSimpleClosedRing, Point } from './ring-topology.util';
 
 /**
  * Resultado de clasificar el geojson de un lote contra el contrato geométrico soportado (ver
@@ -43,6 +45,11 @@ export class FieldsService {
 
   async create(dto: CreateFieldDto, userId: string): Promise<Field> {
     this.assertValidDateRange(dto.startDate, dto.endDate);
+
+    // SEC-004A: cuenta las posiciones de TODOS los lotes y rechaza si la suma excede el límite
+    // ANTES de correr isSimpleClosedRing() (O(n²)) para cualquiera de ellos — varios lotes cuya
+    // suma exceda el límite deben rechazarse acá, no solo un lote individual sobredimensionado.
+    this.assertGeometrySizeWithinLimit(dto.lots.map((lot) => lot.geojson));
 
     // GEOMETRY-2 (RISK-001/RISK-002): valida CADA lote antes de construir/persistir cualquier
     // cosa — un Field con un solo lote incompatible no debe quedar parcialmente creado.
@@ -201,6 +208,10 @@ export class FieldsService {
     }
 
     if (dto.geojson !== undefined) {
+      // SEC-004A: mismo orden que create()/createLot() — el límite de tamaño se evalúa antes de
+      // isSimpleClosedRing() (dentro de validateLotGeojson). Un update sin geojson (solo
+      // metadata) nunca entra a esta rama.
+      this.assertGeometrySizeWithinLimit([dto.geojson]);
       this.validateLotGeojson(dto.geojson);
     }
 
@@ -235,6 +246,9 @@ export class FieldsService {
   ): Promise<FieldLot> {
     await this.findOne(fieldId, userId);
 
+    // SEC-004A: mismo orden que create() — el límite de tamaño se evalúa antes de
+    // isSimpleClosedRing() (dentro de validateLotGeojson).
+    this.assertGeometrySizeWithinLimit([dto.geojson]);
     this.validateLotGeojson(dto.geojson);
 
     const existingLots = await this.fieldLotRepository.find({
@@ -290,6 +304,80 @@ export class FieldsService {
     await this.recalculateTotalAreaHa(fieldId);
 
     return { success: true };
+  }
+
+  /**
+   * SEC-004A: rechaza si la SUMA de posiciones de `geojsons` supera MAX_GEOMETRY_COORDINATES —
+   * antes de que cualquiera de ellos llegue a `isSimpleClosedRing()` (O(n²)). `create()` pasa el
+   * geojson de todos los lotes del Field (la suma total no puede exceder el límite, aunque cada
+   * lote individual esté por debajo); `createLot()`/`updateLot()` pasan un array de un solo
+   * elemento, así que el "total" es simplemente el tamaño de esa geometría.
+   *
+   * Usa `countLotPositions()` (conteo seguro, nunca lanza) en vez de asumir que `geojsons` ya es
+   * estructuralmente válido — un shape malformado cuenta 0 acá y sigue su curso hacia
+   * `validateLotGeojson()`, que es quien determina el motivo de rechazo real
+   * (invalid/multipart/holes) para ese caso.
+   */
+  private assertGeometrySizeWithinLimit(geojsons: unknown[]): void {
+    const total = geojsons.reduce<number>(
+      (sum, geojson) => sum + this.countLotPositions(geojson),
+      0,
+    );
+
+    if (total > MAX_GEOMETRY_COORDINATES) {
+      throw new BadRequestException(
+        `La geometría supera el máximo permitido de ${MAX_GEOMETRY_COORDINATES} coordenadas.`,
+      );
+    }
+  }
+
+  /**
+   * SEC-004A: cuenta las posiciones del ring exterior candidato de un geojson de lote, de forma
+   * segura ante cualquier `unknown` — nunca lanza, nunca asume que encontró un ring válido.
+   * Devuelve 0 para cualquier shape que no pueda resolver con confianza a "un array de
+   * posiciones de un Polygon" (incluye rings[1+] de un Polygon con holes: solo cuenta el
+   * exterior, rings[0]). Esta función es deliberadamente independiente de
+   * classifyLotGeometry()/classifyPolygonGeometry() — no reemplaza esa clasificación (que sigue
+   * siendo la única fuente de los motivos invalid/multipart/holes), solo extrae un conteo previo
+   * y barato del mismo wrapper, para poder rechazar por tamaño ANTES de correr la clasificación
+   * completa (que termina en isSimpleClosedRing, O(n²)).
+   */
+  private countLotPositions(geojson: unknown): number {
+    const value = geojson as
+      | { type?: string; geometry?: unknown; features?: unknown[] }
+      | null;
+
+    if (!value || typeof value !== 'object' || typeof value.type !== 'string') {
+      return 0;
+    }
+
+    let geometry: unknown = value;
+
+    if (value.type === 'Feature') {
+      geometry = value.geometry;
+    } else if (value.type === 'FeatureCollection') {
+      const features = Array.isArray(value.features) ? value.features : [];
+      const feature = features[0] as { type?: string; geometry?: unknown } | null;
+      geometry =
+        feature && typeof feature === 'object' && feature.type === 'Feature'
+          ? feature.geometry
+          : null;
+    }
+
+    const geometryValue = geometry as { type?: string; coordinates?: unknown } | null;
+
+    if (
+      !geometryValue ||
+      typeof geometryValue !== 'object' ||
+      geometryValue.type !== 'Polygon'
+    ) {
+      return 0;
+    }
+
+    const rings = geometryValue.coordinates;
+    const exteriorRing = Array.isArray(rings) ? rings[0] : undefined;
+
+    return Array.isArray(exteriorRing) ? exteriorRing.length : 0;
   }
 
   /**
@@ -401,22 +489,41 @@ export class FieldsService {
     return { valid: true };
   }
 
+  /**
+   * SEC-004: además de estructura/tipo/rango (sin cambios abajo), el ring tiene que representar
+   * un polígono simple, cerrado, con al menos 3 vértices distintos y área no nula — ver
+   * ring-topology.util.ts (función pura, misma política que agro-score-worker,
+   * app/ring_topology.py). Un ring abierto NUNCA se cierra automáticamente acá: se rechaza.
+   *
+   * SEC-004C: cada posición exige EXACTAMENTE 2 componentes `[lon, lat]` — no `>= 2`. Antes, una
+   * posición `[lon, lat, z]` (con elevación u otra dimensión extra) pasaba esta validación y se
+   * persistía, pero el Worker (`_validate_lot_structure`, `len(point) != 2`) siempre exigió
+   * exactamente 2 — un Field así construido fallaba recién al intentar analizarlo. No se trunca
+   * ni se normaliza la dimensión extra: se rechaza, igual que el Worker.
+   */
   private isValidRing(ring: unknown): boolean {
-    return (
+    const structurallyValid =
       Array.isArray(ring) &&
       ring.length >= 4 &&
       ring.every(
         (point) =>
           Array.isArray(point) &&
-          point.length >= 2 &&
+          point.length === 2 &&
           typeof point[0] === 'number' &&
           typeof point[1] === 'number' &&
           point[0] >= -180 &&
           point[0] <= 180 &&
           point[1] >= -90 &&
           point[1] <= 90,
-      )
-    );
+      );
+
+    if (!structurallyValid) {
+      return false;
+    }
+
+    const points: Point[] = (ring as number[][]).map(([lon, lat]) => [lon, lat]);
+
+    return isSimpleClosedRing(points);
   }
 
   /**

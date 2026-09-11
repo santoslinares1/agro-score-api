@@ -15,7 +15,7 @@
 - **`owner`**: acceso total, incluido `/admin/*`.
 - **`admin`**: acceso a `/admin/*`.
 - **`user`**: sin acceso a `/admin/*` (403).
-- Default para usuarios nuevos (`POST /auth/register` y cualquier alta sin rol explícito): `user`.
+- Default de la entidad para un alta sin rol explícito: `user`. Con `POST /auth/register` cerrado (SEC-002 / `AUTH-POLICY-1`, ver `docs/audits/access-request-flow.md`), ningún alta vigente depende ya de este default — admin (`POST /admin/users`) e invitación (`acceptInvitation`) siempre pasan `role` explícito.
 
 **Nota importante sobre la migración `AddUserRolesAndActive`:** la columna `role` ya existía desde el scaffold inicial del proyecto con `DEFAULT 'owner'`, pero nunca tuvo efecto de autorización — no había ningún guard que la leyera. Antes de esta ficha, **todos** los usuarios reales tenían `role='owner'` solo porque nunca se seteó nada distinto (verificado: 9/9 en la DB local). La migración baja a `'user'` únicamente las filas que estaban en ese default nunca-usado, para que activar `/admin/*` no le dé acceso admin automático a cada cuenta existente. Ver el comentario completo en `src/migrations/1785848336701-AddUserRolesAndActive.ts`.
 
@@ -23,7 +23,7 @@
 
 No existe ningún endpoint HTTP público para auto-promoverse un rol — es intencional (consigna explícita: "no abrir ningún endpoint público para convertir usuarios en admin").
 
-1. El usuario ya debe existir (registrado vía `POST /auth/register`, o creado por otro admin una vez que exista al menos uno).
+1. El usuario ya debe existir. `POST /auth/register` está cerrado desde SEC-002 (`AUTH-POLICY-1`) — si ya existe al menos un admin/owner activo, puede crear la cuenta desde el panel (`POST /admin/users` o una invitación); en un ambiente sin ningún admin todavía, la única opción es un INSERT directo en `users` (nunca vía HTTP, mismo criterio que el UPDATE manual del paso 3).
 2. Promoverlo desde el servidor/DB, con el script dedicado (dry-run por default, mismo patrón que `scripts/backfill-fields-user.ts`):
 
    ```bash
@@ -339,9 +339,10 @@ Suite completa: **277/277** (`npm test`) — número histórico de la ficha ADMI
 
 **Resuelto en ADMIN-3** (ya no es deuda): envío real de email para invitaciones/password-reset (`EmailService`, Resend — ver `docs/invitation-password-reset-email.md`), endpoint público `POST /auth/reset-password` para canjear el token, auditoría del lado de `/auth` (`auth.invitation.accepted`, `auth.password_reset.completed`), `agro-score-admin` ya consume los campos nuevos (`emailSent`/`dryRun`/`provider`), páginas públicas de accept-invitation/reset-password (en agro-score-web).
 
+**Resuelto en SEC-002** (ya no es deuda): `POST /auth/register` fue eliminado — el registro público quedó cerrado (`AUTH-POLICY-1`, deuda que venía de `docs/audits/access-request-flow.md`). El alta de un usuario nuevo pasa exclusivamente por invitación aceptada (`POST /auth/accept-invitation`) o creación administrativa (`POST /admin/users`, `POST /admin/access-requests/:id/create-user`).
+
 **Deuda nueva/actualizada:**
 - **`POST /admin/analysis/:id/retry` no re-ejecuta el pipeline** — solo deja constancia ("retry requested"). Automatizar el reintento real requiere reconstruir con confianza el input original y agregar guardas de idempotencia/costo — ver sección "Diagnósticos" arriba.
 - **No hay "olvidé mi contraseña" autoservicio.** El reset lo sigue disparando un admin (`POST /admin/users/:id/password-reset`) — no existe un endpoint público donde un usuario pida su propio reset por email. Ver `docs/invitation-password-reset-email.md`.
 - **No hay endpoint de reenvío** de invitación/reset. Si `emailSent: false` o el email se pierde, la única opción hoy es generar una invitación/token nuevo desde cero.
 - `earthEngine` en `/admin/system/health` siempre `not_checked` (documentado, no un bug — ver sección Sistema/health).
-- `POST /auth/register` sigue público, sin cambios (deuda ya documentada en `docs/audits/access-request-flow.md`, `AUTH-POLICY-1`). Con el default `role='user'`, no es vector para crear admins.

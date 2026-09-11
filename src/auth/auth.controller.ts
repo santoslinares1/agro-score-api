@@ -7,24 +7,22 @@ import { AcceptInvitationDto } from './dto/accept-invitation.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { DeactivateAccountDto } from './dto/deactivate-account.dto';
 import { LoginDto } from './dto/login.dto';
-import { RegisterDto } from './dto/register.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { AuthenticatedUser } from './jwt.strategy';
 
+// SEC-002 (AUTH-POLICY-1): `POST /auth/register` fue eliminado — el registro
+// público quedó cerrado por decisión de producto (onboarding invitation-only
+// en producción). El alta válida de una cuenta nueva pasa exclusivamente por
+// `POST /auth/accept-invitation` (token emitido desde Admin, ver más abajo) o
+// por creación administrativa (`POST /admin/users`,
+// `POST /admin/access-requests/:id/create-user`). Ver docs/admin-backend.md
+// y docs/audits/access-request-flow.md (deuda AUTH-POLICY-1, ahora resuelta).
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
-  // SEC-003: 5 requests/minuto por IP — evita fuerza bruta de credenciales
-  // y flood de registros antes de exponer el backend a internet.
-  @UseGuards(ThrottlerGuard)
-  @Throttle({ default: { limit: 5, ttl: 60_000 } })
-  @Post('register')
-  register(@Body() dto: RegisterDto) {
-    return this.authService.register(dto);
-  }
-
+  // SEC-003: 5 requests/minuto por IP — evita fuerza bruta de credenciales.
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Post('login')
@@ -63,9 +61,20 @@ export class AuthController {
     });
   }
 
+  // SEC-003: logout autenticado — revoca TODOS los JWT emitidos antes para
+  // este usuario (ver AuthService.logout). `userId` se deriva exclusivamente
+  // de `req.user.sub` (poblado por JwtStrategy tras validar firma,
+  // expiración, isActive y tokenVersion) — nunca de body/query/path. Sin
+  // ThrottlerGuard, mismo criterio que /auth/me y /auth/revoke-other-sessions:
+  // no verifica ninguna password, no hay superficie de fuerza bruta que
+  // limitar acá (un atacante ya necesitaría un JWT robado).
+  @UseGuards(JwtAuthGuard)
   @Post('logout')
-  logout() {
-    return { message: 'ok' };
+  logout(@Req() req: Request & { user: AuthenticatedUser }) {
+    return this.authService.logout(req.user.sub, {
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
   }
 
   // PROFILE-SEC-1: verifica password actual — mismo riesgo de fuerza bruta

@@ -148,66 +148,12 @@ describe('AuthService', () => {
     auditLogService = module.get(AuditLogService);
   });
 
-  describe('register', () => {
-    it('normaliza el email (trim + lowercase) antes de buscar y crear', async () => {
-      usersService.findByEmail.mockResolvedValue(null);
-      usersService.create.mockResolvedValue(buildUser());
-
-      await service.register({
-        email: '  UserA@Example.com  ',
-        password: 'password123',
-        fullName: 'User A',
-      });
-
-      expect(usersService.findByEmail).toHaveBeenCalledWith('usera@example.com');
-      expect(usersService.create).toHaveBeenCalledWith(
-        expect.objectContaining({ email: 'usera@example.com' }),
-      );
-    });
-
-    it('hashea la password antes de guardarla (nunca la guarda en texto plano)', async () => {
-      usersService.findByEmail.mockResolvedValue(null);
-      usersService.create.mockResolvedValue(buildUser());
-
-      await service.register({
-        email: 'usera@example.com',
-        password: 'password123',
-        fullName: 'User A',
-      });
-
-      const createArg = usersService.create.mock.calls[0][0];
-      expect(createArg.passwordHash).not.toBe('password123');
-      expect(bcrypt.compareSync('password123', createArg.passwordHash)).toBe(true);
-    });
-
-    it('nunca devuelve passwordHash en la respuesta', async () => {
-      usersService.findByEmail.mockResolvedValue(null);
-      usersService.create.mockResolvedValue(buildUser());
-
-      const result = await service.register({
-        email: 'usera@example.com',
-        password: 'password123',
-        fullName: 'User A',
-      });
-
-      expect(result.user).not.toHaveProperty('passwordHash');
-      expect(result.accessToken).toBe('signed.jwt.token');
-    });
-
-    it('rechaza un email duplicado con ConflictException', async () => {
-      usersService.findByEmail.mockResolvedValue(buildUser());
-
-      await expect(
-        service.register({
-          email: 'usera@example.com',
-          password: 'password123',
-          fullName: 'User A',
-        }),
-      ).rejects.toBeInstanceOf(ConflictException);
-
-      expect(usersService.create).not.toHaveBeenCalled();
-    });
-  });
+  // SEC-002 (AUTH-POLICY-1): no existe `service.register` — el registro
+  // público fue eliminado (ver auth.service.ts y auth.controller.spec.ts
+  // para la prueba a nivel HTTP de que la ruta ya no existe). Los tests que
+  // antes vivían acá (normalización de email, hash de password, conflicto de
+  // email duplicado) siguen cubiertos indirectamente por `acceptInvitation`
+  // abajo, que ejercita el mismo camino de creación de usuario.
 
   describe('login', () => {
     it('devuelve user + accessToken para credenciales correctas', async () => {
@@ -623,6 +569,60 @@ describe('AuthService', () => {
           targetId: 'user-1',
         }),
       );
+    });
+  });
+
+  // SEC-003
+  describe('logout', () => {
+    it('incrementa tokenVersion exactamente una vez con el userId recibido', async () => {
+      await service.logout('user-1');
+
+      expect(usersService.incrementTokenVersion).toHaveBeenCalledTimes(1);
+      expect(usersService.incrementTokenVersion).toHaveBeenCalledWith('user-1');
+    });
+
+    it('nunca devuelve accessToken, user ni tokenVersion — solo un mensaje', async () => {
+      const result = await service.logout('user-1');
+
+      expect(result).toEqual({ message: expect.any(String) });
+      expect(result).not.toHaveProperty('accessToken');
+      expect(result).not.toHaveProperty('user');
+      expect(result).not.toHaveProperty('tokenVersion');
+    });
+
+    it('nunca llama a JwtService.sign (no reemite ningún JWT, a diferencia de revokeOtherSessions)', async () => {
+      await service.logout('user-1');
+
+      expect(jwtService.sign).not.toHaveBeenCalled();
+    });
+
+    it('audita auth.logout con el propio usuario como actor, sin antes/después de datos de usuario', async () => {
+      await service.logout('user-1', { ip: '1.2.3.4', userAgent: 'jest' });
+
+      expect(auditLogService.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.logout',
+          targetType: 'user',
+          targetId: 'user-1',
+          actor: expect.objectContaining({ actorUserId: 'user-1', ip: '1.2.3.4', userAgent: 'jest' }),
+        }),
+      );
+    });
+
+    it('si el incremento de tokenVersion falla, el error se propaga y NUNCA se audita (no hay "logout exitoso" para una revocación que no ocurrió)', async () => {
+      usersService.incrementTokenVersion.mockRejectedValueOnce(new Error('DB caída'));
+
+      await expect(service.logout('user-1')).rejects.toThrow('DB caída');
+
+      expect(auditLogService.record).not.toHaveBeenCalled();
+    });
+
+    it('no llama a UsersService.findById/create/update — no lee ni escribe nada más que tokenVersion', async () => {
+      await service.logout('user-1');
+
+      expect(usersService.findById).not.toHaveBeenCalled();
+      expect(usersService.create).not.toHaveBeenCalled();
+      expect(usersService.update).not.toHaveBeenCalled();
     });
   });
 

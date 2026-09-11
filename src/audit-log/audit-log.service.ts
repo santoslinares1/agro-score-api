@@ -36,7 +36,13 @@ export type AdminAuditAction =
   // que las dos de arriba, el actor es el propio usuario autenticado.
   | 'auth.password_changed'
   | 'auth.sessions_revoked'
-  | 'auth.account_deactivated';
+  | 'auth.account_deactivated'
+  // SEC-003: logout autenticado — mismo criterio de actor (el propio
+  // usuario). A diferencia de 'auth.sessions_revoked' (que reemite un
+  // accessToken para la sesión que pidió la acción), logout no reemite
+  // nada: incrementa tokenVersion e invalida también el JWT que se usó
+  // para pedir el logout.
+  | 'auth.logout';
 
 export type AuditActorContext = {
   actorUserId: string;

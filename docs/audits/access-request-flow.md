@@ -76,7 +76,7 @@ Total: 20 tests nuevos. Suite completa del backend: **165/165** (`npm test`). `n
 
 ## Deuda pendiente
 
-- Decidir si `/auth/register` debe cerrarse del todo o volverse admin-only (`AUTH-POLICY-1`).
+- ~~Decidir si `/auth/register` debe cerrarse del todo o volverse admin-only (`AUTH-POLICY-1`).~~ **Resuelto en SEC-002:** la ruta fue eliminada — ver `docs/admin-backend.md`.
 - Captcha/honeypot si el formulario empieza a recibir spam (mismo punto pendiente que `/contact`).
 - Rate limiting en memoria del proceso — si el backend corre con más de una réplica, migrar a un storage compartido (Redis) para que el límite sea efectivo entre todas las instancias (deuda heredada de SEC-FIX-1, aplica igual acá).
 - No hay persistencia de las solicitudes (solo viajan por email); si se necesita un historial/CRM, sumar una tabla — explícitamente fuera de alcance de esta ficha.

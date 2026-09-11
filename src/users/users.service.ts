@@ -182,10 +182,12 @@ export class UsersService {
   }
 
   /**
-   * PROFILE-SEC-1: "cerrar otras sesiones" desde /app/profile — invalida
-   * todo JWT emitido antes de este momento sin tocar la password. El caller
-   * (AuthService.revokeOtherSessions) reemite un token fresco para que la
-   * sesión actual (la que pidió la acción) siga funcionando.
+   * PROFILE-SEC-1: invalida todo JWT emitido antes de este momento para el usuario, sin tocar la
+   * password. Dos callers, mismo mecanismo, efecto opuesto sobre la sesión que pide la acción:
+   * - AuthService.revokeOtherSessions() ("cerrar otras sesiones" desde /app/profile) reemite un
+   *   accessToken fresco para que la sesión actual siga funcionando.
+   * - AuthService.logout() (SEC-003) NO reemite nada — la sesión que pide el logout también queda
+   *   invalidada, que es la semántica esperada de "cerrar sesión" (vs. "cerrar otras sesiones").
    */
   async incrementTokenVersion(id: string): Promise<void> {
     await this.usersRepository.update(id, {

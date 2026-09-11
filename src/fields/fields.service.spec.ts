@@ -5,7 +5,12 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { CreateFieldDto, CreateFieldLotDto } from './dto/create-field.dto';
 import { Field } from './entities/field.entity';
 import { FieldLot } from './entities/field-lot.entity';
+import { MAX_GEOMETRY_COORDINATES } from './fields-constraints';
 import { FieldsService } from './fields.service';
+// SEC-004A: import de namespace (no solo nombrado) para poder espiar isSimpleClosedRing con
+// jest.spyOn — demuestra que el límite de tamaño corta ANTES de llegar a esta función O(n²), sin
+// mockear su implementación (el spy deja pasar la llamada real salvo que el test la restaure).
+import * as ringTopologyUtil from './ring-topology.util';
 
 describe('FieldsService', () => {
   let service: FieldsService;
@@ -73,6 +78,76 @@ describe('FieldsService', () => {
   ];
   const geojsonWithOutOfRangeCoordinate = { type: 'Polygon', coordinates: [ringWithOutOfRangeLongitude] };
 
+  // SEC-004: fixtures topológicamente inválidas — mismo contrato estructural (Polygon de 1 ring)
+  // que exteriorRing arriba, pero degeneradas a nivel de forma geométrica.
+  const openRing = [
+    [-64.1, -31.4],
+    [-64.0, -31.4],
+    [-64.0, -31.3],
+    [-64.05, -31.35],
+  ]; // 4 posiciones, pero el último punto NO repite el primero.
+  const openRingGeojson = { type: 'Polygon', coordinates: [openRing] };
+
+  const bowTieRing = [
+    [0, 0],
+    [4, 4],
+    [4, 0],
+    [0, 1],
+    [0, 0],
+  ];
+  const bowTieGeojson = { type: 'Polygon', coordinates: [bowTieRing] };
+
+  const collinearZeroAreaRing = [
+    [-64.1, -31.4],
+    [-64.05, -31.4],
+    [-64.0, -31.4],
+    [-64.1, -31.4],
+  ]; // 3 vértices distintos, cerrado, pero los tres sobre la misma recta.
+  const collinearZeroAreaGeojson = { type: 'Polygon', coordinates: [collinearZeroAreaRing] };
+
+  const validRectangleRing = [
+    [-64.1, -31.4],
+    [-64.1, -31.3],
+    [-64.0, -31.3],
+    [-64.0, -31.4],
+    [-64.1, -31.4],
+  ];
+  const validRectangleGeojson = { type: 'Polygon', coordinates: [validRectangleRing] };
+
+  // SEC-004C: ring con una posición de 3 componentes ([lon, lat, z]) — estructuralmente un
+  // triángulo cerrado válido salvo por esa única posición con elevación de más.
+  const ringWithExtraDimension = [
+    [-64.1, -31.4, 0],
+    [-64.0, -31.4],
+    [-64.0, -31.3],
+    [-64.1, -31.4, 0],
+  ];
+  const geojsonWithExtraDimension = { type: 'Polygon', coordinates: [ringWithExtraDimension] };
+
+  // SEC-004C: posición con un solo componente ([lon]) — menos de 2.
+  const ringWithTooFewComponents = [
+    [-64.1, -31.4],
+    [-64.0],
+    [-64.0, -31.3],
+    [-64.1, -31.4],
+  ];
+  const geojsonWithTooFewComponents = { type: 'Polygon', coordinates: [ringWithTooFewComponents] };
+
+  /**
+   * SEC-004A: genera un polígono convexo simple con `vertexCount` vértices distintos más el
+   * cierre (total = vertexCount + 1 posiciones) — nunca se auto-intersecta para ningún
+   * vertexCount >= 3 (puntos sobre un círculo, en orden angular), así que sirve tanto para
+   * probar el límite de tamaño como para un caso positivo genuino, sin escribir un array
+   * literal enorme a mano.
+   */
+  const buildConvexRing = (vertexCount: number): number[][] => {
+    const points = Array.from({ length: vertexCount }, (_, i) => {
+      const angle = (2 * Math.PI * i) / vertexCount;
+      return [Math.cos(angle) * 0.01, Math.sin(angle) * 0.01];
+    });
+    return [...points, points[0]];
+  };
+
   const buildField = (overrides: Partial<Field> = {}): Field =>
     ({
       id: 'field-1',
@@ -119,6 +194,13 @@ describe('FieldsService', () => {
     service = module.get(FieldsService);
     fieldRepository = module.get(getRepositoryToken(Field));
     fieldLotRepository = module.get(getRepositoryToken(FieldLot));
+  });
+
+  afterEach(() => {
+    // SEC-004A: restaura cualquier jest.spyOn(ringTopologyUtil, 'isSimpleClosedRing') hecho por
+    // un test puntual — sin esto, un spy quedaría activo (aunque sin mockImplementation, solo
+    // trackeando llamadas) para tests posteriores.
+    jest.restoreAllMocks();
   });
 
   describe('create', () => {
@@ -214,6 +296,70 @@ describe('FieldsService', () => {
       expect(fieldRepository.save).not.toHaveBeenCalled();
     });
 
+    // SEC-004: ring abierto/degenerado — mismo criterio "sin persistencia parcial" que los casos
+    // de arriba (multipart/holes/rango), ahora para la política topológica nueva.
+    it('rechaza un ring abierto sin cerrarlo en silencio, sin llamar a ningún repositorio', async () => {
+      const invalidDto = {
+        ...dto,
+        lots: [{ name: 'lote_1', geojson: openRingGeojson, areaHa: 10 }],
+      } as CreateFieldDto;
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(fieldLotRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un bow-tie (autointersección) sin llamar a ningún repositorio', async () => {
+      const invalidDto = {
+        ...dto,
+        lots: [{ name: 'lote_1', geojson: bowTieGeojson, areaHa: 10 }],
+      } as CreateFieldDto;
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(fieldLotRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un ring cerrado y colineal (área cero) sin llamar a ningún repositorio', async () => {
+      const invalidDto = {
+        ...dto,
+        lots: [{ name: 'lote_1', geojson: collinearZeroAreaGeojson, areaHa: 10 }],
+      } as CreateFieldDto;
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(fieldLotRepository.create).not.toHaveBeenCalled();
+      expect(fieldRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('el mensaje de rechazo es el genérico estable, sin exponer coordenadas', async () => {
+      const invalidDto = {
+        ...dto,
+        lots: [{ name: 'lote_1', geojson: openRingGeojson, areaHa: 10 }],
+      } as CreateFieldDto;
+
+      await expect(service.create(invalidDto, 'user-A')).rejects.toThrow(
+        'El polígono del lote no es válido.',
+      );
+    });
+
+    it('acepta un rectángulo cerrado simple de 5 posiciones', async () => {
+      const validDto = {
+        ...dto,
+        lots: [{ name: 'lote_1', geojson: validRectangleGeojson, areaHa: 10 }],
+      } as CreateFieldDto;
+
+      await service.create(validDto, 'user-A');
+
+      expect(fieldRepository.save).toHaveBeenCalled();
+    });
+
     // RISK-052: startDate/endDate representan un rango real — igualdad e inversión se rechazan
     // antes de tocar los repositorios, ni fieldLotRepository ni fieldRepository deben llamarse.
     it('rechaza startDate === endDate antes de persistir', async () => {
@@ -242,6 +388,178 @@ describe('FieldsService', () => {
       expect(fieldRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({ startDate: '2024-01-01', endDate: '2024-06-01' }),
       );
+    });
+
+    // SEC-004A: límite de coordenadas — evaluado ANTES de isSimpleClosedRing() (O(n²)) y antes
+    // de cualquier escritura, sobre la SUMA de posiciones de todos los lotes del Field.
+    describe('límite de coordenadas (SEC-004A)', () => {
+      it('rechaza un único lote de 5001 posiciones, sin llamar a ningún repositorio', async () => {
+        const oversizedGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES)], // vértices + cierre = 5001
+        };
+        const invalidDto = {
+          ...dto,
+          lots: [{ name: 'lote_1', geojson: oversizedGeojson, areaHa: 10 }],
+        } as CreateFieldDto;
+
+        await expect(service.create(invalidDto, 'user-A')).rejects.toThrow(
+          `La geometría supera el máximo permitido de ${MAX_GEOMETRY_COORDINATES} coordenadas.`,
+        );
+        expect(fieldLotRepository.create).not.toHaveBeenCalled();
+        expect(fieldRepository.create).not.toHaveBeenCalled();
+        expect(fieldRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('rechaza 5001 posiciones distribuidas entre varios lotes, ninguno individualmente sobre el límite', async () => {
+        const lot1Geojson = { type: 'Polygon', coordinates: [buildConvexRing(2999)] }; // 3000 posiciones
+        const lot2Geojson = { type: 'Polygon', coordinates: [buildConvexRing(2000)] }; // 2001 posiciones — suma 5001
+
+        const invalidDto = {
+          ...dto,
+          lots: [
+            { name: 'lote_1', geojson: lot1Geojson, areaHa: 10 },
+            { name: 'lote_2', geojson: lot2Geojson, areaHa: 10 },
+          ],
+        } as CreateFieldDto;
+
+        await expect(service.create(invalidDto, 'user-A')).rejects.toThrow(
+          `La geometría supera el máximo permitido de ${MAX_GEOMETRY_COORDINATES} coordenadas.`,
+        );
+        expect(fieldLotRepository.create).not.toHaveBeenCalled();
+        expect(fieldRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('no ejecuta isSimpleClosedRing() cuando el límite de tamaño ya fue excedido', async () => {
+        const spy = jest.spyOn(ringTopologyUtil, 'isSimpleClosedRing');
+        const oversizedGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES)],
+        };
+        const invalidDto = {
+          ...dto,
+          lots: [{ name: 'lote_1', geojson: oversizedGeojson, areaHa: 10 }],
+        } as CreateFieldDto;
+
+        await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+          BadRequestException,
+        );
+        expect(spy).not.toHaveBeenCalled();
+      });
+
+      it('exactamente 5000 posiciones totales supera el control de tamaño y llega a isSimpleClosedRing()', async () => {
+        const spy = jest.spyOn(ringTopologyUtil, 'isSimpleClosedRing');
+        // vertexCount 4999 + cierre = exactamente 5000 posiciones — igual al límite, no lo supera.
+        const boundaryGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES - 1)],
+        };
+        const boundaryDto = {
+          ...dto,
+          lots: [{ name: 'lote_1', geojson: boundaryGeojson, areaHa: 10 }],
+        } as CreateFieldDto;
+
+        await service.create(boundaryDto, 'user-A');
+
+        expect(spy).toHaveBeenCalled();
+      });
+
+      it('acepta un polígono convexo simple de exactamente 5000 posiciones (caso positivo genuino)', async () => {
+        const boundaryGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES - 1)],
+        };
+        const boundaryDto = {
+          ...dto,
+          lots: [{ name: 'lote_1', geojson: boundaryGeojson, areaHa: 10 }],
+        } as CreateFieldDto;
+
+        await service.create(boundaryDto, 'user-A');
+
+        expect(fieldRepository.save).toHaveBeenCalled();
+      });
+
+      it('varios lotes cuya suma sea exactamente 5000 pasan el control de tamaño', async () => {
+        const lot1Geojson = { type: 'Polygon', coordinates: [buildConvexRing(2998)] }; // 2999 posiciones
+        const lot2Geojson = { type: 'Polygon', coordinates: [buildConvexRing(2000)] }; // 2001 posiciones — suma 5000
+
+        const boundaryDto = {
+          ...dto,
+          lots: [
+            { name: 'lote_1', geojson: lot1Geojson, areaHa: 10 },
+            { name: 'lote_2', geojson: lot2Geojson, areaHa: 10 },
+          ],
+        } as CreateFieldDto;
+
+        await service.create(boundaryDto, 'user-A');
+
+        expect(fieldRepository.save).toHaveBeenCalled();
+      });
+
+      it('un GeoJSON malformado (coordinates no es un array) no rompe el conteo y sigue recibiendo el error geométrico', async () => {
+        const malformedGeojson = { type: 'Polygon', coordinates: 'no-es-un-array' };
+        const invalidDto = {
+          ...dto,
+          lots: [{ name: 'lote_1', geojson: malformedGeojson, areaHa: 10 }],
+        } as CreateFieldDto;
+
+        await expect(service.create(invalidDto, 'user-A')).rejects.toThrow(
+          'El polígono del lote no es válido.',
+        );
+        expect(fieldRepository.save).not.toHaveBeenCalled();
+      });
+    });
+
+    // SEC-004C: cada posición exige EXACTAMENTE [lon, lat] — ni menos ni más componentes.
+    describe('paridad dimensional (SEC-004C)', () => {
+      it('rechaza una posición [lon, lat, z] sin llamar a ningún repositorio', async () => {
+        const invalidDto = {
+          ...dto,
+          lots: [{ name: 'lote_1', geojson: geojsonWithExtraDimension, areaHa: 10 }],
+        } as CreateFieldDto;
+
+        await expect(service.create(invalidDto, 'user-A')).rejects.toThrow(
+          'El polígono del lote no es válido.',
+        );
+        expect(fieldLotRepository.create).not.toHaveBeenCalled();
+        expect(fieldRepository.create).not.toHaveBeenCalled();
+        expect(fieldRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('rechaza una posición con menos de dos componentes', async () => {
+        const invalidDto = {
+          ...dto,
+          lots: [{ name: 'lote_1', geojson: geojsonWithTooFewComponents, areaHa: 10 }],
+        } as CreateFieldDto;
+
+        await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+          BadRequestException,
+        );
+        expect(fieldRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('con varios lotes, una posición tridimensional en cualquiera impide toda persistencia', async () => {
+        const invalidDto = {
+          ...dto,
+          lots: [
+            { name: 'lote_1', geojson: validGeojson, areaHa: 10 },
+            { name: 'lote_2', geojson: geojsonWithExtraDimension, areaHa: 5 },
+          ],
+        } as CreateFieldDto;
+
+        await expect(service.create(invalidDto, 'user-A')).rejects.toBeInstanceOf(
+          BadRequestException,
+        );
+        expect(fieldLotRepository.create).not.toHaveBeenCalled();
+        expect(fieldRepository.create).not.toHaveBeenCalled();
+        expect(fieldRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('sigue aceptando un Polygon simple con posiciones exactamente [lon, lat]', async () => {
+        await service.create(dto, 'user-A');
+
+        expect(fieldRepository.save).toHaveBeenCalled();
+      });
     });
   });
 
@@ -459,6 +777,59 @@ describe('FieldsService', () => {
       expect(fieldLotRepository.update).not.toHaveBeenCalled();
     });
 
+    // SEC-004
+    it('rechaza un ring abierto al reemplazar la geometría, sin ejecutar el update', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+      fieldLotRepository.findOne.mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' });
+
+      await expect(
+        service.updateLot('field-1', 'lot-1', { geojson: openRingGeojson }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(fieldLotRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un bow-tie al reemplazar la geometría, sin ejecutar el update', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+      fieldLotRepository.findOne.mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' });
+
+      await expect(
+        service.updateLot('field-1', 'lot-1', { geojson: bowTieGeojson }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(fieldLotRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un ring colineal de área cero al reemplazar la geometría, sin ejecutar el update', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+      fieldLotRepository.findOne.mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' });
+
+      await expect(
+        service.updateLot('field-1', 'lot-1', { geojson: collinearZeroAreaGeojson }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(fieldLotRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('acepta un rectángulo cerrado simple al reemplazar la geometría', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+      fieldLotRepository.findOne
+        .mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' })
+        .mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1', geojson: validRectangleGeojson });
+
+      const result = await service.updateLot(
+        'field-1',
+        'lot-1',
+        { geojson: validRectangleGeojson },
+        'user-A',
+      );
+
+      expect(fieldLotRepository.update).toHaveBeenCalledWith('lot-1', {
+        geojson: validRectangleGeojson,
+      });
+      expect(result.geojson).toEqual(validRectangleGeojson);
+    });
+
     it('recalcula totalAreaHa cuando cambia areaHa', async () => {
       fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
       fieldLotRepository.findOne
@@ -469,6 +840,100 @@ describe('FieldsService', () => {
       await service.updateLot('field-1', 'lot-1', { areaHa: 55 }, 'user-A');
 
       expect(fieldRepository.update).toHaveBeenCalledWith('field-1', { totalAreaHa: 75 });
+    });
+
+    // SEC-004A
+    describe('límite de coordenadas (SEC-004A)', () => {
+      it('rechaza 5001 posiciones al reemplazar geojson, sin ejecutar el update', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        fieldLotRepository.findOne.mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' });
+        const oversizedGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES)],
+        };
+
+        await expect(
+          service.updateLot('field-1', 'lot-1', { geojson: oversizedGeojson }, 'user-A'),
+        ).rejects.toThrow(
+          `La geometría supera el máximo permitido de ${MAX_GEOMETRY_COORDINATES} coordenadas.`,
+        );
+        expect(fieldLotRepository.update).not.toHaveBeenCalled();
+      });
+
+      it('no ejecuta isSimpleClosedRing() cuando el límite ya fue excedido', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        fieldLotRepository.findOne.mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' });
+        const spy = jest.spyOn(ringTopologyUtil, 'isSimpleClosedRing');
+        const oversizedGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES)],
+        };
+
+        await expect(
+          service.updateLot('field-1', 'lot-1', { geojson: oversizedGeojson }, 'user-A'),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(spy).not.toHaveBeenCalled();
+      });
+
+      it('acepta exactamente 5000 posiciones al reemplazar geojson', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        const boundaryGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES - 1)],
+        };
+        fieldLotRepository.findOne
+          .mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' })
+          .mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1', geojson: boundaryGeojson });
+
+        await service.updateLot('field-1', 'lot-1', { geojson: boundaryGeojson }, 'user-A');
+
+        expect(fieldLotRepository.update).toHaveBeenCalledWith('lot-1', {
+          geojson: boundaryGeojson,
+        });
+      });
+
+      it('un update sólo de metadata (sin geojson) no ejecuta isSimpleClosedRing() ni el chequeo de tamaño', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        fieldLotRepository.findOne
+          .mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' })
+          .mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1', notes: 'nuevo' });
+        const spy = jest.spyOn(ringTopologyUtil, 'isSimpleClosedRing');
+
+        await service.updateLot('field-1', 'lot-1', { notes: 'nuevo' }, 'user-A');
+
+        expect(fieldLotRepository.update).toHaveBeenCalledWith('lot-1', { notes: 'nuevo' });
+        expect(spy).not.toHaveBeenCalled();
+      });
+    });
+
+    // SEC-004C
+    describe('paridad dimensional (SEC-004C)', () => {
+      it('rechaza una posición [lon, lat, z] al reemplazar la geometría, sin ejecutar el update', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        fieldLotRepository.findOne.mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' });
+
+        await expect(
+          service.updateLot(
+            'field-1',
+            'lot-1',
+            { geojson: geojsonWithExtraDimension },
+            'user-A',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+
+        expect(fieldLotRepository.update).not.toHaveBeenCalled();
+      });
+
+      it('un update sólo de metadata sigue funcionando sin verse afectado', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        fieldLotRepository.findOne
+          .mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1' })
+          .mockResolvedValueOnce({ id: 'lot-1', fieldId: 'field-1', notes: 'nuevo' });
+
+        await service.updateLot('field-1', 'lot-1', { notes: 'nuevo' }, 'user-A');
+
+        expect(fieldLotRepository.update).toHaveBeenCalledWith('lot-1', { notes: 'nuevo' });
+      });
     });
   });
 
@@ -564,6 +1029,125 @@ describe('FieldsService', () => {
       ).rejects.toBeInstanceOf(BadRequestException);
 
       expect(fieldLotRepository.save).not.toHaveBeenCalled();
+    });
+
+    // SEC-004
+    it('rechaza un ring abierto sin crear ni guardar el lote', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.createLot('field-1', { ...dto, geojson: openRingGeojson }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(fieldLotRepository.create).not.toHaveBeenCalled();
+      expect(fieldLotRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un bow-tie sin crear ni guardar el lote', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.createLot('field-1', { ...dto, geojson: bowTieGeojson }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(fieldLotRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('rechaza un ring colineal de área cero sin crear ni guardar el lote', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+      await expect(
+        service.createLot('field-1', { ...dto, geojson: collinearZeroAreaGeojson }, 'user-A'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(fieldLotRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('acepta un rectángulo cerrado simple', async () => {
+      fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+      fieldLotRepository.find.mockResolvedValueOnce([]).mockResolvedValueOnce([{ areaHa: 10 }]);
+
+      await service.createLot('field-1', { ...dto, geojson: validRectangleGeojson }, 'user-A');
+
+      expect(fieldLotRepository.save).toHaveBeenCalled();
+    });
+
+    // SEC-004A
+    describe('límite de coordenadas (SEC-004A)', () => {
+      it('rechaza 5001 posiciones sin crear ni guardar el lote', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        const oversizedGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES)],
+        };
+
+        await expect(
+          service.createLot('field-1', { ...dto, geojson: oversizedGeojson }, 'user-A'),
+        ).rejects.toThrow(
+          `La geometría supera el máximo permitido de ${MAX_GEOMETRY_COORDINATES} coordenadas.`,
+        );
+        expect(fieldLotRepository.create).not.toHaveBeenCalled();
+        expect(fieldLotRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('no ejecuta isSimpleClosedRing() cuando el límite ya fue excedido', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        const spy = jest.spyOn(ringTopologyUtil, 'isSimpleClosedRing');
+        const oversizedGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES)],
+        };
+
+        await expect(
+          service.createLot('field-1', { ...dto, geojson: oversizedGeojson }, 'user-A'),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(spy).not.toHaveBeenCalled();
+      });
+
+      it('acepta exactamente 5000 posiciones (polígono convexo simple)', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+        fieldLotRepository.find.mockResolvedValueOnce([]).mockResolvedValueOnce([{ areaHa: 10 }]);
+        const boundaryGeojson = {
+          type: 'Polygon',
+          coordinates: [buildConvexRing(MAX_GEOMETRY_COORDINATES - 1)],
+        };
+
+        await service.createLot('field-1', { ...dto, geojson: boundaryGeojson }, 'user-A');
+
+        expect(fieldLotRepository.save).toHaveBeenCalled();
+      });
+    });
+
+    // SEC-004C
+    describe('paridad dimensional (SEC-004C)', () => {
+      it('rechaza una posición [lon, lat, z] sin crear ni guardar el lote', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+        await expect(
+          service.createLot(
+            'field-1',
+            { ...dto, geojson: geojsonWithExtraDimension },
+            'user-A',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+
+        expect(fieldLotRepository.create).not.toHaveBeenCalled();
+        expect(fieldLotRepository.save).not.toHaveBeenCalled();
+      });
+
+      it('rechaza una posición con menos de dos componentes', async () => {
+        fieldRepository.findOne.mockResolvedValue(buildField({ userId: 'user-A' }));
+
+        await expect(
+          service.createLot(
+            'field-1',
+            { ...dto, geojson: geojsonWithTooFewComponents },
+            'user-A',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+
+        expect(fieldLotRepository.save).not.toHaveBeenCalled();
+      });
     });
   });
 

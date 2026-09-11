@@ -77,7 +77,7 @@ Formato: `ID | Severidad | Componente | Resumen | Prioridad`. Detalle completo (
 | SEC-009 | Worker | Excepciones internas devueltas crudas al caller (`HTTPException(detail=str(exc))`) | Antes de deploy | ✅ **Resuelto (SEC-FIX-1)** |
 | SEC-010 | Backend | `POST /fields` no valida el `geojson` de los lotes al crear (sí al editar) | Después de deploy | Abierto |
 | SEC-011 | Backend | Sin índices en `fields.userId`, `field_lots.fieldId`, `analysis.fieldId`/`lotId` | Después de deploy | Abierto |
-| SEC-012 | Backend | `/auth/logout` no invalida el JWT (sin blacklist); TTL default 7 días | Después de deploy | Abierto (diseño aceptado) |
+| SEC-012 | Backend | `/auth/logout` no invalida el JWT (sin blacklist); TTL default 7 días | Después de deploy | ✅ **Resuelto (SEC-003)** — logout ahora incrementa `tokenVersion`, ver detalle |
 | SEC-013 | Backend | `CONTACT_EMAIL_DRY_RUN` puede quedar en `true` en producción sin ninguna señal visible | Antes de deploy | Abierto — smoke test post-deploy |
 | SEC-014 | Backend | Sin límite de concurrencia de análisis por usuario contra el worker | Después de deploy | Abierto |
 | SEC-015 | Worker | `requirements.txt`: 4 paquetes sin pin de versión (`scipy`, `matplotlib`, `scikit-learn`, `pillow`) | Antes de deploy | Abierto |
@@ -115,10 +115,10 @@ Formato: `ID | Severidad | Componente | Resumen | Prioridad`. Detalle completo (
 - **Estado: ✅ resuelto (SEC-FIX-1).** `src/auth/jwt-secret.util.ts` centraliza la resolución (sin fallback) y la usan tanto `auth.module.ts` como `jwt.strategy.ts`; `main.ts` hace `bootstrap().catch(...)` + `process.exit(1)` con un mensaje que nunca imprime el valor del secreto. Cubierto por `jwt-secret.util.spec.ts` (6 tests, incluido uno que verifica que el mensaje de error no contiene ningún valor de secreto).
 
 **SEC-012 [Medio] — Logout no invalida el JWT; TTL default 7 días**
-- Evidencia: `src/auth/auth.controller.ts:30-33` (`logout()` solo devuelve `{message:'ok'}`, sin tocar el token); `auth.module.ts:22` `expiresIn: ... || '7d'`.
-- Riesgo: es el comportamiento esperado en un esquema JWT stateless sin blacklist — pero un token robado (XSS futuro, laptop comprometida, log accidental) sigue siendo válido hasta por 7 días después del logout.
-- Recomendación: documentar esto como decisión de diseño aceptada, o evaluar TTL más corto + refresh token, o blacklist en Redis si el producto lo justifica.
-- Estado: abierto (aceptable como está, a decisión de negocio).
+- Evidencia (histórica, antes de SEC-003): `logout()` solo devolvía `{message:'ok'}`, sin tocar el token, aceptando requests sin JWT.
+- Riesgo: un token robado (XSS futuro, laptop comprometida, log accidental) seguía siendo válido hasta por 7 días después del logout — el borrado de `localStorage` en el cliente no revocaba nada server-side.
+- **Resuelto (SEC-003):** `POST /auth/logout` ahora requiere `JwtAuthGuard` y reutiliza `User.tokenVersion` (el mismo mecanismo de invalidación por generación que ya usaban `change-password`/`reset-password`/`revoke-other-sessions`) — ver `src/auth/auth.controller.ts` y `src/auth/auth.service.ts`. Limitación deliberada de esta remediación mínima: no hay sesiones individuales ni JTI, así que logout invalida **todas** las sesiones del usuario, no solo la que lo ejecuta (mismo comportamiento ya aceptado para "cerrar otras sesiones"). El TTL del JWT (`JWT_EXPIRES_IN`, default 7 días) no cambió — sigue acotando cuánto puede durar un token nunca deslogueado explícitamente.
+- Estado: resuelto.
 
 **Ownership (`fields`, `analysis`, PDF) — OK, sin hallazgos nuevos.**
 `FieldsService.findOne(id, userId)` (`src/fields/fields.service.ts:83-100`) y `AnalysisService.findOneOwned`/`findByField` (`src/analysis/analysis.service.ts:92-122`) validan ownership por `userId` de forma consistente, con default-deny explícito para casos legacy sin Field asociado. Las 3 rutas de reporte (`/analysis/:id/report`, `/report/download`, `/report/pdf`) pasan todas por `findOneOwned` antes de tocar filesystem o generar el PDF. Los comentarios `AUTH-3`/`AUTH-4` en el propio código documentan que hubo una brecha de ownership real en una versión anterior de `findByField`, ya corregida — buena señal de proceso.

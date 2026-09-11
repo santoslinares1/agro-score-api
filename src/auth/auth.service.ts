@@ -19,7 +19,6 @@ import { AcceptInvitationDto } from './dto/accept-invitation.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { DeactivateAccountDto } from './dto/deactivate-account.dto';
 import { LoginDto } from './dto/login.dto';
-import { RegisterDto } from './dto/register.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { hashToken } from './token.util';
 
@@ -54,27 +53,10 @@ export class AuthService {
     private readonly dataSource: DataSource,
   ) {}
 
-  async register(dto: RegisterDto): Promise<AuthResponse> {
-    const email = this.normalizeEmail(dto.email);
-
-    const existing = await this.usersService.findByEmail(email);
-
-    if (existing) {
-      throw new ConflictException('Ya existe una cuenta con ese email.');
-    }
-
-    const passwordHash = await bcrypt.hash(dto.password, SALT_ROUNDS);
-
-    const user = await this.usersService.create({
-      email,
-      passwordHash,
-      fullName: dto.fullName.trim(),
-      companyName: dto.companyName?.trim() || undefined,
-    });
-
-    return this.buildAuthResponse(user);
-  }
-
+  // SEC-002 (AUTH-POLICY-1): no hay método `register()` — el registro público
+  // fue eliminado a nivel de ruta y de servicio (ver AuthController). El alta
+  // de un usuario nuevo pasa por `acceptInvitation` (más abajo) o por
+  // `UsersService.create` invocado desde AdminService.
   async login(dto: LoginDto): Promise<AuthResponse> {
     const email = this.normalizeEmail(dto.email);
 
@@ -370,6 +352,46 @@ export class AuthService {
     });
 
     return this.buildAuthResponse(updated);
+  }
+
+  /**
+   * SEC-003: cierra el replay de un JWT después de logout reutilizando el mismo mecanismo de
+   * invalidación por generación que `changePassword`/`revokeOtherSessions` (`tokenVersion`) — no
+   * hay sesiones individuales, JTI ni blacklist en AgroScore, así que "cerrar sesión" y "cerrar
+   * todas las sesiones" son, en este modelo, la MISMA operación: el incremento invalida
+   * indistintamente el JWT que ejecutó el logout y cualquier otro emitido antes para el mismo
+   * usuario. Limitación deliberada de esta remediación mínima (ver docs/audits/secops-audit.md,
+   * SEC-012).
+   *
+   * A diferencia de `revokeOtherSessions` (que reemite un accessToken para que la sesión que pidió
+   * la acción siga funcionando), logout NO reemite nada — es la semántica esperada de "cerrar
+   * sesión": quien lo pide también queda deslogueado.
+   *
+   * Igual que `resetPassword`/`acceptInvitation`, la auditoría corre DESPUÉS de que el incremento
+   * ya se aplicó (un solo `UPDATE` atómico vía `UsersService.incrementTokenVersion`, sin
+   * transacción explícita que lo agrupe con el audit log — no hay dos escrituras que necesiten
+   * serializarse entre sí, a diferencia de resetPassword). Si `auditLogService.record()` fallara,
+   * se propaga sin capturar (mismo criterio sin try/catch que el resto de este archivo): el
+   * request respondería con error 500 aunque el token YA quedó revocado. La invariante de
+   * seguridad (ningún JWT anterior autoriza un request nuevo) se sostiene igual — solo la
+   * respuesta HTTP no lo refleja como éxito. No se agrega try/catch acá por la misma razón
+   * documentada en resetPassword: sería un cambio de comportamiento transversal a los otros
+   * métodos de este archivo, fuera de alcance de esta ficha.
+   */
+  async logout(
+    userId: string,
+    requestMeta: RequestAuditMeta = {},
+  ): Promise<{ message: string }> {
+    await this.usersService.incrementTokenVersion(userId);
+
+    await this.auditLogService.record({
+      actor: { actorUserId: userId, ip: requestMeta.ip, userAgent: requestMeta.userAgent },
+      action: 'auth.logout',
+      targetType: 'user',
+      targetId: userId,
+    });
+
+    return { message: 'Sesión cerrada correctamente.' };
   }
 
   /**
