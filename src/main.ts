@@ -4,9 +4,17 @@ import { NestFactory } from '@nestjs/core';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { resolveCorsOrigins } from './config/cors-origins.util';
+import { NestExpressApplication } from '@nestjs/platform-express';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app =
+    await NestFactory.create<NestExpressApplication>(AppModule);
+
+  // Producción: Internet -> Nginx -> NestJS.
+  // Nginx es el único proxy confiable antes de la aplicación.
+  if (process.env.NODE_ENV === 'production') {
+    app.set('trust proxy', 1);
+  }
 
   // SEC-FIX-1: cabeceras de seguridad HTTP estándar. No interfiere con CORS
   // (son middlewares independientes) ni con el CORS_ORIGIN + credentials ni
