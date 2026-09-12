@@ -179,6 +179,38 @@ export class Analysis {
   @Column({ type: 'timestamp', nullable: true })
   firstPdfDownloadedAt: Date | null;
 
+  /**
+   * KPI review — instrumentación (ticket 3/3, "Modo de análisis solicitado no persistido",
+   * RISK-024): copia literal de `RunFieldAnalysisDto.includeMapAssets` / `includeIndexImages` /
+   * `includeImageSeries` tal como llegaron a `AnalysisService.runFieldAnalysis` para ESTA
+   * ejecución puntual — ver `AnalysisService.buildAnalysisInsertValues`, el único escritor,
+   * fijado UNA sola vez en el INSERT inicial (`status='Procesando'`), nunca recalculado al
+   * finalizar/fallar/reintentar.
+   *
+   * Deliberadamente los tres booleanos crudos, NUNCA un enum de "modo" (`Diagnóstico
+   * productivo` / `Informe visual completo`): esa taxonomía de producto sigue sin decidirse (ver
+   * Q-011 en 21-open-questions.md) — inventar un mapeo acá sería una decisión de producto
+   * disfrazada de instrumentación. Para un Analysis programado (`scheduled-analysis`), estos tres
+   * campos reflejan el valor REAL forzado por `ScheduledAnalysisRunnerService` (siempre `true` en
+   * el runner vigente, ver RISK-014) — nunca lo configurado en `FieldAnalysisSchedule`, que el
+   * runner ignora a propósito.
+   *
+   * `null` (nunca `false`) tanto para todo Analysis anterior a este rollout como para cualquier
+   * caller que no envíe el flag correspondiente — la ausencia de dato y "explícitamente false"
+   * son cosas distintas, y esta columna preserva esa distinción en vez de fabricar un default.
+   * Sin backfill: inferir esto desde `resultJson` (`hasRgbImage`/etc.) reintroduciría la
+   * ambigüedad "no se pidió" vs. "se pidió y Earth Engine no tenía imagen disponible" que esta
+   * columna existe para evitar.
+   */
+  @Column({ type: 'boolean', nullable: true })
+  requestedMapAssets: boolean | null;
+
+  @Column({ type: 'boolean', nullable: true })
+  requestedIndexImages: boolean | null;
+
+  @Column({ type: 'boolean', nullable: true })
+  requestedImageSeries: boolean | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

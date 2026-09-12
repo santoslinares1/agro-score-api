@@ -974,7 +974,14 @@ export class AnalysisService {
   private buildAnalysisInsertValues(
     fieldId: string,
     field: Field,
-    input: { maxCloudiness: number; startDate: string; endDate: string },
+    input: {
+      maxCloudiness: number;
+      startDate: string;
+      endDate: string;
+      includeMapAssets?: boolean;
+      includeIndexImages?: boolean;
+      includeImageSeries?: boolean;
+    },
   ): Record<string, unknown> {
     return {
       scope: 'field',
@@ -986,6 +993,12 @@ export class AnalysisService {
       maxCloudiness: input.maxCloudiness,
       startDate: input.startDate,
       endDate: input.endDate,
+      // KPI review — instrumentación (ticket 3/3, RISK-024): copia literal de lo que efectivamente
+      // llegó a esta ejecución — `?? null`, nunca `?? false`: un flag ausente no es lo mismo que
+      // "explícitamente pedido en false". Ver el docstring de estas columnas en Analysis.
+      requestedMapAssets: input.includeMapAssets ?? null,
+      requestedIndexImages: input.includeIndexImages ?? null,
+      requestedImageSeries: input.includeImageSeries ?? null,
       resultJson: {
         mode: 'python-worker-v2',
         message: 'Análisis de campo en procesamiento.',
@@ -1071,7 +1084,14 @@ export class AnalysisService {
   private async resolveOrCreateByClientRequestId(
     fieldId: string,
     field: Field,
-    input: { maxCloudiness: number; startDate: string; endDate: string },
+    input: {
+      maxCloudiness: number;
+      startDate: string;
+      endDate: string;
+      includeMapAssets?: boolean;
+      includeIndexImages?: boolean;
+      includeImageSeries?: boolean;
+    },
     clientRequestId: string,
   ): Promise<{ won: boolean; analysis: Analysis }> {
     const candidateId = randomUUID();

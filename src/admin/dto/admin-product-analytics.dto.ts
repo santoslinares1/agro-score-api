@@ -71,6 +71,26 @@ export type AdminProductAnalyticsCoverage = {
   nonCanonicalSchedules: {
     count: number;
   };
+  /**
+   * Cobertura histórica de `Analysis.completedAt` — insumo directo de `activation` y
+   * `timeToFirstTechnicalValue` (ambas filtran `completedAt IS NOT NULL`, ver
+   * AdminService.computeActivationAndTimeToValue). Mismo criterio honesto que
+   * `scheduleHistory`: expone cuándo el dato empieza a existir en vez de que esas dos métricas
+   * subestimen en silencio a usuarios cuyo único Analysis sufficient es anterior al rollout de la
+   * columna (migración `AddAnalysisTimingFields`, sin backfill).
+   */
+  analysisTimingAvailability: {
+    /** Instante ISO del `MIN(completedAt)` real entre TODOS los Analysis, o null si ninguno tiene
+     * `completedAt` todavía. Nunca inferido desde el nombre/fecha de una migración — solo desde
+     * el dato persistido, igual que `scheduleHistory.availableFrom`. */
+    availableFrom: string | null;
+    /** true solo si no existe ningún Analysis `Finalizado` con `completedAt IS NULL` creado ANTES
+     * de `availableFrom` — es decir, si el universo "Finalizado antes del rollout" está vacío.
+     * false (incluyendo `availableFrom: null`) significa que `activation`/
+     * `timeToFirstTechnicalValue` pueden estar subestimando usuarios que se activaron antes de
+     * que existiera esta columna. */
+    complete: boolean;
+  };
 };
 
 export type AdminNorthStarMetric = {

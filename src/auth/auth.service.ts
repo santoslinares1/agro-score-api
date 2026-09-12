@@ -85,6 +85,12 @@ export class AuthService {
       throw new UnauthorizedException('Credenciales inválidas.');
     }
 
+    // KPI review — instrumentación (ticket 2/3, "Recurrencia real de usuario"): recién acá, con
+    // credenciales e isActive ya validados — nunca antes, para no registrar un intento fallido
+    // como si fuera un login real. recordLogin nunca lanza (ver UsersService.recordLogin), así
+    // que esto no puede convertir un login legítimo en un error.
+    await this.usersService.recordLogin(user.id);
+
     return this.buildAuthResponse(user);
   }
 

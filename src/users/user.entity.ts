@@ -80,6 +80,28 @@ export class User {
   @Column({ type: 'timestamp', nullable: true })
   activationAssistanceStartedAt: Date | null;
 
+  /**
+   * KPI review — instrumentación (ticket 2/3, "Recurrencia real de usuario"): última vez que
+   * este usuario completó un login exitoso — ver UsersService.recordLogin / AuthService.login.
+   * A diferencia de `activationAssistanceStartedAt` (set-once), esta columna se SOBREESCRIBE en
+   * cada login: importa la última vez, no la primera.
+   *
+   * Nunca se actualiza en un login fallido (password incorrecta, cuenta inactiva, email
+   * inexistente), ni en ningún otro flujo (aceptar invitación, reset de password). Hoy no existe
+   * endpoint de refresh de token (`JWT_EXPIRES_IN=7d`, ver `.env.example`, ni `AuthController`),
+   * así que un usuario activo dentro de su misma sesión de hasta 7 días no vuelve a loguearse:
+   * esta columna mide "última vez que inició sesión", no "última vez que usó la aplicación", y
+   * por eso subestima recurrencia en ventanas menores a la duración de esa sesión.
+   *
+   * `null` para todo usuario existente antes de este rollout y para todo usuario que nunca inició
+   * sesión desde entonces — no existe backfill posible (no había ningún registro de logins antes
+   * de esta columna, en ningún repo). Deliberadamente excluida de `PublicUser` (ver ese tipo en
+   * users.service.ts) y de cualquier respuesta HTTP: capturar el dato es el alcance de este
+   * ticket, exponerlo es un ticket aparte.
+   */
+  @Column({ type: 'timestamp', nullable: true })
+  lastLoginAt: Date | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

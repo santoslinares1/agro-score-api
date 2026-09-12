@@ -88,6 +88,21 @@ describe('Recorrido real de autenticación tras un reset de password (F03)', () 
         }
         return { affected: 1 };
       },
+      // KPI review — instrumentación (ticket 2/3): AuthService.login() ahora llama
+      // UsersService.recordLogin() (createQueryBuilder().update().set().where().execute()) antes
+      // de emitir el JWT. No probar lastLoginAt es intencional acá — esta suite es sobre
+      // invalidación de JWT, no sobre esa instrumentación — pero el doble tiene que soportar la
+      // llamada real para no ensuciar el resultado con un catch silencioso (ver
+      // UsersService.recordLogin, que nunca lanza).
+      createQueryBuilder: () => ({
+        update: () => ({
+          set: () => ({
+            where: () => ({
+              execute: async () => ({ affected: 1 }),
+            }),
+          }),
+        }),
+      }),
     };
 
     const fakePasswordResetRepo = {

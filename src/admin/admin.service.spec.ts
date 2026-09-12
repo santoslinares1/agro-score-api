@@ -3763,14 +3763,23 @@ describe('AdminService', () => {
 
     // Simula el scan paginado de Analysis: `batches` es una lista de páginas, cada una un array de
     // filas {resultJson, completedAt, userId} — mockImplementation consume una página por llamada,
-    // devolviendo [] (fin del scan) una vez agotadas.
+    // devolviendo [] (fin del scan) una vez agotadas. `timingCoverage` responde, aparte, a la
+    // query de getAnalysisTimingCoverage (discriminada por texto — comparte analysisRepo con el
+    // scan, igual que fieldAnalysisScheduleTransitionRepo comparte North Star y scheduleHistory).
     function mockActivationScan(
       batches: Array<
         Array<{ resultJson: unknown; completedAt: Date; userId: string }>
       >,
+      timingCoverage: { availableFrom: Date | null; hasGap: boolean } = {
+        availableFrom: null,
+        hasGap: false,
+      },
     ) {
       let call = 0;
-      analysisRepo.manager.query.mockImplementation(() => {
+      analysisRepo.manager.query.mockImplementation((sql: string) => {
+        if (sql.includes('"availableFrom"')) {
+          return Promise.resolve([timingCoverage]);
+        }
         const page = batches[call] ?? [];
         call += 1;
         return Promise.resolve(page);
@@ -3794,6 +3803,7 @@ describe('AdminService', () => {
       });
       expect(result.coverage.scheduleHistory).toBeDefined();
       expect(result.coverage.analysisClassificationScan).toBeDefined();
+      expect(result.coverage.analysisTimingAvailability).toBeDefined();
     });
 
     describe('North Star (KPI #1 — campos con monitoreo utilizable semanal)', () => {
@@ -4277,6 +4287,78 @@ describe('AdminService', () => {
       });
     });
 
+    describe('Cobertura de completedAt en Analysis (KPI review — instrumentación, ticket 1/3)', () => {
+      it('sin ningún completedAt todavía: availableFrom null y complete false', async () => {
+        mockActivationScan([], { availableFrom: null, hasGap: false });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.analysisTimingAvailability).toEqual({
+          availableFrom: null,
+          complete: false,
+        });
+      });
+
+      it('existe un Analysis Finalizado sin completedAt anterior a la baseline: complete false', async () => {
+        mockActivationScan([], {
+          availableFrom: new Date('2026-08-18T22:30:19.017Z'),
+          hasGap: true,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.analysisTimingAvailability).toEqual({
+          availableFrom: '2026-08-18T22:30:19.017Z',
+          complete: false,
+        });
+      });
+
+      it('ningún Finalizado sin completedAt anterior a la baseline: complete true', async () => {
+        mockActivationScan([], {
+          availableFrom: new Date('2026-08-18T22:30:19.017Z'),
+          hasGap: false,
+        });
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        expect(result.coverage.analysisTimingAvailability.complete).toBe(true);
+      });
+
+      it('convive con un scan de activation real sin contaminar sus páginas (queries independientes sobre el mismo repo)', async () => {
+        const createdAt = new Date('2026-08-01T00:00:00Z');
+        const completedAt = new Date('2026-08-20T00:00:00Z');
+        usersService.listEligibleProducers.mockResolvedValue([
+          { id: 'user-1', createdAt },
+        ]);
+        mockActivationScan(
+          [[{ resultJson: buildSufficientResultJson(), completedAt, userId: 'user-1' }]],
+          { availableFrom: new Date('2026-08-18T00:00:00Z'), hasGap: false },
+        );
+
+        const result = await service.getProductAnalytics({
+          week: '2026-09-02',
+        });
+
+        // Ambas queries comparten analysisRepo.manager.query y se resuelven correctamente sin
+        // interferirse: la de cobertura no consume la página del scan, ni viceversa.
+        expect(result.activation).toEqual({
+          eligibleUsersCount: 1,
+          activatedUsersCount: 1,
+          rate: 1,
+        });
+        expect(result.coverage.analysisTimingAvailability).toEqual({
+          availableFrom: '2026-08-18T00:00:00.000Z',
+          complete: true,
+        });
+      });
+    });
+
     describe('Activation (KPI #2) y Time to First Technical Value (KPI #3)', () => {
       it('Cero usuarios elegibles: todo en 0, rates null, scan nunca se dispara', async () => {
         usersService.listEligibleProducers.mockResolvedValue([]);
@@ -4298,7 +4380,13 @@ describe('AdminService', () => {
           p75Hours: null,
           p95Hours: null,
         });
-        expect(analysisRepo.manager.query).not.toHaveBeenCalled();
+        // analysisRepo.manager.query SÍ recibe la query de cobertura (getAnalysisTimingCoverage,
+        // independiente de la cohorte elegible) — lo que nunca debe dispararse sin usuarios
+        // elegibles es específicamente el SCAN paginado de activation.
+        const scanCalls = analysisRepo.manager.query.mock.calls.filter(
+          ([sql]: [string]) => !sql.includes('"availableFrom"'),
+        );
+        expect(scanCalls).toHaveLength(0);
       });
 
       it('POSITIVO: un Analysis sufficient activa al usuario en su completedAt', async () => {
@@ -4518,7 +4606,16 @@ describe('AdminService', () => {
 
         await service.getProductAnalytics({ week: '2026-09-02' });
 
-        const [sql] = analysisRepo.manager.query.mock.calls[0] as [string];
+        // analysisRepo.manager.query también recibe, en la misma corrida, la query de cobertura
+        // de getAnalysisTimingCoverage — se distingue por exclusión, igual que
+        // findNorthStarQueryCall más arriba para fieldAnalysisScheduleTransitionRepo.
+        const scanCall = analysisRepo.manager.query.mock.calls.find(
+          ([callSql]: [string]) => !callSql.includes('"availableFrom"'),
+        );
+        if (!scanCall) {
+          throw new Error('No se encontró la query del scan de activation en los mocks.');
+        }
+        const [sql] = scanCall as [string];
         // ORDER BY con desempate por id — sin esto, dos Analysis con el mismo completedAt exacto
         // pueden caer en lados opuestos de un LIMIT, y un cursor de una sola columna con ">"
         // estricto nunca vuelve a pedir la fila que quedó del lado equivocado.

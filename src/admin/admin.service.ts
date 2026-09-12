@@ -512,6 +512,7 @@ export class AdminService {
       qualityBreakdown,
       scheduleHistoryCoverage,
       nonCanonicalSchedulesCount,
+      analysisTimingCoverage,
     ] = await Promise.all([
       this.computeNorthStar(week, northStarCutoffInstant),
       this.computeActivationAndTimeToValue(),
@@ -519,12 +520,14 @@ export class AdminService {
       this.computeQualityBreakdown(week),
       this.getScheduleHistoryCoverage(northStarCutoffInstant),
       this.getNonCanonicalSchedulesCount(),
+      this.getAnalysisTimingCoverage(),
     ]);
 
     const coverage: AdminProductAnalyticsCoverage = {
       scheduleHistory: scheduleHistoryCoverage,
       analysisClassificationScan: activationAndTimeToValue.coverage,
       nonCanonicalSchedules: { count: nonCanonicalSchedulesCount },
+      analysisTimingAvailability: analysisTimingCoverage,
     };
 
     return {
@@ -790,6 +793,51 @@ export class AdminService {
     return {
       availableFrom: availableFromDate.toISOString(),
       complete: cutoffInstant.getTime() >= availableFromDate.getTime(),
+    };
+  }
+
+  /**
+   * Cobertura honesta del insumo de `activation`/`timeToFirstTechnicalValue` (KPI review —
+   * instrumentación, ticket 1/3): ambas métricas filtran `Analysis.completedAt IS NOT NULL`
+   * (columna agregada por la migración `AddAnalysisTimingFields`, sin backfill — ver esa
+   * migración). Mismo patrón que `getScheduleHistoryCoverage`: `availableFrom` se calcula SIEMPRE
+   * desde el dato real (`MIN(completedAt)`), nunca desde la fecha de la migración — un deploy no
+   * prueba que la columna ya tenga datos reales.
+   *
+   * `complete` exige que no exista ningún Analysis `Finalizado` con `completedAt IS NULL` creado
+   * ANTES de `availableFrom` — si existe, significa que hay usuarios cuyo primer resultado
+   * sufficient puede ser anterior al rollout y por lo tanto invisible para `activation`/
+   * `timeToFirstTechnicalValue`, que no tienen forma de contarlos. Sin ningún `completedAt`
+   * todavía (`availableFrom: null`) nunca se afirma `complete: true` — ausencia total de datos no
+   * es cobertura completa, mismo criterio que `getScheduleHistoryCoverage`.
+   */
+  private async getAnalysisTimingCoverage(): Promise<
+    AdminProductAnalyticsCoverage['analysisTimingAvailability']
+  > {
+    const rows = await this.analysisRepository.manager.query<
+      { availableFrom: Date | null; hasGap: boolean }[]
+    >(
+      `SELECT
+         (SELECT MIN("completedAt") FROM analysis) AS "availableFrom",
+         EXISTS (
+           SELECT 1 FROM analysis
+           WHERE status = 'Finalizado'
+             AND "completedAt" IS NULL
+             AND "createdAt" < (SELECT MIN("completedAt") FROM analysis)
+         ) AS "hasGap"`,
+    );
+
+    const availableFrom = rows[0]?.availableFrom ?? null;
+
+    if (!availableFrom) {
+      // Sin ningún completedAt todavía: igual que getScheduleHistoryCoverage, ausencia total de
+      // evidencia nunca se afirma como cobertura completa.
+      return { availableFrom: null, complete: false };
+    }
+
+    return {
+      availableFrom: new Date(availableFrom).toISOString(),
+      complete: !rows[0].hasGap,
     };
   }
 

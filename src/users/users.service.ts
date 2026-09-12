@@ -1,4 +1,4 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { ConflictException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, In, Not, Repository, UpdateResult } from 'typeorm';
 
@@ -8,7 +8,14 @@ import { ADMIN_ROLES, UserRole } from './user-role.enum';
 // PROFILE-SEC-1: tokenVersion se excluye del shape público igual que
 // passwordHash — es un detalle interno de invalidación de JWT, no algo que
 // el frontend necesite leer.
-export type PublicUser = Omit<User, 'passwordHash' | 'tokenVersion'>;
+//
+// KPI review — instrumentación (ticket 2/3): lastLoginAt se excluye por ahora del mismo modo —
+// no por sensibilidad, sino porque capturar el dato es el alcance de ese ticket y exponerlo es
+// una decisión de producto/UI aparte (ver el docstring de User.lastLoginAt).
+export type PublicUser = Omit<
+  User,
+  'passwordHash' | 'tokenVersion' | 'lastLoginAt'
+>;
 
 export type ListUsersParams = {
   page: number;
@@ -25,6 +32,8 @@ export type UpdateUserFields = Partial<
 
 @Injectable()
 export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+
   constructor(
     @InjectRepository(User)
     private readonly usersRepository: Repository<User>,
@@ -178,6 +187,38 @@ export class UsersService {
   }
 
   /**
+   * KPI review — instrumentación (ticket 2/3, "Recurrencia real de usuario"): always-overwrite —
+   * a diferencia de `markActivationAssistanceStarted`, este UPDATE NO lleva guard `IS NULL`: cada
+   * login exitoso pisa el valor anterior a propósito, porque lo que importa es la ÚLTIMA vez, no
+   * la primera. El timestamp es SIEMPRE `now()` de Postgres — no hay ningún parámetro de
+   * timestamp en la firma, así que ningún caller puede inyectar uno.
+   *
+   * Nunca lanza: el único caller real (`AuthService.login()`, tras validar credenciales e
+   * `isActive`) ya completó la parte que importa del login — un fallo de esta señal secundaria
+   * (SQL, conexión) se registra y se resuelve en silencio, nunca convierte un login legítimo en
+   * un error HTTP. Mismo criterio que `AnalysisService.markPdfDownloaded`.
+   *
+   * No valida existencia del usuario ni devuelve nada: el caller ya tiene el `User` completo
+   * (viene de `findByEmail` en el mismo flujo), así que no hace falta releerlo para confirmar.
+   */
+  async recordLogin(userId: string): Promise<void> {
+    try {
+      await this.usersRepository
+        .createQueryBuilder()
+        .update(User)
+        .set({ lastLoginAt: () => 'now()' })
+        .where('id = :id', { id: userId })
+        .execute();
+    } catch (error) {
+      this.logger.error(
+        `No se pudo persistir lastLoginAt para userId=${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
    * ADMIN-1: cuenta cuántos usuarios activos tienen el rol dado, excluyendo
    * opcionalmente un id — usado para la protección de "último owner" antes
    * de degradar o desactivar a alguien.
@@ -274,7 +315,13 @@ export class UsersService {
   }
 
   toPublicUser(user: User): PublicUser {
-    const { passwordHash: _passwordHash, tokenVersion: _tokenVersion, ...publicUser } = user;
+    const {
+      passwordHash: _passwordHash,
+      tokenVersion: _tokenVersion,
+      // KPI review — instrumentación (ticket 2/3): ver el comentario de PublicUser arriba.
+      lastLoginAt: _lastLoginAt,
+      ...publicUser
+    } = user;
 
     return publicUser;
   }

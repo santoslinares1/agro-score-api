@@ -117,6 +117,7 @@ describe('AuthService', () => {
             updatePassword: jest.fn().mockResolvedValue({ affected: 1 }),
             incrementTokenVersion: jest.fn().mockResolvedValue(undefined),
             countActiveByRole: jest.fn().mockResolvedValue(1),
+            recordLogin: jest.fn().mockResolvedValue(undefined),
             toPublicUser: jest.fn((user: User) => {
               const { passwordHash: _passwordHash, tokenVersion: _tokenVersion, ...rest } = user;
               return rest;
@@ -172,6 +173,30 @@ describe('AuthService', () => {
       );
     });
 
+    // KPI review — instrumentación (ticket 2/3, "Recurrencia real de usuario").
+    it('POSITIVO: un login exitoso registra lastLoginAt del usuario correcto', async () => {
+      usersService.findByEmail.mockResolvedValue(buildUser());
+
+      await service.login({
+        email: 'usera@example.com',
+        password: 'password123',
+      });
+
+      expect(usersService.recordLogin).toHaveBeenCalledWith('user-1');
+      expect(usersService.recordLogin).toHaveBeenCalledTimes(1);
+    });
+
+    it('POSITIVO: recordLogin nunca aparece en el shape público devuelto (excluido de PublicUser)', async () => {
+      usersService.findByEmail.mockResolvedValue(buildUser());
+
+      const result = await service.login({
+        email: 'usera@example.com',
+        password: 'password123',
+      });
+
+      expect(result.user).not.toHaveProperty('lastLoginAt');
+    });
+
     it('rechaza password incorrecta con Unauthorized genérico', async () => {
       usersService.findByEmail.mockResolvedValue(buildUser());
 
@@ -180,6 +205,8 @@ describe('AuthService', () => {
       ).rejects.toMatchObject({
         message: 'Credenciales inválidas.',
       });
+      // NEGATIVO: password incorrecta nunca registra un login.
+      expect(usersService.recordLogin).not.toHaveBeenCalled();
     });
 
     it('rechaza email inexistente con el mismo mensaje genérico (no revela si existe)', async () => {
@@ -190,6 +217,8 @@ describe('AuthService', () => {
       ).rejects.toMatchObject({
         message: 'Credenciales inválidas.',
       });
+      // NEGATIVO: email inexistente nunca registra un login.
+      expect(usersService.recordLogin).not.toHaveBeenCalled();
     });
 
     it('ambos casos de login inválido son UnauthorizedException', async () => {
@@ -213,6 +242,8 @@ describe('AuthService', () => {
       await expect(
         service.login({ email: 'usera@example.com', password: 'password123' }),
       ).rejects.toMatchObject({ message: 'Credenciales inválidas.' });
+      // NEGATIVO: una cuenta inactiva con password correcta tampoco registra un login.
+      expect(usersService.recordLogin).not.toHaveBeenCalled();
     });
   });
 

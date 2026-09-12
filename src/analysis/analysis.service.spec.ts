@@ -1236,6 +1236,104 @@ describe('AnalysisService', () => {
     });
   });
 
+  describe('runFieldAnalysis — modo solicitado persistido (KPI review, ticket 3/3, RISK-024)', () => {
+    const runAndCapture = async (input: {
+      includeMapAssets?: boolean;
+      includeIndexImages?: boolean;
+      includeImageSeries?: boolean;
+    }) => {
+      fieldsService.findOne.mockResolvedValue(buildField());
+      fieldsService.getPipelineInput.mockResolvedValue({
+        fieldId: 'field-1',
+        name: 'Campo A',
+        lots: [
+          {
+            id: 'lot-1',
+            name: 'Lote 1',
+            geojson: {},
+            areaHa: 10,
+            includeInProductivityClassification: true,
+          },
+        ],
+      } as any);
+      analysisRepository.findOne.mockResolvedValue(null); // sin análisis Procesando duplicado
+
+      return service.runFieldAnalysis(
+        'field-1',
+        {
+          startDate: '2024-01-01',
+          endDate: '2024-06-01',
+          maxCloudiness: 30,
+          ...input,
+        },
+        'user-A',
+      );
+    };
+
+    it('POSITIVO: persiste exactamente los tres flags recibidos, cada uno con su propio valor', async () => {
+      const analysis = await runAndCapture({
+        includeMapAssets: true,
+        includeIndexImages: false,
+        includeImageSeries: true,
+      });
+
+      expect(lastInsertValues.requestedMapAssets).toBe(true);
+      expect(lastInsertValues.requestedIndexImages).toBe(false);
+      expect(lastInsertValues.requestedImageSeries).toBe(true);
+      expect((analysis as any).requestedMapAssets).toBe(true);
+      expect((analysis as any).requestedIndexImages).toBe(false);
+      expect((analysis as any).requestedImageSeries).toBe(true);
+    });
+
+    it('NEGATIVO: sin ningún flag enviado, las tres columnas quedan null — nunca false', async () => {
+      await runAndCapture({});
+
+      expect(lastInsertValues.requestedMapAssets).toBeNull();
+      expect(lastInsertValues.requestedIndexImages).toBeNull();
+      expect(lastInsertValues.requestedImageSeries).toBeNull();
+    });
+
+    // Mismo valor exacto que ScheduledAnalysisRunnerService.triggerRun pasa hoy (RISK-014) — no
+    // lo configurado (e ignorado) en FieldAnalysisSchedule. No hay una ruta de código distinta
+    // para scheduled-analysis: ejercita el mismo mecanismo genérico con esos valores puntuales.
+    it('scheduled-analysis: persiste true/true/true cuando el runner los fuerza explícitamente (RISK-014)', async () => {
+      await runAndCapture({
+        includeMapAssets: true,
+        includeIndexImages: true,
+        includeImageSeries: true,
+      });
+
+      expect(lastInsertValues.requestedMapAssets).toBe(true);
+      expect(lastInsertValues.requestedIndexImages).toBe(true);
+      expect(lastInsertValues.requestedImageSeries).toBe(true);
+    });
+
+    it('NO-SIDE-EFFECT: no aparece en el payload enviado al Worker (nombres distintos a propósito)', async () => {
+      pythonWorkerService.runFieldAnalysis.mockResolvedValue({
+        globalScore: 1,
+        category: 'x',
+        confidenceScore: 1,
+        productivityScore: 1,
+        stabilityScore: 1,
+        soilScore: 1,
+        climateScore: 1,
+        ndviAverageMax: 1,
+        ndviVariability: 'Media',
+        zonesDetected: 1,
+        resultJson: { mode: 'python-worker-v2', message: '' },
+      } as any);
+
+      await runAndCapture({ includeMapAssets: true });
+      await flushBackgroundWork();
+
+      expect(pythonWorkerService.runFieldAnalysis).toHaveBeenCalledTimes(1);
+      const [workerPayload] = pythonWorkerService.runFieldAnalysis.mock.calls[0];
+      expect(workerPayload).not.toHaveProperty('requestedMapAssets');
+      expect(workerPayload).not.toHaveProperty('requestedIndexImages');
+      expect(workerPayload).not.toHaveProperty('requestedImageSeries');
+    });
+  });
+
   describe('runFieldAnalysis — validación de rango de fechas (OPS-2)', () => {
     it('rechaza startDate === endDate con BadRequestException, sin llegar a consultar el dedupe', async () => {
       fieldsService.findOne.mockResolvedValue(buildField());

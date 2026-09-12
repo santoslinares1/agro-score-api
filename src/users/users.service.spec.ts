@@ -230,3 +230,108 @@ describe('UsersService.markActivationAssistanceStarted (MEASUREMENT GAP P1-06)',
     ).rejects.toThrow();
   });
 });
+
+describe('UsersService.recordLogin (KPI review — instrumentación, ticket 2/3)', () => {
+  let service: UsersService;
+  let usersRepository: { createQueryBuilder: jest.Mock };
+  let queryBuilderMock: {
+    update: jest.Mock;
+    set: jest.Mock;
+    where: jest.Mock;
+    execute: jest.Mock;
+  };
+
+  beforeEach(async () => {
+    queryBuilderMock = {
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ affected: 1 }),
+    };
+    usersRepository = {
+      createQueryBuilder: jest.fn(() => queryBuilderMock),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        UsersService,
+        { provide: getRepositoryToken(User), useValue: usersRepository },
+      ],
+    }).compile();
+
+    service = module.get(UsersService);
+  });
+
+  it('arma el UPDATE always-overwrite (sin guard IS NULL) con un timestamp de SERVIDOR, nunca uno del caller', async () => {
+    await service.recordLogin('user-1');
+
+    expect(queryBuilderMock.update).toHaveBeenCalledWith(User);
+    expect(queryBuilderMock.set).toHaveBeenCalledWith({
+      lastLoginAt: expect.any(Function), // función SQL cruda (now()), nunca un Date de Node.
+    });
+    const [setCall] = queryBuilderMock.set.mock.calls;
+    expect(setCall[0].lastLoginAt()).toBe('now()');
+    expect(queryBuilderMock.where).toHaveBeenCalledWith('id = :id', {
+      id: 'user-1',
+    });
+    expect(queryBuilderMock.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('no tiene ningún parámetro de timestamp en su firma — solo (userId)', () => {
+    expect(service.recordLogin.length).toBe(1);
+  });
+
+  it('no devuelve nada (void) — el caller ya tiene el User completo, no hace falta releerlo', async () => {
+    const result = await service.recordLogin('user-1');
+
+    expect(result).toBeUndefined();
+  });
+
+  it('NEGATIVO / resiliencia: si el UPDATE falla (SQL, conexión), nunca lanza — se registra y se resuelve en silencio', async () => {
+    queryBuilderMock.execute.mockRejectedValue(new Error('DB caída'));
+
+    await expect(service.recordLogin('user-1')).resolves.toBeUndefined();
+  });
+});
+
+describe('UsersService.toPublicUser', () => {
+  // No necesita DI real: toPublicUser no toca this.usersRepository.
+  const service = new UsersService({} as never);
+
+  function buildUser(overrides: Partial<User> = {}): User {
+    return {
+      id: 'user-1',
+      email: 'usera@example.com',
+      passwordHash: 'hash-secreto',
+      fullName: 'User A',
+      companyName: 'Acme',
+      role: UserRole.USER,
+      isActive: true,
+      tokenVersion: 3,
+      activationAssistanceStartedAt: null,
+      lastLoginAt: new Date('2026-09-10T12:00:00.000Z'),
+      createdAt: new Date('2026-01-01'),
+      updatedAt: new Date('2026-01-01'),
+      ...overrides,
+    };
+  }
+
+  it('excluye passwordHash, tokenVersion y lastLoginAt — KPI review, ticket 2/3: capturar el dato es este ticket, exponerlo es otro', () => {
+    const result = service.toPublicUser(buildUser());
+
+    expect(result).not.toHaveProperty('passwordHash');
+    expect(result).not.toHaveProperty('tokenVersion');
+    expect(result).not.toHaveProperty('lastLoginAt');
+  });
+
+  it('conserva el resto de los campos, incluida activationAssistanceStartedAt (esa sí es pública)', () => {
+    const result = service.toPublicUser(buildUser());
+
+    expect(result.id).toBe('user-1');
+    expect(result.email).toBe('usera@example.com');
+    expect(result.fullName).toBe('User A');
+    expect(result.role).toBe(UserRole.USER);
+    expect(result.isActive).toBe(true);
+    expect(result.activationAssistanceStartedAt).toBeNull();
+  });
+});
