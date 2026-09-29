@@ -2,13 +2,30 @@ import {
   BadRequestException,
   HttpException,
   HttpStatus,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { randomUUID } from 'crypto';
-import { IsNull, Repository } from 'typeorm';
+import { EntityManager, In, IsNull, Repository } from 'typeorm';
+import { ANALYSIS_QUEUE_CONFIG } from '../analysis-queue/analysis-queue.config';
+import type { AnalysisQueueConfig } from '../analysis-queue/analysis-queue.config';
+import {
+  ANALYSIS_EXECUTE_JOB,
+  ANALYSIS_JOB_CONTRACT_VERSION,
+  AnalysisJobTrigger,
+  buildAnalysisExecutePayload,
+} from '../analysis-queue/analysis-job.contract';
+import {
+  AnalysisInputSnapshot,
+  AnalysisInputSnapshotLot,
+  buildAnalysisInputSnapshot,
+  summarizeSnapshotLots,
+} from '../analysis-queue/analysis-input-snapshot';
+import { WorkerAnalysisResult } from '../python-worker/types';
 import {
   daysBetweenIsoDates,
   MAX_ANALYSIS_DATE_RANGE_DAYS,
@@ -71,6 +88,67 @@ const ANALYSIS_ERROR_MESSAGE_MAX_LENGTH = 500;
 const ANALYSIS_STALE_ERROR_MESSAGE =
   'El análisis superó el tiempo máximo de procesamiento y fue marcado automáticamente como Error.';
 
+/**
+ * ADR-001: ON CONFLICT del camino encolado — mismo target/predicado EXACTO que
+ * UQ_analysis_running_per_field desde la migración 1789200000000 (Queued + Procesando). El camino
+ * legacy conserva su predicado original (`status = 'Procesando'`), que Postgres sigue pudiendo
+ * inferir contra el índice nuevo (lo implica) y también contra el índice anterior — así la versión
+ * legacy funciona antes y después de migrar.
+ */
+const QUEUED_UPSERT_CONFLICT_CLAUSE = `
+      ON CONFLICT (COALESCE("fieldId", "lotId"))
+      WHERE "status" IN ('Queued', 'Procesando') AND ("scope" = 'field' OR "scope" IS NULL)
+      DO UPDATE SET "id" = "analysis"."id"
+      RETURNING (xmax = 0) AS inserted, *`;
+
+const LEGACY_UPSERT_CONFLICT_CLAUSE = `
+      ON CONFLICT (COALESCE("fieldId", "lotId"))
+      WHERE "status" = 'Procesando' AND ("scope" = 'field' OR "scope" IS NULL)
+      DO UPDATE SET "id" = "analysis"."id"
+      RETURNING (xmax = 0) AS inserted, *`;
+
+export type RunFieldAnalysisInput = {
+  startDate: string;
+  endDate: string;
+  maxCloudiness: number;
+  indices?: string[];
+  zoneIndices?: string[];
+  indexImageIndices?: string[];
+  includeMapAssets?: boolean;
+  includeIndexImages?: boolean;
+  includeImageSeries?: boolean;
+  maxZoneCampaigns?: number;
+  clientRequestId?: string;
+};
+
+/** ADR-001: quién origina el análisis — viaja como metadata de entrega en outbox/job. */
+export type RunFieldAnalysisOptions = {
+  trigger?: AnalysisJobTrigger;
+  scheduledRunId?: string;
+};
+
+/**
+ * ADR-001: contexto del camino encolado. `prepared` es el resultado de capturar el snapshot ANTES
+ * de abrir la transacción: si falló, el error se relanza DENTRO de la transacción únicamente si
+ * esta request efectivamente insertó la fila (así se revierte todo: Analysis, asociación de
+ * clientRequestId y outbox), y se ignora si la request solo reutiliza un Analysis existente
+ * (mismo comportamiento de dedupe/idempotencia que el camino legacy).
+ */
+type QueuedEnqueueContext = {
+  prepared: { snapshot: AnalysisInputSnapshot } | { error: unknown };
+  userId: string;
+  trigger: AnalysisJobTrigger;
+  scheduledRunId?: string;
+};
+
+export type ActiveFieldAnalysis = {
+  id: string;
+  status: AnalysisStatus;
+  startedAt: Date | null;
+  createdAt: Date;
+  hasDurableExecution: boolean;
+};
+
 @Injectable()
 export class AnalysisService {
   private readonly logger = new Logger(AnalysisService.name);
@@ -82,7 +160,24 @@ export class AnalysisService {
     private readonly fieldsService: FieldsService,
     private readonly reportPdfService: ReportPdfService,
     private readonly analysisVerdictService: AnalysisVerdictService,
+    // ADR-001: @Optional para no romper instanciaciones directas existentes (specs e2e): sin
+    // config, la cola queda deshabilitada y el comportamiento es el legacy.
+    @Optional()
+    @Inject(ANALYSIS_QUEUE_CONFIG)
+    private readonly queueConfig?: AnalysisQueueConfig,
   ) {}
+
+  /**
+   * ADR-001: ¿esta solicitud debe encolarse de forma durable? Manual: ANALYSIS_QUEUE_ENABLED.
+   * Semanal: además ANALYSIS_QUEUE_WEEKLY_ENABLED (se habilita en un paso posterior del rollout).
+   */
+  isQueueEnabledFor(trigger: AnalysisJobTrigger): boolean {
+    if (!this.queueConfig?.enabled) {
+      return false;
+    }
+
+    return trigger === 'weekly' ? this.queueConfig.weeklyEnabled : true;
+  }
 
   /**
    * Solo devuelve análisis cuyo Field es del usuario autenticado (scope
@@ -488,8 +583,8 @@ export class AnalysisService {
 
   /**
    * Analysis no tiene columna userId propia — la ownership se resuelve vía Field.userId. Mismo
-   * predicado que UQ_analysis_running_per_field (status='Procesando' AND (scope='field' OR scope
-   * IS NULL)) — cuenta exactamente lo que ese índice protege, nunca filas scope='lot' del módulo
+   * predicado que UQ_analysis_running_per_field (ADR-001: status IN ('Queued','Procesando') AND
+   * (scope='field' OR scope IS NULL) — un análisis encolado ya consume un slot del techo) — cuenta exactamente lo que ese índice protege, nunca filas scope='lot' del módulo
    * legacy (bloqueado en AUTH-5, GoneException, no puede crear filas nuevas).
    */
   private async countRunningAnalysesForUser(userId: string): Promise<number> {
@@ -498,7 +593,7 @@ export class AnalysisService {
        FROM "analysis" a
        INNER JOIN "fields" f ON f."id" = a."fieldId"
        WHERE f."userId" = $1
-         AND a."status" = 'Procesando'
+         AND a."status" IN ('Queued', 'Procesando')
          AND (a."scope" = 'field' OR a."scope" IS NULL)`,
       [userId],
     );
@@ -508,20 +603,9 @@ export class AnalysisService {
 
   async runFieldAnalysis(
     fieldId: string,
-    input: {
-      startDate: string;
-      endDate: string;
-      maxCloudiness: number;
-      indices?: string[];
-      zoneIndices?: string[];
-      indexImageIndices?: string[];
-      includeMapAssets?: boolean;
-      includeIndexImages?: boolean;
-      includeImageSeries?: boolean;
-      maxZoneCampaigns?: number;
-      clientRequestId?: string;
-    },
+    input: RunFieldAnalysisInput,
     userId: string,
+    options: RunFieldAnalysisOptions = {},
   ): Promise<Analysis> {
     // Lanza NotFoundException si el campo no existe o no es del usuario. F04 (revisión
     // independiente, ronda 2): se captura `field` (antes se descartaba) porque provee lotName/
@@ -603,12 +687,27 @@ export class AnalysisService {
     // los dispara la request cuyo INSERT contra UQ_analysis_running_per_field efectivamente
     // insertó la fila (won=true en completeWonSlot, más abajo): la que pierde la decisión
     // (won=false) devuelve el análisis que la propia base asoció, sin iniciar nada.
+    // ADR-001: camino durable. Mismas validaciones y la misma coordinación por clave/slot que el
+    // camino legacy; la diferencia es QUÉ se confirma en la transacción ganadora (Analysis=Queued +
+    // inputSnapshot + outbox) y que este proceso HTTP nunca llama al Worker.
+    const trigger = options.trigger ?? 'manual';
+    const queueContext: QueuedEnqueueContext | undefined =
+      this.isQueueEnabledFor(trigger)
+        ? {
+            prepared: await this.prepareInputSnapshot(fieldId, input),
+            userId,
+            trigger,
+            scheduledRunId: options.scheduledRunId,
+          }
+        : undefined;
+
     if (input.clientRequestId) {
       const resolution = await this.resolveOrCreateByClientRequestId(
         fieldId,
         field,
         input,
         input.clientRequestId,
+        queueContext,
       );
 
       if (!resolution.won) {
@@ -618,6 +717,11 @@ export class AnalysisService {
             'disparar procesamiento.',
         );
 
+        return resolution.analysis;
+      }
+
+      if (queueContext) {
+        this.logEnqueued(resolution.analysis, queueContext);
         return resolution.analysis;
       }
 
@@ -636,13 +740,27 @@ export class AnalysisService {
     // trae información para cerrarla; ver el dictamen de esta ronda.
     const runningAnalysis = await this.analysisRepository.findOne({
       where: [
-        { fieldId, scope: 'field', status: 'Procesando' },
-        { lotId: fieldId, scope: IsNull(), status: 'Procesando' },
+        { fieldId, scope: 'field', status: In(['Queued', 'Procesando']) },
+        {
+          lotId: fieldId,
+          scope: IsNull(),
+          status: In(['Queued', 'Procesando']),
+        },
       ],
     });
 
     if (runningAnalysis) {
       const now = new Date();
+      // ADR-001: un Analysis administrado por la cola (inputSnapshot no nulo) nunca se marca Error
+      // por edad — su expiración/reintentos los gobierna pg-boss. Solo se consulta cuando la regla
+      // de edad aplicaría, para no pagar la lectura en el caso común.
+      const staleByAge = isAnalysisStale(
+        runningAnalysis,
+        now,
+        ANALYSIS_STALE_THRESHOLD_MS,
+      );
+      const staleLegacy =
+        staleByAge && !(await this.hasDurableExecution(runningAnalysis.id));
 
       // OPS-1: si el 'Procesando' existente sigue fresco, mantenemos el dedupe de siempre
       // (reutilizarlo, no crear otro). Si ya superó ANALYSIS_STALE_THRESHOLD_MS, lo tratamos
@@ -650,7 +768,7 @@ export class AnalysisService {
       // (única autoridad que muta Analysis.status por staleness, ver también
       // reconcileStaleAnalyses) y seguimos el flujo normal para crear uno nuevo — así el usuario
       // recupera el campo en su propio próximo intento, sin esperar al reconciliador periódico.
-      if (!isAnalysisStale(runningAnalysis, now, ANALYSIS_STALE_THRESHOLD_MS)) {
+      if (!staleLegacy) {
         this.logger.warn(
           `Ya hay un análisis en curso para fieldId=${fieldId} (analysisId=${runningAnalysis.id}); no se dispara uno nuevo.`,
         );
@@ -664,6 +782,28 @@ export class AnalysisService {
       );
 
       await this.failStaleAnalysis(runningAnalysis, now);
+    }
+
+    if (queueContext) {
+      const queuedClaim = await this.enqueueWithoutClientRequestId(
+        fieldId,
+        field,
+        input,
+        queueContext,
+      );
+
+      if (!queuedClaim.inserted) {
+        this.logger.warn(
+          `Carrera de deduplicación detectada para fieldId=${fieldId}: otra request concurrente ` +
+            `ganó (analysisId=${queuedClaim.analysis.id}, status=${queuedClaim.analysis.status}); se ` +
+            'reutiliza sin encolar un segundo trabajo.',
+        );
+
+        return queuedClaim.analysis;
+      }
+
+      this.logEnqueued(queuedClaim.analysis, queueContext);
+      return queuedClaim.analysis;
     }
 
     const insertValues = this.buildAnalysisInsertValues(fieldId, field, input);
@@ -793,28 +933,10 @@ export class AnalysisService {
         analysis.startedAt,
         completedAt,
       );
-      analysis.errorMessage = null;
-      analysis.globalScore = result.globalScore;
-      analysis.category = result.category;
-      analysis.confidenceScore = result.confidenceScore;
-      analysis.productivityScore = result.productivityScore;
-      analysis.stabilityScore = result.stabilityScore;
-      analysis.soilScore = result.soilScore;
-      analysis.climateScore = result.climateScore;
-      analysis.ndviAverageMax = result.ndviAverageMax;
-      analysis.ndviVariability = result.ndviVariability;
-      analysis.zonesDetected = result.zonesDetected;
-      analysis.resultJson = {
-        ...result.resultJson,
-        fieldId,
-        fieldLots: fieldInput.lots.map((lot) => ({
-          id: lot.id,
-          name: lot.name,
-          areaHa: lot.areaHa,
-          includeInProductivityClassification:
-            lot.includeInProductivityClassification,
-        })),
-      };
+      Object.assign(
+        analysis,
+        this.buildFinalizedResultFields(result, fieldId, fieldInput.lots),
+      );
 
       await this.analysisRepository.save(analysis);
 
@@ -823,19 +945,7 @@ export class AnalysisService {
           `classificationScope=${result.resultJson?.classificationScope ?? 'n/a'}).`,
       );
 
-      // PR 11A: el veredicto técnico es best-effort — AnalysisVerdictService ya se protege
-      // internamente (persiste status='failed' si el generador o el guardado fallan), pero este
-      // .catch() es la última red: si incluso guardar el 'failed' tirara, no puede escapar hacia
-      // el catch de abajo y marcar como 'Error' un análisis que en realidad terminó bien.
-      await this.analysisVerdictService
-        .generateAndPersist(analysis)
-        .catch((error) => {
-          this.logger.error(
-            `Generación de veredicto técnico interrumpida de forma inesperada (analysisId=${analysisId}): ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        });
+      await this.generateTechnicalVerdictBestEffort(analysis);
     } catch (error) {
       this.logger.error(
         `Field pipeline error (analysisId=${analysisId}, fieldId=${fieldId}): ${
@@ -862,17 +972,10 @@ export class AnalysisService {
           analysis.startedAt,
           failedAt,
         );
-        analysis.errorMessage = summarizedError;
-        analysis.category = 'Error al procesar análisis de campo';
-        analysis.resultJson = {
-          mode: 'error',
-          message: 'Error al ejecutar el pipeline de campo.',
-          error: summarizedError,
-          // Sin esto, el frontend no puede distinguir un análisis de campo
-          // errado de uno de lote único (isFieldAnalysis se basa en
-          // resultJson.fieldId) y el botón "Volver" queda mal armado.
-          fieldId,
-        };
+        Object.assign(
+          analysis,
+          this.buildErrorResultFields(fieldId, summarizedError),
+        );
 
         await this.analysisRepository.save(analysis);
       }
@@ -889,8 +992,12 @@ export class AnalysisService {
    * método necesite saber nada de schedules/runs.
    */
   async reconcileStaleAnalyses(now: Date = new Date()): Promise<void> {
+    // ADR-001: SOLO filas legacy (sin inputSnapshot = sin ejecución durable). Un Analysis
+    // administrado por la cola nunca se marca Error por edad acá: su expiración, heartbeat y
+    // reintentos los gobierna pg-boss, y el cierre de un job perdido lo hace el runner
+    // (AnalysisJobReconcilerService).
     const candidates = await this.analysisRepository.find({
-      where: { status: 'Procesando' },
+      where: { status: 'Procesando', inputSnapshot: IsNull() },
     });
 
     for (const analysis of candidates) {
@@ -982,7 +1089,45 @@ export class AnalysisService {
       includeIndexImages?: boolean;
       includeImageSeries?: boolean;
     },
+    queued?: { snapshot: AnalysisInputSnapshot | null },
   ): Record<string, unknown> {
+    if (queued) {
+      // ADR-001: fila encolada — startedAt queda null hasta que el consumidor reclama el primer
+      // intento (Queued → Procesando); resultJson.lots se deriva del MISMO snapshot que va a
+      // ejecutar el Worker (nunca de una lectura separada del Field).
+      const lots = queued.snapshot
+        ? summarizeSnapshotLots(queued.snapshot.lots)
+        : (field.lots ?? []).map((lot) => ({
+            id: lot.id,
+            name: lot.name,
+            areaHa: lot.areaHa,
+            includeInProductivityClassification:
+              lot.includeInProductivityClassification,
+          }));
+
+      return {
+        scope: 'field',
+        fieldId,
+        lotId: null,
+        lotName: field.name,
+        status: 'Queued',
+        startedAt: null,
+        maxCloudiness: input.maxCloudiness,
+        startDate: input.startDate,
+        endDate: input.endDate,
+        requestedMapAssets: input.includeMapAssets ?? null,
+        requestedIndexImages: input.includeIndexImages ?? null,
+        requestedImageSeries: input.includeImageSeries ?? null,
+        inputSnapshot: queued.snapshot,
+        resultJson: {
+          mode: 'python-worker-v2',
+          message: 'Análisis de campo en cola.',
+          fieldId,
+          lots,
+        },
+      };
+    }
+
     return {
       scope: 'field',
       fieldId,
@@ -1039,11 +1184,7 @@ export class AnalysisService {
 
     const [query, parameters] = insertQuery.getQueryAndParameters();
 
-    const upsertSql = `${query}
-      ON CONFLICT (COALESCE("fieldId", "lotId"))
-      WHERE "status" = 'Procesando' AND ("scope" = 'field' OR "scope" IS NULL)
-      DO UPDATE SET "id" = "analysis"."id"
-      RETURNING (xmax = 0) AS inserted, *`;
+    const upsertSql = `${query}${LEGACY_UPSERT_CONFLICT_CLAUSE}`;
 
     const rows: Array<Record<string, unknown>> = await this.analysisRepository.query(
       upsertSql,
@@ -1053,7 +1194,7 @@ export class AnalysisService {
 
     return {
       inserted: Boolean(inserted),
-      analysis: this.analysisRepository.create(rawAnalysis as Partial<Analysis>),
+      analysis: this.hydrateAnalysisRow(rawAnalysis),
     };
   }
 
@@ -1093,10 +1234,16 @@ export class AnalysisService {
       includeImageSeries?: boolean;
     },
     clientRequestId: string,
+    queueContext?: QueuedEnqueueContext,
   ): Promise<{ won: boolean; analysis: Analysis }> {
     const candidateId = randomUUID();
     const insertValues = {
-      ...this.buildAnalysisInsertValues(fieldId, field, input),
+      ...this.buildAnalysisInsertValues(
+        fieldId,
+        field,
+        input,
+        queueContext ? { snapshot: this.snapshotOf(queueContext) } : undefined,
+      ),
       id: candidateId,
     };
 
@@ -1112,11 +1259,11 @@ export class AnalysisService {
       .values(insertValues);
     const [query, parameters] = insertQuery.getQueryAndParameters();
 
-    const upsertSql = `${query}
-      ON CONFLICT (COALESCE("fieldId", "lotId"))
-      WHERE "status" = 'Procesando' AND ("scope" = 'field' OR "scope" IS NULL)
-      DO UPDATE SET "id" = "analysis"."id"
-      RETURNING (xmax = 0) AS inserted, *`;
+    const upsertSql = `${query}${
+      queueContext
+        ? QUEUED_UPSERT_CONFLICT_CLAUSE
+        : LEGACY_UPSERT_CONFLICT_CLAUSE
+    }`;
 
     return this.analysisRepository.manager.transaction(async (manager) => {
       // Exclusión (1): la fila de analysis_client_request para (fieldId, clientRequestId).
@@ -1167,9 +1314,17 @@ export class AnalysisService {
       const { inserted, ...rawAnalysis } = rows[0] as { inserted: boolean } & Record<string, unknown>;
 
       if (inserted) {
+        if (queueContext) {
+          await this.completeQueuedClaimInTransaction(
+            manager,
+            rawAnalysis,
+            queueContext,
+          );
+        }
+
         return {
           won: true,
-          analysis: manager.create(Analysis, rawAnalysis as Partial<Analysis>),
+          analysis: this.hydrateAnalysisRow(rawAnalysis),
         };
       }
 
@@ -1187,10 +1342,15 @@ export class AnalysisService {
       // parcial — este INSERT ni siquiera choca contra ella, `inserted` da true directamente, y el
       // bloque de abajo nunca se ejecuta).
       const now = new Date();
+      // ADR-001: `inputSnapshot` viene en el mismo RETURNING * (columna cruda) — un valor no nulo
+      // marca ejecución durable, que nunca se recupera por edad (ver isAnalysisStale).
       const staleCandidate: StaleAnalysisCandidate = {
         status: rawAnalysis.status as AnalysisStatus,
         startedAt: rawAnalysis.startedAt as Date | null,
         createdAt: rawAnalysis.createdAt as Date | null,
+        hasDurableExecution:
+          rawAnalysis.inputSnapshot !== null &&
+          rawAnalysis.inputSnapshot !== undefined,
       };
 
       if (!isAnalysisStale(staleCandidate, now, ANALYSIS_STALE_THRESHOLD_MS)) {
@@ -1205,7 +1365,7 @@ export class AnalysisService {
 
         return {
           won: false,
-          analysis: manager.create(Analysis, rawAnalysis as Partial<Analysis>),
+          analysis: this.hydrateAnalysisRow(rawAnalysis),
         };
       }
 
@@ -1278,18 +1438,311 @@ export class AnalysisService {
 
         return {
           won: false,
-          analysis: manager.create(Analysis, retryRawAnalysis as Partial<Analysis>),
+          analysis: this.hydrateAnalysisRow(retryRawAnalysis),
         };
       }
 
       // La candidata (mismo `candidateId` con el que la asociación ya fue reclamada más arriba)
       // ahora existe de verdad como fila de Analysis 'Procesando' — la asociación ya apunta a este
       // id desde la exclusión (1), no hace falta redirigirla.
+      if (queueContext) {
+        await this.completeQueuedClaimInTransaction(
+          manager,
+          retryRawAnalysis,
+          queueContext,
+        );
+      }
+
       return {
         won: true,
-        analysis: manager.create(Analysis, retryRawAnalysis as Partial<Analysis>),
+        analysis: this.hydrateAnalysisRow(retryRawAnalysis),
       };
     });
+  }
+
+  /**
+   * ADR-001: captura el snapshot inmutable ANTES de abrir la transacción (getPipelineInput lee el
+   * Field vigente en ese instante). Nunca lanza: un fallo de preparación (campo sin lotes, ningún
+   * lote incluido) se devuelve como `{ error }` y solo se relanza si esta request efectivamente
+   * gana el slot — ver QueuedEnqueueContext.
+   */
+  private async prepareInputSnapshot(
+    fieldId: string,
+    input: RunFieldAnalysisInput,
+  ): Promise<QueuedEnqueueContext['prepared']> {
+    try {
+      const fieldInput = await this.fieldsService.getPipelineInput(fieldId);
+
+      if (
+        !fieldInput.lots.some((lot) => lot.includeInProductivityClassification)
+      ) {
+        throw new BadRequestException(
+          'El campo no tiene ningún lote incluido en la clasificación productiva. Habilitá al menos un lote antes de analizar.',
+        );
+      }
+
+      return {
+        snapshot: buildAnalysisInputSnapshot(fieldInput, {
+          startDate: input.startDate,
+          endDate: input.endDate,
+          maxCloudiness: input.maxCloudiness,
+          indices: input.indices,
+          zoneIndices: input.zoneIndices,
+          indexImageIndices: input.indexImageIndices,
+          includeMapAssets: input.includeMapAssets,
+          includeIndexImages: input.includeIndexImages,
+          includeImageSeries: input.includeImageSeries,
+          maxZoneCampaigns: input.maxZoneCampaigns,
+        }),
+      };
+    } catch (error) {
+      return { error };
+    }
+  }
+
+  private snapshotOf(
+    queueContext: QueuedEnqueueContext,
+  ): AnalysisInputSnapshot | null {
+    return 'snapshot' in queueContext.prepared
+      ? queueContext.prepared.snapshot
+      : null;
+  }
+
+  /**
+   * ADR-001: se ejecuta DENTRO de la transacción que acaba de insertar la fila Queued. Si la
+   * preparación del snapshot había fallado, relanza ese error ORIGINAL → rollback completo (ni
+   * Analysis, ni asociación de clientRequestId, ni outbox). Si no, inserta la fila de outbox en la
+   * misma transacción: Analysis + inputSnapshot + asociación + outbox confirman juntos o nada.
+   */
+  private async completeQueuedClaimInTransaction(
+    manager: EntityManager,
+    rawAnalysis: Record<string, unknown>,
+    queueContext: QueuedEnqueueContext,
+  ): Promise<void> {
+    if ('error' in queueContext.prepared) {
+      throw queueContext.prepared.error;
+    }
+
+    await this.insertOutboxRow(manager, {
+      analysisId: rawAnalysis.id as string,
+      fieldId: rawAnalysis.fieldId as string,
+      userId: queueContext.userId,
+      trigger: queueContext.trigger,
+      scheduledRunId: queueContext.scheduledRunId,
+    });
+  }
+
+  private async insertOutboxRow(
+    manager: EntityManager,
+    input: {
+      analysisId: string;
+      fieldId: string;
+      userId: string;
+      trigger: AnalysisJobTrigger;
+      scheduledRunId?: string;
+    },
+  ): Promise<void> {
+    const payload = buildAnalysisExecutePayload({
+      analysisId: input.analysisId,
+      fieldId: input.fieldId,
+      requestedByUserId: input.userId,
+      trigger: input.trigger,
+      scheduledRunId: input.scheduledRunId,
+    });
+
+    // ON CONFLICT DO NOTHING: una sola intención de ejecución por (analysisId, jobType). Dentro de
+    // la transacción ganadora nunca debería existir ya, pero una segunda inserción no puede
+    // producir un segundo job.
+    await manager.query(
+      `INSERT INTO "analysis_job_outbox" ("id", "analysisId", "jobType", "payloadVersion", "payload")
+       VALUES ($1, $2, $3, $4, $5::jsonb)
+       ON CONFLICT ("analysisId", "jobType") DO NOTHING`,
+      [
+        randomUUID(),
+        input.analysisId,
+        ANALYSIS_EXECUTE_JOB,
+        ANALYSIS_JOB_CONTRACT_VERSION,
+        JSON.stringify(payload),
+      ],
+    );
+  }
+
+  /**
+   * ADR-001: equivalente encolado de runAtomicUpsert (camino sin clientRequestId) — mismo INSERT
+   * ... ON CONFLICT contra UQ_analysis_running_per_field, pero dentro de una transacción que además
+   * inserta el outbox (o revierte todo si la preparación del snapshot había fallado).
+   */
+  private async enqueueWithoutClientRequestId(
+    fieldId: string,
+    field: Field,
+    input: RunFieldAnalysisInput,
+    queueContext: QueuedEnqueueContext,
+  ): Promise<{ inserted: boolean; analysis: Analysis }> {
+    const insertValues = this.buildAnalysisInsertValues(fieldId, field, input, {
+      snapshot: this.snapshotOf(queueContext),
+    });
+    const [query, parameters] = this.analysisRepository
+      .createQueryBuilder()
+      .insert()
+      .into(Analysis)
+      .values(insertValues)
+      .getQueryAndParameters();
+    const upsertSql = `${query}${QUEUED_UPSERT_CONFLICT_CLAUSE}`;
+
+    return this.analysisRepository.manager.transaction(async (manager) => {
+      const rows: Array<Record<string, unknown>> = await manager.query(
+        upsertSql,
+        parameters,
+      );
+      const { inserted, ...rawAnalysis } = rows[0] as {
+        inserted: boolean;
+      } & Record<string, unknown>;
+
+      if (inserted) {
+        await this.completeQueuedClaimInTransaction(
+          manager,
+          rawAnalysis,
+          queueContext,
+        );
+      }
+
+      return {
+        inserted: Boolean(inserted),
+        analysis: this.hydrateAnalysisRow(rawAnalysis),
+      };
+    });
+  }
+
+  private logEnqueued(
+    analysis: Analysis,
+    queueContext: QueuedEnqueueContext,
+  ): void {
+    this.logger.log(
+      `Análisis encolado de forma durable (analysisId=${analysis.id}, fieldId=${analysis.fieldId}, ` +
+        `trigger=${queueContext.trigger}${
+          queueContext.scheduledRunId
+            ? `, scheduledRunId=${queueContext.scheduledRunId}`
+            : ''
+        }).`,
+    );
+  }
+
+  /**
+   * Convierte una fila cruda de un RETURNING * en entidad, SIN `inputSnapshot` (ADR-001): esa
+   * columna es `select: false` (GeoJSON completo) y nunca debe viajar en una respuesta HTTP ni en
+   * objetos que después se re-guarden.
+   */
+  private hydrateAnalysisRow(raw: Record<string, unknown>): Analysis {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { inputSnapshot, ...rest } = raw;
+
+    return this.analysisRepository.create(rest as Partial<Analysis>);
+  }
+
+  /** ADR-001: ¿este Analysis tiene ejecución durable (administrada por la cola)? */
+  private async hasDurableExecution(analysisId: string): Promise<boolean> {
+    const rows: Array<{ durable: boolean }> =
+      await this.analysisRepository.query(
+        `SELECT ("inputSnapshot" IS NOT NULL) AS durable FROM "analysis" WHERE "id" = $1`,
+        [analysisId],
+      );
+
+    return Boolean(rows[0]?.durable);
+  }
+
+  /**
+   * ADR-001: Analysis activo (Queued/Procesando) de un campo, con la marca de ejecución durable —
+   * usado por el scheduler semanal para decidir si bloquear la corrida (un 'Procesando' durable en
+   * backoff de reintentos puede superar el umbral de staleness legacy sin estar colgado).
+   */
+  async findActiveAnalysisForField(
+    fieldId: string,
+  ): Promise<ActiveFieldAnalysis | null> {
+    const rows: Array<ActiveFieldAnalysis> =
+      await this.analysisRepository.query(
+        `SELECT a."id", a."status", a."startedAt", a."createdAt",
+              (a."inputSnapshot" IS NOT NULL) AS "hasDurableExecution"
+       FROM "analysis" a
+       WHERE a."status" IN ('Queued', 'Procesando')
+         AND ((a."scope" = 'field' AND a."fieldId" = $1) OR (a."scope" IS NULL AND a."lotId" = $1))
+       ORDER BY a."createdAt" DESC
+       LIMIT 1`,
+        [fieldId],
+      );
+
+    return rows[0] ?? null;
+  }
+
+  /**
+   * Columnas de resultado de un Analysis finalizado — compartidas por el camino legacy
+   * (processFieldAnalysisInBackground) y por el consumidor de la cola (ADR-001), para que ambos
+   * persistan exactamente el mismo resultado funcional. `lots` sale del input efectivamente
+   * ejecutado (en la cola: el inputSnapshot), nunca de una lectura posterior del Field.
+   */
+  buildFinalizedResultFields(
+    result: WorkerAnalysisResult,
+    fieldId: string,
+    lots: AnalysisInputSnapshotLot[],
+  ): Partial<Analysis> {
+    return {
+      errorMessage: null,
+      globalScore: result.globalScore,
+      category: result.category,
+      confidenceScore: result.confidenceScore,
+      productivityScore: result.productivityScore,
+      stabilityScore: result.stabilityScore,
+      soilScore: result.soilScore,
+      climateScore: result.climateScore,
+      ndviAverageMax: result.ndviAverageMax,
+      ndviVariability: result.ndviVariability,
+      zonesDetected: result.zonesDetected,
+      resultJson: {
+        ...result.resultJson,
+        fieldId,
+        fieldLots: summarizeSnapshotLots(lots),
+      },
+    };
+  }
+
+  /** Columnas de un Analysis de campo terminado en Error (legacy y cola comparten la forma). */
+  buildErrorResultFields(
+    fieldId: string,
+    publicErrorMessage: string,
+  ): Partial<Analysis> {
+    const errorMessage = this.summarizeError(publicErrorMessage);
+
+    return {
+      errorMessage,
+      category: 'Error al procesar análisis de campo',
+      resultJson: {
+        mode: 'error',
+        message: 'Error al ejecutar el pipeline de campo.',
+        error: errorMessage,
+        // Sin esto, el frontend no puede distinguir un análisis de campo
+        // errado de uno de lote único (isFieldAnalysis se basa en
+        // resultJson.fieldId) y el botón "Volver" queda mal armado.
+        fieldId,
+      },
+    };
+  }
+
+  /**
+   * PR 11A: el veredicto técnico es best-effort — AnalysisVerdictService ya se protege
+   * internamente (persiste status='failed' si el generador o el guardado fallan), pero este
+   * .catch() es la última red: si incluso guardar el 'failed' tirara, no puede escapar y marcar
+   * como 'Error' un análisis que en realidad terminó bien. Compartido por el camino legacy y el
+   * consumidor de la cola (ADR-001).
+   */
+  async generateTechnicalVerdictBestEffort(analysis: Analysis): Promise<void> {
+    await this.analysisVerdictService
+      .generateAndPersist(analysis)
+      .catch((error) => {
+        this.logger.error(
+          `Generación de veredicto técnico interrumpida de forma inesperada (analysisId=${analysis.id}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
   }
 
   /**

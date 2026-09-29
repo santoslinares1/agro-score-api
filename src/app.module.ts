@@ -3,7 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { resolveDatabaseSsl } from './config/database-ssl.util';
+import { buildTypeOrmModuleOptions } from './config/typeorm-options.util';
 import { LotsModule } from './lots/lots.module';
 import { AnalysisModule } from './analysis/analysis.module';
 import { PythonWorkerModule } from './python-worker/python-worker.module';
@@ -56,26 +56,7 @@ import { AppService } from './app.service';
 
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        type: 'postgres',
-        host: config.get<string>('DB_HOST'),
-        port: Number(config.get<string>('DB_PORT')),
-        username: config.get<string>('DB_USER'),
-        password: config.get<string>('DB_PASSWORD'),
-        database: config.get<string>('DB_NAME'),
-        autoLoadEntities: true,
-        // AUTH-2: el esquema ahora se versiona con migrations (ver
-        // src/data-source.ts y src/migrations/). synchronize solo se
-        // habilita si TYPEORM_SYNCHRONIZE=true está seteado explícito;
-        // por default (incluido local) queda en false.
-        synchronize: config.get<string>('TYPEORM_SYNCHRONIZE') === 'true',
-        // SEC-004: SSL off por default (Postgres de Docker local no habla
-        // TLS); se activa con DATABASE_SSL=true contra RDS/Postgres remoto.
-        ssl: resolveDatabaseSsl(
-          config.get<string>('DATABASE_SSL'),
-          config.get<string>('DATABASE_SSL_REJECT_UNAUTHORIZED'),
-        ),
-      }),
+      useFactory: buildTypeOrmModuleOptions,
     }),
 
     LotsModule,

@@ -3,6 +3,8 @@ import { DataSource } from 'typeorm';
 
 import { AccessRequest } from './access-request/entities/access-request.entity';
 import { Analysis } from './analysis/entities/analysis.entity';
+import { AnalysisAttempt } from './analysis-queue/entities/analysis-attempt.entity';
+import { AnalysisJobOutbox } from './analysis-queue/entities/analysis-job-outbox.entity';
 import { AnalysisTechnicalVerdict } from './analysis-verdict/entities/analysis-technical-verdict.entity';
 import { AdminAuditLog } from './audit-log/entities/admin-audit-log.entity';
 import { resolveDatabaseSsl } from './config/database-ssl.util';
@@ -45,6 +47,8 @@ export const AppDataSource = new DataSource({
     Field,
     FieldLot,
     Analysis,
+    AnalysisJobOutbox,
+    AnalysisAttempt,
     AnalysisTechnicalVerdict,
     AccessRequest,
     AdminAuditLog,

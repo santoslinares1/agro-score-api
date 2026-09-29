@@ -179,23 +179,21 @@ export class ScheduledAnalysisRunnerService {
       );
 
       // FIX CRÍTICO (auditoría predeploy): AnalysisService.runFieldAnalysis puede devolver
-      // silenciosamente un Analysis 'Procesando' preexistente (ej. disparado manualmente segundos
+      // silenciosamente un Analysis activo preexistente (ej. disparado manualmente segundos
       // antes) en vez de crear uno nuevo — el valor de retorno no distingue ambos casos, así que
       // el scheduler no puede confiar en él a ciegas. Chequeo defensivo ANTES de llamarlo: si ya
       // hay un análisis en curso para este campo, no lo llamamos — mejor una corrida fallida y
       // reintentable la próxima semana que un email atado al análisis de otro (con flags que no
-      // son necesariamente las del informe completo). Reusa AnalysisService.findByField, ya
-      // público y ya usado por el historial de diagnósticos — no toca AnalysisService.
-      const history = await this.analysisService.findByField(
-        schedule.fieldId,
-        schedule.userId,
-      );
+      // son necesariamente las del informe completo).
+      //
+      // ADR-001: "en curso" = Queued o Procesando. findActiveAnalysisForField además informa si el
+      // Analysis tiene ejecución durable (cola): esos nunca se consideran stale por edad (un
+      // 'Procesando' durable en backoff de reintentos puede superar el umbral legacy sin estar
+      // colgado), así que siempre bloquean.
+      const blockingAnalysis =
+        await this.analysisService.findActiveAnalysisForField(schedule.fieldId);
 
-      const blockingAnalysis = history.find(
-        (item) => item.status === 'Procesando',
-      );
-
-      // OPS-1: un Analysis 'Procesando' stale (isAnalysisStale — misma utilidad que usa
+      // OPS-1: un Analysis 'Procesando' LEGACY stale (isAnalysisStale — misma utilidad que usa
       // AnalysisService.runFieldAnalysis para su propio dedupe, una sola definición de
       // "staleness" para ambos) no debe bloquear la corrida para siempre. Este chequeo NUNCA
       // marca nada como Error por su cuenta — solo decide si bloquear o no; la mutación real la
@@ -227,6 +225,11 @@ export class ScheduledAnalysisRunnerService {
           includeImageSeries: true,
         },
         schedule.userId,
+        // ADR-001: con ANALYSIS_QUEUE_ENABLED + ANALYSIS_QUEUE_WEEKLY_ENABLED esto solo crea
+        // Analysis=Queued + inputSnapshot + outbox (nunca llama al Worker desde este proceso). La
+        // corrida sigue 'processing' mientras el Analysis esté Queued o Procesando (ver
+        // reconcileRun), y snapshot/veredicto/email siguen ocurriendo solo tras 'Finalizado'.
+        { trigger: 'weekly', scheduledRunId: run.id },
       );
 
       run.analysisId = analysis.id;
@@ -370,7 +373,7 @@ export class ScheduledAnalysisRunnerService {
         // Nunca se manda email si el análisis falló — MVP: sin email de error a usuario final.
         return;
       } else {
-        return; // Sigue 'Procesando'.
+        return; // ADR-001: sigue no terminal ('Queued' o 'Procesando').
       }
     }
 

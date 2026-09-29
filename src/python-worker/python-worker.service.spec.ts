@@ -8,6 +8,8 @@ import { of, throwError } from 'rxjs';
 import { MAX_ANALYSIS_CLOUDINESS } from '../analysis/analysis-constraints';
 import { PythonWorkerService } from './python-worker.service';
 import { PipelineInput, WeeklyReportWorkerInput, WorkerAnalysisResult } from './types';
+import { classifyWorkerCallError } from '../analysis-queue/analysis-failure-classifier';
+import { getWorkerCallFailure, WorkerCallFailure } from './worker-call-failure';
 
 const buildInput = (overrides: Partial<PipelineInput> = {}): PipelineInput => ({
   lotId: 'lot-1',
@@ -543,5 +545,74 @@ describe('PythonWorkerService — clasificación de errores del Worker (OPS-3, R
       expect(error.message).toBe('El motor de análisis no está disponible temporalmente.');
       expect(error.message).not.toContain('worker-interno');
     });
+  });
+});
+
+describe('PythonWorkerService — metadata estructurada para la cola durable (ADR-001)', () => {
+  // El consumidor de la cola decide reintentos con classifyWorkerCallError, que lee SOLO el
+  // WorkerCallFailure adjunto como `cause` — nunca el mensaje público. Estos casos recorren el
+  // camino real (handleWorkerError) para cada clase de falla del ticket.
+  it.each([
+    [{ status: 400, data: { detail: 'x' } }, 'worker_bad_request', false],
+    [{ status: 422, data: { detail: [] } }, 'worker_unprocessable', false],
+    [{ status: 429, data: {} }, 'worker_rate_limited', true],
+    [
+      { status: 500, data: { detail: 'Earth Engine' } },
+      'worker_server_error',
+      true,
+    ],
+    [{ status: 503, data: {} }, 'worker_server_error', true],
+    [
+      { code: 'ECONNABORTED', message: 'timeout of 600000ms exceeded' },
+      'worker_timeout',
+      true,
+    ],
+    [
+      { code: 'ECONNREFUSED', message: 'connect ECONNREFUSED 127.0.0.1:8000' },
+      'worker_unreachable',
+      true,
+    ],
+    [
+      { code: 'ENOTFOUND', message: 'getaddrinfo ENOTFOUND worker' },
+      'worker_unreachable',
+      true,
+    ],
+    [{ status: 401, data: {} }, 'worker_rejected', false],
+  ] as const)(
+    '%j → %s (retryable=%s)',
+    async (axiosShape, expectedCode, expectedRetryable) => {
+      const { service, httpService } =
+        await createService('http://worker:9000');
+      httpService.post.mockReturnValue(
+        throwError(() => buildAxiosError(axiosShape as any)),
+      );
+
+      const error = await captureError(
+        service.runFieldAnalysis(buildFieldInput() as any),
+      );
+      const failure = getWorkerCallFailure(error);
+      const classification = classifyWorkerCallError(error);
+
+      expect(failure).toBeInstanceOf(WorkerCallFailure);
+      expect(failure?.message).not.toContain('127.0.0.1');
+      expect(classification.code).toBe(expectedCode);
+      expect(classification.retryable).toBe(expectedRetryable);
+    },
+  );
+
+  it('un error de mapeo del input ANTES de la llamada HTTP (geometría inválida) no trae metadata y es no reintentable', async () => {
+    const { service, httpService } = await createService('http://worker:9000');
+    const input = buildFieldInput() as any;
+    input.lots = [
+      { ...input.lots[0], geojson: { type: 'Point', coordinates: [0, 0] } },
+    ];
+
+    const error = await captureError(service.runFieldAnalysis(input));
+
+    expect(httpService.post).not.toHaveBeenCalled();
+    expect(getWorkerCallFailure(error)).toBeNull();
+    expect(classifyWorkerCallError(error)).toEqual(
+      expect.objectContaining({ code: 'invalid_input', retryable: false }),
+    );
   });
 });

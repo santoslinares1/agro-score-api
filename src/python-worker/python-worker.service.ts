@@ -16,6 +16,7 @@ import {
   WeeklyReportWorkerResult,
   WorkerAnalysisResult,
 } from './types';
+import { WorkerCallFailure } from './worker-call-failure';
 import { getRequiredWorkerToken } from './worker-token.util';
 
 type NewWorkerPayload = {
@@ -225,27 +226,40 @@ export class PythonWorkerService {
       )}`,
     );
 
+    // ADR-001: `cause` estructurado (status HTTP / código de transporte, nunca body ni mensaje
+    // crudo) para que el consumidor de la cola clasifique reintentables sin parsear el mensaje
+    // público. No cambia ningún mensaje ni tipo de excepción existente.
+    const cause = new WorkerCallFailure(
+      operation,
+      status ?? null,
+      typeof axiosError?.code === 'string' ? axiosError.code : null,
+    );
+
     if (status === 400) {
       throw new BadRequestException(
         'Los parámetros enviados al motor de análisis no son válidos.',
+        { cause },
       );
     }
 
     if (status === 422) {
       throw new BadRequestException(
         'El motor de análisis rechazó el formato de los datos enviados.',
+        { cause },
       );
     }
 
     if (status !== undefined && status >= 500) {
       throw new ServiceUnavailableException(
         'El motor de análisis no pudo completar la operación.',
+        { cause },
       );
     }
 
     if (isTimeout) {
       throw new ServiceUnavailableException(
         'El motor de análisis excedió el tiempo máximo de respuesta.',
+        { cause },
       );
     }
 
@@ -254,6 +268,7 @@ export class PythonWorkerService {
     // indisponibilidad general, nunca como "parámetros inválidos".
     throw new ServiceUnavailableException(
       'El motor de análisis no está disponible temporalmente.',
+      { cause },
     );
   }
 

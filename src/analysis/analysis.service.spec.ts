@@ -1,6 +1,7 @@
 import { BadRequestException, HttpException, HttpStatus, NotFoundException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
+import { IsNull } from 'typeorm';
 
 import { FieldsService } from '../fields/fields.service';
 import { Field } from '../fields/entities/field.entity';
@@ -1055,13 +1056,13 @@ describe('AnalysisService', () => {
       expect(error.message.toLowerCase()).not.toContain('worker');
     });
 
-    it('cuenta vía Field.userId (join), filtrando por status Procesando', async () => {
+    it('cuenta vía Field.userId (join), filtrando por status activos (ADR-001: Queued + Procesando)', async () => {
       analysisRepository.query.mockResolvedValueOnce([{ count: 0 }]);
 
       await service.assertUserBelowConcurrencyCeiling('user-A');
 
       expect(analysisRepository.query).toHaveBeenCalledWith(
-        expect.stringContaining(`"status" = 'Procesando'`),
+        expect.stringContaining(`"status" IN ('Queued', 'Procesando')`),
         ['user-A'],
       );
       expect(analysisRepository.query).toHaveBeenCalledWith(
@@ -1990,13 +1991,15 @@ describe('AnalysisService', () => {
     const minutesAgo = (minutes: number) =>
       new Date(now.getTime() - minutes * 60 * 1000);
 
-    it('consulta solo Analysis con status Procesando', async () => {
+    it('consulta solo Analysis Procesando LEGACY (ADR-001: sin inputSnapshot = sin ejecución durable)', async () => {
       analysisRepository.find.mockResolvedValue([]);
 
       await service.reconcileStaleAnalyses(now);
 
       expect(analysisRepository.find).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { status: 'Procesando' } }),
+        expect.objectContaining({
+          where: { status: 'Procesando', inputSnapshot: IsNull() },
+        }),
       );
     });
 

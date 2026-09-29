@@ -62,6 +62,29 @@ services:
     networks:
       - agroscore_internal
 
+  # ADR-001: consumidor de la cola durable de análisis (pg-boss sobre el mismo Postgres). MISMA
+  # imagen que agro-score-api, otro comando. No publica ni expone ningún puerto: solo habla con
+  # Postgres y con agro-score-worker por la red interna. Queda inactivo mientras
+  # ANALYSIS_JOB_RUNNER_ENABLED != true (ver docs/analysis-queue.md para el orden de rollout).
+  # Una sola réplica: con ANALYSIS_JOB_CONCURRENCY=1 la concurrencia global es 1.
+  agro-score-job-runner:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    container_name: agro_score_job_runner
+    command: ["node", "dist/src/job-runner.main.js"]
+    restart: unless-stopped
+    env_file:
+      - .env.backend
+    depends_on:
+      - postgres
+      - agro-score-worker
+    # SIGTERM → deja de tomar jobs y espera el activo hasta ANALYSIS_JOB_SHUTDOWN_TIMEOUT_MS
+    # (default 60s); el grace period de Docker tiene que ser mayor para no matarlo antes.
+    stop_grace_period: 90s
+    networks:
+      - agroscore_internal
+
 networks:
   agroscore_internal:
     driver: bridge

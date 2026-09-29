@@ -22,6 +22,7 @@ import type { AnalysisStatus } from '../../analysis/entities/analysis.entity';
 import { PaginationQueryDto } from './pagination-query.dto';
 
 const ANALYSIS_STATUSES: AnalysisStatus[] = [
+  'Queued',
   'Procesando',
   'Finalizado',
   'Error',

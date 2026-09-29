@@ -9,9 +9,20 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 
+import type { AnalysisInputSnapshot } from '../../analysis-queue/analysis-input-snapshot';
 import { User } from '../../users/user.entity';
 
-export type AnalysisStatus = 'Procesando' | 'Finalizado' | 'Error';
+/**
+ * ADR-001: 'Queued' = encolado de forma durable (Analysis + inputSnapshot + outbox confirmados en
+ * una transacción), todavía sin un intento reclamado. Transiciones permitidas:
+ * Queued -> Procesando -> Finalizado | Error, y Queued -> Error. Nunca desde un terminal.
+ */
+export type AnalysisStatus = 'Queued' | 'Procesando' | 'Finalizado' | 'Error';
+
+export const ACTIVE_ANALYSIS_STATUSES: readonly AnalysisStatus[] = [
+  'Queued',
+  'Procesando',
+];
 export type NdviVariability = 'Baja' | 'Media' | 'Alta';
 export type AnalysisScope = 'lot' | 'field';
 
@@ -95,6 +106,18 @@ export class Analysis {
 
   @Column({ type: 'jsonb', nullable: true })
   resultJson: WorkerResultJson | null;
+
+  /**
+   * ADR-001: snapshot inmutable del input agronómico (lotes con GeoJSON + parámetros pedidos),
+   * capturado al encolar en la misma transacción que crea este Analysis — todos los intentos y
+   * reintentos del consumidor usan exactamente esto, nunca el Field vigente. `null` para todo
+   * Analysis histórico y para el camino legacy fire-and-forget (ANALYSIS_QUEUE_ENABLED=false).
+   * Un valor no nulo es además la marca de "ejecución durable administrada por la cola": el
+   * reconciliador legacy por edad nunca toca estas filas. `select: false` para no arrastrar GeoJSON
+   * en lecturas comunes; se lee explícitamente donde hace falta.
+   */
+  @Column({ type: 'jsonb', nullable: true, select: false })
+  inputSnapshot?: AnalysisInputSnapshot | null;
 
   /**
    * ADMIN-1: timing/error para el panel admin. Nullable: los análisis

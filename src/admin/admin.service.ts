@@ -2010,8 +2010,9 @@ export class AdminService {
     if (query.status === 'without_analysis') {
       qb.andWhere(`NOT EXISTS (${this.fieldAnalysisExistsSubquery('field')})`);
     } else if (query.status === 'processing') {
+      // ADR-001: 'processing' (estado administrativo) cubre ambos estados no terminales.
       qb.andWhere(
-        `${this.latestAnalysisStatusSubquery('field')} = 'Procesando'`,
+        `${this.latestAnalysisStatusSubquery('field')} IN ('Queued', 'Procesando')`,
       );
     } else if (query.status === 'error') {
       qb.andWhere(`${this.latestAnalysisStatusSubquery('field')} = 'Error'`);
@@ -2416,7 +2417,12 @@ export class AdminService {
       return 'without_analysis';
     }
 
-    if (latestAnalysis.status === 'Procesando') {
+    // ADR-001: un Analysis 'Queued' es tan "en curso" como uno 'Procesando' para este estado
+    // administrativo — nunca se lo trata como terminado.
+    if (
+      latestAnalysis.status === 'Queued' ||
+      latestAnalysis.status === 'Procesando'
+    ) {
       return 'processing';
     }
 

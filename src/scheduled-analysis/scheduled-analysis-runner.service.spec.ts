@@ -4,8 +4,10 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
 
 import { Analysis } from '../analysis/entities/analysis.entity';
-import { AnalysisService } from '../analysis/analysis.service';
-import { FieldAnalysisSummary } from '../analysis/dto/field-analysis-summary.dto';
+import {
+  ActiveFieldAnalysis,
+  AnalysisService,
+} from '../analysis/analysis.service';
 import { AnalysisVerdictService } from '../analysis-verdict/analysis-verdict.service';
 import { AnalysisTechnicalVerdictResponse } from '../analysis-verdict/dto/analysis-technical-verdict.dto';
 import { EmailService } from '../email/email.service';
@@ -70,7 +72,7 @@ describe('ScheduledAnalysisRunnerService', () => {
       AnalysisService,
       | 'runFieldAnalysis'
       | 'findOne'
-      | 'findByField'
+      | 'findActiveAnalysisForField'
       | 'assertUserBelowConcurrencyCeiling'
     >
   >;
@@ -163,14 +165,21 @@ describe('ScheduledAnalysisRunnerService', () => {
       ...overrides,
     }) as Analysis;
 
-  const buildAnalysisSummary = (
-    overrides: Partial<FieldAnalysisSummary> = {},
-  ): FieldAnalysisSummary =>
-    ({
-      id: 'other-analysis-1',
-      status: 'Procesando',
-      ...overrides,
-    }) as FieldAnalysisSummary;
+  const buildActiveAnalysis = (
+    overrides: Partial<ActiveFieldAnalysis> = {},
+  ): ActiveFieldAnalysis => ({
+    id: 'other-analysis-1',
+    status: 'Procesando',
+    startedAt: null,
+    createdAt: new Date(),
+    hasDurableExecution: false,
+    ...overrides,
+  });
+
+  // ADR-001: triggerRun identifica el origen semanal (metadata de entrega del outbox/job).
+  const WEEKLY_OPTIONS: unknown = expect.objectContaining({
+    trigger: 'weekly',
+  });
 
   const DEFAULT_BASE_URL = 'https://app.agroscore.test';
 
@@ -302,7 +311,7 @@ describe('ScheduledAnalysisRunnerService', () => {
           useValue: {
             runFieldAnalysis: jest.fn(),
             findOne: jest.fn(),
-            findByField: jest.fn(),
+            findActiveAnalysisForField: jest.fn(),
             // SEC-008: default resuelto (no lanza) — los tests de runNow preexistentes no son
             // sobre el techo de concurrencia en sí; los que sí lo son pisan esto explícitamente.
             assertUserBelowConcurrencyCeiling: jest
@@ -359,9 +368,10 @@ describe('ScheduledAnalysisRunnerService', () => {
     analysisVerdictService = module.get(AnalysisVerdictService);
     weeklyTechnicalVerdictService = module.get(WeeklyTechnicalVerdictService);
 
-    // findByField: por defecto "sin otros análisis en curso" — el nuevo chequeo defensivo de
-    // triggerRun (fix crítico de la auditoría) lo llama siempre antes de runFieldAnalysis.
-    analysisService.findByField.mockResolvedValue([]);
+    // findActiveAnalysisForField: por defecto "sin otros análisis en curso" — el chequeo defensivo
+    // de triggerRun (fix crítico de la auditoría; ADR-001: Queued o Procesando) lo llama siempre
+    // antes de runFieldAnalysis.
+    analysisService.findActiveAnalysisForField.mockResolvedValue(null);
 
     // scheduleRepository.findOne: por defecto un schedule activo — reconcileRun ahora relee el
     // schedule antes de mandar el email (fix de la auditoría) y los tests existentes de envío de
@@ -454,6 +464,7 @@ describe('ScheduledAnalysisRunnerService', () => {
         'field-healthy',
         expect.anything(),
         'user-A',
+        WEEKLY_OPTIONS,
       );
     });
   });
@@ -475,6 +486,7 @@ describe('ScheduledAnalysisRunnerService', () => {
         'field-1',
         expect.objectContaining({ maxCloudiness: 30 }),
         'user-A',
+        WEEKLY_OPTIONS,
       );
     });
 
@@ -501,6 +513,7 @@ describe('ScheduledAnalysisRunnerService', () => {
           endDate: expectedRange.endDate,
         }),
         'user-A',
+        WEEKLY_OPTIONS,
       );
       expect(analysisService.runFieldAnalysis).not.toHaveBeenCalledWith(
         'field-1',
@@ -509,6 +522,7 @@ describe('ScheduledAnalysisRunnerService', () => {
           endDate: '2020-01-01',
         }),
         'user-A',
+        WEEKLY_OPTIONS,
       );
     });
 
@@ -553,6 +567,7 @@ describe('ScheduledAnalysisRunnerService', () => {
           includeImageSeries: true,
         }),
         'user-A',
+        WEEKLY_OPTIONS,
       );
     });
 
@@ -598,12 +613,12 @@ describe('ScheduledAnalysisRunnerService', () => {
       const schedule = buildSchedule();
       runRepository.findOne.mockResolvedValue(null);
       fieldsService.findOne.mockResolvedValue(buildField());
-      analysisService.findByField.mockResolvedValue([
-        buildAnalysisSummary({
+      analysisService.findActiveAnalysisForField.mockResolvedValue(
+        buildActiveAnalysis({
           id: 'manual-analysis-ajeno',
           status: 'Procesando',
         }),
-      ]);
+      );
 
       const run = await service.triggerRun(
         schedule,
@@ -624,9 +639,9 @@ describe('ScheduledAnalysisRunnerService', () => {
       const schedule = buildSchedule();
       runRepository.findOne.mockResolvedValue(null);
       fieldsService.findOne.mockResolvedValue(buildField());
-      analysisService.findByField.mockResolvedValue([
-        buildAnalysisSummary({ status: 'Procesando' }),
-      ]);
+      analysisService.findActiveAnalysisForField.mockResolvedValue(
+        buildActiveAnalysis({ status: 'Procesando' }),
+      );
 
       const run = await service.triggerRun(
         schedule,
@@ -645,13 +660,13 @@ describe('ScheduledAnalysisRunnerService', () => {
       const now = new Date('2026-08-24T12:00:00Z');
       runRepository.findOne.mockResolvedValue(null);
       fieldsService.findOne.mockResolvedValue(buildField());
-      analysisService.findByField.mockResolvedValue([
-        buildAnalysisSummary({
+      analysisService.findActiveAnalysisForField.mockResolvedValue(
+        buildActiveAnalysis({
           id: 'stale-analysis-1',
           status: 'Procesando',
           createdAt: new Date(now.getTime() - 25 * 60 * 1000),
         }),
-      ]);
+      );
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
       const run = await service.triggerRun(
@@ -669,13 +684,13 @@ describe('ScheduledAnalysisRunnerService', () => {
       const now = new Date('2026-08-24T12:00:00Z');
       runRepository.findOne.mockResolvedValue(null);
       fieldsService.findOne.mockResolvedValue(buildField());
-      analysisService.findByField.mockResolvedValue([
-        buildAnalysisSummary({
+      analysisService.findActiveAnalysisForField.mockResolvedValue(
+        buildActiveAnalysis({
           id: 'stale-analysis-1',
           status: 'Procesando',
           createdAt: new Date(now.getTime() - 25 * 60 * 1000),
         }),
-      ]);
+      );
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
       await service.triggerRun(schedule, now, 'automatic_dispatcher');
@@ -687,6 +702,7 @@ describe('ScheduledAnalysisRunnerService', () => {
         'field-1',
         expect.anything(),
         'user-A',
+        WEEKLY_OPTIONS,
       );
     });
 
@@ -695,12 +711,12 @@ describe('ScheduledAnalysisRunnerService', () => {
       const now = new Date('2026-08-24T12:00:00Z');
       runRepository.findOne.mockResolvedValue(null);
       fieldsService.findOne.mockResolvedValue(buildField());
-      analysisService.findByField.mockResolvedValue([
-        buildAnalysisSummary({
+      analysisService.findActiveAnalysisForField.mockResolvedValue(
+        buildActiveAnalysis({
           status: 'Procesando',
           createdAt: new Date(now.getTime() - 2 * 60 * 1000),
         }),
-      ]);
+      );
 
       const run = await service.triggerRun(
         schedule,
@@ -715,14 +731,86 @@ describe('ScheduledAnalysisRunnerService', () => {
       );
     });
 
+    it('ADR-001: un Analysis Queued (encolado, todavía sin intento) bloquea triggerRun igual que uno Procesando', async () => {
+      const schedule = buildSchedule();
+      const now = new Date('2026-08-24T12:00:00Z');
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.findActiveAnalysisForField.mockResolvedValue(
+        buildActiveAnalysis({
+          status: 'Queued',
+          hasDurableExecution: true,
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+        }),
+      );
+
+      const run = await service.triggerRun(
+        schedule,
+        now,
+        'automatic_dispatcher',
+      );
+
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+      expect(run.status).toBe('failed');
+      expect(run.errorMessage).toContain(
+        'Ya hay un análisis en proceso para este campo',
+      );
+    });
+
+    it('ADR-001: un Procesando DURABLE de más de 20 min (backoff de reintentos) sigue bloqueando — nunca stale por edad', async () => {
+      const schedule = buildSchedule();
+      const now = new Date('2026-08-24T12:00:00Z');
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.findActiveAnalysisForField.mockResolvedValue(
+        buildActiveAnalysis({
+          status: 'Procesando',
+          hasDurableExecution: true,
+          startedAt: new Date(now.getTime() - 45 * 60 * 1000),
+          createdAt: new Date(now.getTime() - 46 * 60 * 1000),
+        }),
+      );
+
+      const run = await service.triggerRun(
+        schedule,
+        now,
+        'automatic_dispatcher',
+      );
+
+      expect(analysisService.runFieldAnalysis).not.toHaveBeenCalled();
+      expect(run.status).toBe('failed');
+    });
+
+    it('ADR-001: encola con trigger=weekly y el scheduledRunId de la corrida creada', async () => {
+      const schedule = buildSchedule();
+      runRepository.findOne.mockResolvedValue(null);
+      fieldsService.findOne.mockResolvedValue(buildField());
+      analysisService.runFieldAnalysis.mockResolvedValue(
+        buildAnalysis({ status: 'Queued' }),
+      );
+
+      const run = await service.triggerRun(
+        schedule,
+        new Date('2026-08-24T12:00:00Z'),
+        'automatic_dispatcher',
+      );
+
+      expect(analysisService.runFieldAnalysis).toHaveBeenCalledWith(
+        'field-1',
+        expect.anything(),
+        'user-A',
+        { trigger: 'weekly', scheduledRunId: run.id },
+      );
+      // Queued es no terminal: la corrida queda 'processing' hasta que el Analysis termine.
+      expect(run.status).toBe('processing');
+    });
+
     it('FIX: si un análisis manual normal existe pero NO está Procesando, el scheduled run sí se dispara', async () => {
       const schedule = buildSchedule();
       runRepository.findOne.mockResolvedValue(null);
       fieldsService.findOne.mockResolvedValue(buildField());
-      analysisService.findByField.mockResolvedValue([
-        buildAnalysisSummary({ status: 'Finalizado' }),
-        buildAnalysisSummary({ status: 'Error' }),
-      ]);
+      // Solo análisis terminales: findActiveAnalysisForField no devuelve ninguno activo.
+      analysisService.findActiveAnalysisForField.mockResolvedValue(null);
       analysisService.runFieldAnalysis.mockResolvedValue(buildAnalysis());
 
       const run = await service.triggerRun(
@@ -851,6 +939,25 @@ describe('ScheduledAnalysisRunnerService', () => {
         analysis,
       );
     });
+
+    it.each(['Queued', 'Procesando'] as const)(
+      'ADR-001: con el Analysis %s la corrida sigue processing — sin snapshot, veredicto semanal ni email',
+      async (status) => {
+        const run = buildRun({
+          status: 'processing',
+          analysisId: 'analysis-1',
+        });
+        runRepository.find.mockResolvedValue([run]);
+        analysisService.findOne.mockResolvedValue(buildAnalysis({ status }));
+
+        await service.reconcilePendingRuns();
+
+        expect(run.status).toBe('processing');
+        expect(runRepository.save).not.toHaveBeenCalled();
+        expect(weeklySnapshotService.createFromAnalysis).not.toHaveBeenCalled();
+        expect(emailService.sendScheduledAnalysisEmail).not.toHaveBeenCalled();
+      },
+    );
 
     it('FASE 5: NO crea snapshot si el Analysis falló', async () => {
       const run = buildRun({ status: 'processing', analysisId: 'analysis-1' });
@@ -2174,6 +2281,7 @@ describe('ScheduledAnalysisRunnerService', () => {
           includeImageSeries: true,
         }),
         'user-A',
+        WEEKLY_OPTIONS,
       );
     });
 

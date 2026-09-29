@@ -20,10 +20,16 @@ export type StaleAnalysisCandidate = {
   status: AnalysisStatus;
   startedAt?: Date | null;
   createdAt?: Date | null;
+  /**
+   * ADR-001: true si el Analysis está administrado por la cola durable (inputSnapshot no nulo).
+   * Nunca es stale por edad: expiración, heartbeat y reintentos los gobierna pg-boss. Ausente o
+   * false = fila legacy, regla de edad de siempre.
+   */
+  hasDurableExecution?: boolean;
 };
 
 /**
- * true solo si `candidate` está 'Procesando' y su antigüedad (startedAt, o createdAt si no hay
+ * true solo si `candidate` está 'Procesando', NO es durable (ADR-001) y su antigüedad (startedAt, o createdAt si no hay
  * startedAt) supera `thresholdMs`. Sin ningún timestamp disponible, nunca es stale — mismo
  * criterio que computeDurationMs en AnalysisService: sin dato conocido, no se inventa una edad.
  */
@@ -32,7 +38,10 @@ export function isAnalysisStale(
   now: Date,
   thresholdMs: number = ANALYSIS_STALE_THRESHOLD_MS,
 ): boolean {
-  if (candidate.status !== 'Procesando') {
+  if (
+    candidate.status !== 'Procesando' ||
+    candidate.hasDurableExecution === true
+  ) {
     return false;
   }
 

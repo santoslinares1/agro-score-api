@@ -9,10 +9,18 @@ import { Analysis } from './entities/analysis.entity';
 import { FieldsModule } from 'src/fields/fields.module';
 import { ReportPdfService } from './report-pdf/report-pdf.service';
 import { AnalysisVerdictModule } from '../analysis-verdict/analysis-verdict.module';
+import {
+  ANALYSIS_QUEUE_CONFIG,
+  analysisQueueConfigProvider,
+} from '../analysis-queue/analysis-queue.config';
+import { AnalysisAttempt } from '../analysis-queue/entities/analysis-attempt.entity';
+import { AnalysisJobOutbox } from '../analysis-queue/entities/analysis-job-outbox.entity';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Analysis]),
+    // ADR-001: outbox/intentos se registran acá (autoLoadEntities) porque AnalysisService escribe
+    // el outbox en la misma transacción que crea el Analysis.
+    TypeOrmModule.forFeature([Analysis, AnalysisJobOutbox, AnalysisAttempt]),
     PythonWorkerModule,
     FieldsModule,
     AnalysisVerdictModule,
@@ -26,10 +34,12 @@ import { AnalysisVerdictModule } from '../analysis-verdict/analysis-verdict.modu
     ReportPdfService,
     AnalysisReconcileScheduler,
     UserComputeThrottlerGuard,
+    // ADR-001: flags/valores de la cola (ANALYSIS_QUEUE_*) — ver analysis-queue.config.ts.
+    analysisQueueConfigProvider,
   ],
   // Fase 4A (scheduled-analysis): el scheduler reutiliza AnalysisService.runFieldAnalysis/findOne
   // tal cual (mismo pipeline manual, sin duplicar lógica) — antes no se exportaba porque nada
   // fuera de este módulo lo necesitaba. No cambia ningún comportamiento del análisis manual.
-  exports: [AnalysisService],
+  exports: [AnalysisService, ANALYSIS_QUEUE_CONFIG],
 })
 export class AnalysisModule {}
