@@ -37,9 +37,10 @@ import {
   isAnalysisStale,
   StaleAnalysisCandidate,
 } from './analysis-stale.util';
-import { Analysis, AnalysisStatus } from './entities/analysis.entity';
+import { Analysis, AnalysisScope, AnalysisStatus } from './entities/analysis.entity';
 import { Field } from '../fields/entities/field.entity';
 import { FieldsService } from '../fields/fields.service';
+import { AnalysisListItem } from './dto/analysis-list-item.dto';
 import { AnalysisStatusDto } from './dto/analysis-status.dto';
 import { FieldAnalysisSummary } from './dto/field-analysis-summary.dto';
 import { ReportPdfService } from './report-pdf/report-pdf.service';
@@ -185,20 +186,65 @@ export class AnalysisService {
    * resolveOwnedFieldId). Los análisis de lote legacy (scope='lot', sin
    * relación a Field/User) quedan afuera de la lista: no hay owner
    * verificable, así que no se listan para nadie (AUTH-3).
+   *
+   * P0-A1 (auditoría de performance autenticada, 2026-09-15): antes hacía `getMany()` sobre
+   * entidades `Analysis` completas — resultJson incluido, hasta 11,5MB para 8 análisis de un solo
+   * usuario, medido en producción. Dashboard y "Mis campos" (los únicos consumidores, ver
+   * dashboard.component.ts/fields.component.ts en agro-score-web) solo leen los campos de
+   * AnalysisListItem. Reescrito como SQL crudo (mismo patrón que countRunningAnalysesForUser más
+   * abajo en este archivo) en vez de QueryBuilder + `.select([...])` porque necesita mezclar
+   * columnas simples con `globalScoreAvailable`, derivado con un path JSONB puntual
+   * (`resultJson->'dataAvailability'->>'globalScore'`) que nunca trae el jsonb completo a Node —
+   * ni siquiera esa única señal se lee si no hace falta, Postgres la extrae server-side. Mismo
+   * join/filtro de ownership que la versión anterior, solo expresado en SQL en vez de QueryBuilder.
    */
-  async findAll(userId: string): Promise<Analysis[]> {
-    return this.analysisRepository
-      .createQueryBuilder('analysis')
-      .innerJoin(
-        Field,
-        'field',
-        `(analysis.scope = :fieldScope AND field.id::text = analysis."fieldId") OR ` +
-          `(analysis.scope IS NULL AND field.id::text = analysis."lotId")`,
-        { fieldScope: 'field' },
-      )
-      .where('field."userId" = :userId', { userId })
-      .orderBy('analysis.createdAt', 'DESC')
-      .getMany();
+  async findAll(userId: string): Promise<AnalysisListItem[]> {
+    const rows: Array<{
+      id: string;
+      status: AnalysisStatus;
+      scope: AnalysisScope | null;
+      fieldId: string | null;
+      lotId: string | null;
+      lotName: string;
+      createdAt: Date;
+      globalScore: number;
+      category: string;
+      globalScoreAvailableRaw: boolean | null;
+    }> = await this.analysisRepository.query(
+      `SELECT
+          a."id",
+          a."status",
+          a."scope",
+          a."fieldId",
+          a."lotId",
+          a."lotName",
+          a."createdAt",
+          a."globalScore",
+          a."category",
+          (a."resultJson" -> 'dataAvailability' ->> 'globalScore')::boolean AS "globalScoreAvailableRaw"
+        FROM "analysis" a
+        INNER JOIN "fields" f
+          ON (a."scope" = 'field' AND f."id"::text = a."fieldId")
+          OR (a."scope" IS NULL AND f."id"::text = a."lotId")
+        WHERE f."userId" = $1
+        ORDER BY a."createdAt" DESC`,
+      [userId],
+    );
+
+    return rows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      scope: row.scope,
+      fieldId: row.fieldId,
+      lotId: row.lotId,
+      lotName: row.lotName,
+      createdAt: row.createdAt,
+      globalScore: row.globalScore,
+      category: row.category,
+      // F01: mismo criterio que findByField — ausente (null) se trata como disponible, solo
+      // `false` explícito lo marca no disponible. Nunca se deduce de globalScore ni category.
+      globalScoreAvailable: row.globalScoreAvailableRaw !== false,
+    }));
   }
 
   async findOne(id: string): Promise<Analysis> {

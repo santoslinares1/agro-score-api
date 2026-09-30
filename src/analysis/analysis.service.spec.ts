@@ -424,28 +424,114 @@ describe('AnalysisService', () => {
   });
 
   describe('findAll (owned)', () => {
-    // NOTA: el filtro real de ownership vive en una condición SQL cruda
-    // (join con `::text`, específico de Postgres) armada con QueryBuilder.
-    // Un mock no puede ejecutar esa SQL, así que este test solo prueba el
-    // cableado del service (que efectivamente filtra por el userId
-    // recibido y devuelve lo que el builder resuelva) — no reemplaza una
-    // prueba de integración contra Postgres real para las reglas de
-    // exclusión de scope='lot'/huérfanos (ver deuda restante en la entrega).
-    it('arma el query filtrando por el userId recibido y devuelve el resultado del builder', async () => {
-      const analyses = [
-        buildAnalysis({ id: 'a1' }),
-        buildAnalysis({ id: 'a2' }),
-      ];
-      const queryBuilder = analysisRepository.createQueryBuilder();
-      queryBuilder.getMany.mockResolvedValue(analyses);
+    // NOTA: el filtro real de ownership vive en SQL crudo (join con `::text`, específico de
+    // Postgres) armado con analysisRepository.query — un mock no puede ejecutarlo, así que estos
+    // tests prueban el cableado del service (que efectivamente filtra por el userId recibido, pide
+    // las columnas correctas, y mapea las filas crudas al DTO liviano) — no reemplazan una prueba
+    // de integración contra Postgres real para las reglas de exclusión de scope='lot'/huérfanos
+    // (ver deuda restante en la entrega).
+    const buildRawRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'a1',
+      status: 'Finalizado',
+      scope: 'field',
+      fieldId: 'field-1',
+      lotId: null,
+      lotName: 'Campo A',
+      createdAt: new Date('2026-01-01'),
+      globalScore: 70,
+      category: 'Buena aptitud productiva con variabilidad moderada',
+      globalScoreAvailableRaw: null,
+      ...overrides,
+    });
+
+    it('filtra por el userId recibido, ordena por createdAt DESC y devuelve el DTO liviano', async () => {
+      analysisRepository.query.mockResolvedValueOnce([
+        buildRawRow({ id: 'a1' }),
+        buildRawRow({ id: 'a2' }),
+      ]);
 
       const result = await service.findAll('user-A');
 
-      expect(queryBuilder.where).toHaveBeenCalledWith(
-        expect.stringContaining('userId'),
-        { userId: 'user-A' },
+      expect(analysisRepository.query).toHaveBeenCalledWith(
+        expect.stringContaining('f."userId" = $1'),
+        ['user-A'],
       );
-      expect(result).toBe(analyses);
+      expect(analysisRepository.query).toHaveBeenCalledWith(
+        expect.stringContaining('ORDER BY a."createdAt" DESC'),
+        ['user-A'],
+      );
+      expect(result).toHaveLength(2);
+      expect(result[0]).toEqual({
+        id: 'a1',
+        status: 'Finalizado',
+        scope: 'field',
+        fieldId: 'field-1',
+        lotId: null,
+        lotName: 'Campo A',
+        createdAt: new Date('2026-01-01'),
+        globalScore: 70,
+        category: 'Buena aptitud productiva con variabilidad moderada',
+        globalScoreAvailable: true,
+      });
+    });
+
+    // P0-A1: la razón de ser de este fix — ningún elemento devuelto expone resultJson, aunque la
+    // fila cruda de Postgres (simulada acá) pudiera traer algo parecido colgando por error.
+    it('P0-A1: nunca expone resultJson ni ninguna clave que no sea la del DTO liviano', async () => {
+      analysisRepository.query.mockResolvedValueOnce([
+        buildRawRow({
+          id: 'a1',
+          // Si algún día la query cambiara y alguien agregara resultJson a la fila cruda por
+          // accidente, este test debe fallar porque el .map() del service igual lo dejaría afuera.
+          resultJson: { imageSeries: { ndvi: [{ images: [{ image_base64: 'x'.repeat(1000) }] }] } },
+        }),
+      ]);
+
+      const [item] = await service.findAll('user-A');
+
+      expect(item).not.toHaveProperty('resultJson');
+      expect(Object.keys(item).sort()).toEqual(
+        [
+          'category',
+          'createdAt',
+          'fieldId',
+          'globalScore',
+          'globalScoreAvailable',
+          'id',
+          'lotId',
+          'lotName',
+          'scope',
+          'status',
+        ].sort(),
+      );
+    });
+
+    it('F01: globalScoreAvailable=true si el path JSONB no trae la señal (null)', async () => {
+      analysisRepository.query.mockResolvedValueOnce([
+        buildRawRow({ globalScoreAvailableRaw: null }),
+      ]);
+
+      const [item] = await service.findAll('user-A');
+
+      expect(item.globalScoreAvailable).toBe(true);
+    });
+
+    it('F01: globalScoreAvailable=false solo cuando la señal explícita es false', async () => {
+      analysisRepository.query.mockResolvedValueOnce([
+        buildRawRow({ globalScoreAvailableRaw: false }),
+      ]);
+
+      const [item] = await service.findAll('user-A');
+
+      expect(item.globalScoreAvailable).toBe(false);
+    });
+
+    it('devuelve lista vacía si el usuario no tiene análisis', async () => {
+      analysisRepository.query.mockResolvedValueOnce([]);
+
+      const result = await service.findAll('user-sin-datos');
+
+      expect(result).toEqual([]);
     });
   });
 
